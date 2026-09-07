@@ -18,3 +18,17 @@ def test_public_paths_resolve_packaged_assets(backend):
 def test_unsupported_backend_does_not_fall_back():
     with pytest.raises(ValueError, match="Unsupported"):
         engine_paths("metal")
+
+
+def test_public_pool_defaults_to_negotiated_engine_workers():
+    from beat_engine import EngineWorker, WorkerPool
+
+    paths = engine_paths()
+    pool = WorkerPool()
+    try:
+        worker = pool.get_worker(
+            julia_executable="julia", solver_script=paths.system_solver, julia_threads=2, julia_project=paths.project
+        )
+        assert isinstance(worker, EngineWorker)
+    finally:
+        pool.shutdown()

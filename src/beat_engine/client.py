@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .beat_contract.worker import negotiate_submission, validate_worker_event, validate_worker_ready
 from .paths import engine_paths
+from .worker import WorkerPool as TransportWorkerPool
 from .worker import WorkerProcess
 
 
@@ -28,3 +29,10 @@ class EngineWorker(WorkerProcess):
         protocol = (self._worker_info or {}).get("protocol")
         if isinstance(protocol, dict) and protocol.get("name") == "beat-worker":
             validate_worker_event(event)
+
+
+class WorkerPool(TransportWorkerPool):
+    """Public pool defaults to version-negotiated workers."""
+
+    def __init__(self, factory=EngineWorker):
+        super().__init__(factory)
