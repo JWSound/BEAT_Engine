@@ -128,6 +128,10 @@ import sys
 
 class StandardLibraryOnly(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
+        # Python 3.11's stdlib copy module probes for Jython support.
+        # Keep that unavailable via ImportError, as on ordinary CPython.
+        if fullname == 'org':
+            raise ModuleNotFoundError(fullname, name=fullname)
         if fullname.split('.')[0] not in sys.stdlib_module_names:
             raise AssertionError(f'Non-standard-library dependency: {fullname}')
 
