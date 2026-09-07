@@ -4,14 +4,13 @@ import copy
 import json
 import subprocess
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
-from blab.solvers.beat_contract import validate_compiled_system, validate_solve_request
+from beat_engine.beat_contract import validate_compiled_system, validate_solve_request
 
-CONTRACT = Path(__file__).resolve().parents[1] / "src/blab/solvers/beat_contract"
+CONTRACT = Path(__file__).resolve().parents[1] / "src/beat_engine/beat_contract"
 CORPUS = json.loads((CONTRACT / "conformance.json").read_text())
 
 
@@ -78,29 +77,6 @@ def test_non_json_or_nonfinite_extension_values_are_rejected(value):
     request["solver_options"]["custom"] = value
     with pytest.raises(ValueError, match="finite JSON"):
         validate_solve_request(request)
-
-
-def test_adapter_does_not_leak_new_application_dataclass_fields():
-    from blab.physical_model import CompiledPhysicalSystem
-    from blab.system_contract import compiled_system_from_dict, compiled_system_to_dict
-
-    @dataclass(frozen=True)
-    class FutureApplicationSystem(CompiledPhysicalSystem):
-        editor_selection: str = "must stay in the application"
-
-    system = compiled_system_from_dict(CORPUS["base_request"]["compiled_system"])
-    future = FutureApplicationSystem(**vars(system))
-    assert compiled_system_to_dict(future) == compiled_system_to_dict(system)
-    assert "editor_selection" not in compiled_system_to_dict(future)
-
-
-def test_adapter_rejects_bad_wire_before_coercing_it():
-    from blab.system_contract import system_solve_request_from_dict
-
-    request = copy.deepcopy(CORPUS["base_request"])
-    request["frequencies_hz"] = [True]
-    with pytest.raises(ValueError, match="expected number"):
-        system_solve_request_from_dict(request)
 
 
 def test_contract_loads_standalone_and_validates_without_application_or_numpy():

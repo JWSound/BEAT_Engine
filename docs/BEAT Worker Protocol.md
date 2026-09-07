@@ -7,14 +7,14 @@ before opening the request file. No matrix assembly is needed for negotiation.
 
 ## Handshake and version ownership
 
-[worker-v1.json](../src/blab/solvers/beat_contract/worker-v1.json) is the engine-owned
+[worker-v1.json](../src/beat_engine/beat_contract/worker-v1.json) is the engine-owned
 announcement template. Julia adds `runtime.julia_version` and `backends` at startup,
 then emits the resulting object as a single JSON line on stdout, with `type: ready`.
 
 | Field | Meaning |
 |---|---|
 | `protocol` | Name `beat-worker`, integer version `1` |
-| `engine` | Name `BEAT Engine`, development version `0.1.0-dev` |
+| `engine` | Name `BEAT Engine`, development version `0.1.0rc1` |
 | `contracts` | Supported versions for system request, compiled system, system result, and field array |
 | `operations` | `solve` and `bem_field` |
 | `precisions` | `float32` and `float64` |
@@ -123,7 +123,7 @@ an optimization, not a durable engine object handle.
 
 ## Integration boundary
 
-`beat_worker.py` remains a model-independent, standard-library transport. It stores
+`beat_engine/worker.py` remains a model-independent, standard-library transport. It stores
 the announcement and offers validation hooks. Boundary Lab's runtime adapter uses
 the engine-owned `beat_contract.worker` negotiation code in those hooks.
 

@@ -7,14 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from blab.solvers.beat_contract.worker import (
+from beat_engine import EngineWorker as BeatEngineWorkerProcess
+from beat_engine.beat_contract.worker import (
     WorkerCompatibilityError,
     negotiate_submission,
     validate_worker_ready,
 )
-from blab.solvers.beat_engine_runtime import BeatEngineWorkerProcess
 
-CONTRACT = Path(__file__).resolve().parents[1] / "src/blab/solvers/beat_contract"
+CONTRACT = Path(__file__).resolve().parents[1] / "src/beat_engine/beat_contract"
 
 
 @pytest.fixture

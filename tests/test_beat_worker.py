@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from blab.solvers.beat_worker import WorkerPool, WorkerProcess
+from beat_engine.worker import WorkerPool, WorkerProcess
 
 
 @pytest.fixture
@@ -120,7 +120,7 @@ def test_pool_keys_include_runtime_environment_and_shutdown_releases_workers(wor
 
 
 def test_transport_loads_without_any_application_or_third_party_imports():
-    script = Path(__file__).resolve().parents[1] / "src/blab/solvers/beat_worker.py"
+    script = Path(__file__).resolve().parents[1] / "src/beat_engine/worker.py"
     code = """
 import importlib.abc
 import importlib.util
@@ -141,46 +141,3 @@ assert module.WorkerPool
         [sys.executable, "-I", "-c", code, str(script)], capture_output=True, text=True, timeout=30
     )
     assert process.returncode == 0, process.stderr
-
-
-def test_production_imports_do_not_load_source_request_adapter():
-    code = """
-import importlib.abc
-import sys
-
-class RejectSourceAdapter(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname in {'blab.solvers.beat_engine_backend', 'blab.solvers.julia_local_backend'}:
-            raise AssertionError(f'Production imported source adapter: {fullname}')
-
-sys.meta_path.insert(0, RejectSourceAdapter())
-import blab.headless
-import blab.solvers.coupled_backend
-import blab.solvers.coupled_field
-import blab.deploy_worker
-"""
-    root = Path(__file__).resolve().parents[1]
-    process = subprocess.run(
-        [sys.executable, "-c", code],
-        env=dict(os.environ, PYTHONPATH=str(root / "src")),
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert process.returncode == 0, process.stderr
-
-
-def test_compatibility_exports_share_the_runtime_pool(worker_script):
-    from blab.solvers import beat_engine_backend as legacy
-    from blab.solvers import beat_engine_runtime as runtime
-    from blab.solvers import julia_local_backend as older
-
-    assert older.BeatEngineWorkerProcess is runtime.BeatEngineWorkerProcess
-    assert legacy._get_julia_worker is runtime.get_beat_engine_worker
-    assert legacy.shutdown_beat_engine_workers is runtime.shutdown_beat_engine_workers
-    try:
-        assert legacy._get_julia_worker(**options(worker_script)) is runtime.get_beat_engine_worker(
-            **options(worker_script)
-        )
-    finally:
-        runtime.shutdown_beat_engine_workers()

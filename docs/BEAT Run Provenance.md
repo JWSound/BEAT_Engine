@@ -12,7 +12,7 @@ The worker's `ready.engine` and each result's provenance identify the engine usi
 
 - `name` and `version`: the engine-owned interface/release identity.
 - `repository_revision`: the containing checkout's Git HEAD, or null when Git
-  metadata cannot be read. This is the Boundary Lab repository while BEAT remains
+  metadata cannot be read or the engine source is not tracked by that checkout. This is the Boundary Lab repository while BEAT remains
   bundled; after extraction it will identify the engine repository.
 - `repository_dirty`: engine-scoped Git status, including untracked files, or null
   when unavailable. The scope is `julia_local` and its sibling `beat_contract`.

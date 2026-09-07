@@ -33,7 +33,10 @@ function engine_identity()
             end
         end
         digest_input = join(["$name\0$(files[name])\n" for name in sort!(collect(keys(files)))])
-        revision = git_value(["rev-parse", "HEAD"])
+        # Installed wheels may live below an unrelated application checkout.
+        # Only claim a Git revision if this engine source is tracked there.
+        tracked = git_value(["ls-files", "--error-unmatch", "--", "src/BeatEngineProvenance.jl"])
+        revision = tracked === nothing ? nothing : git_value(["rev-parse", "HEAD"])
         status = revision === nothing ? nothing : git_value(["status", "--porcelain", "--untracked-files=all", "--", ".", "../beat_contract"])
         IDENTITY[] = Dict("repository_revision" => revision,
             "repository_dirty" => status === nothing ? nothing : !isempty(status),

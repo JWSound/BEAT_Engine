@@ -6,16 +6,16 @@ can construct JSON requests without importing Boundary Lab models, Qt, or NumPy.
 
 ## Authoritative artifacts and versions
 
-- [JSON Schema](../src/blab/solvers/beat_contract/system-v1.schema.json): request
+- [JSON Schema](../src/beat_engine/beat_contract/system-v1.schema.json): request
   v1 at `urn:beat-engine:system-solve:1`; compiled system v1 at its
   `#/$defs/compiled_system` fragment.
-- [Independent example](../src/blab/solvers/beat_contract/example-exterior-request.json):
+- [Independent example](../src/beat_engine/beat_contract/example-exterior-request.json):
   a prescribed-velocity exterior request. Mesh filenames are illustrative; supply
   matching Gmsh assets before solving.
-- [Conformance corpus](../src/blab/solvers/beat_contract/conformance.json): shared
+- [Conformance corpus](../src/beat_engine/beat_contract/conformance.json): shared
   acceptance/rejection cases for Python and Julia, including a coupled interface.
-- [Python validator](../src/blab/solvers/beat_contract/__init__.py) and
-  [Julia validator](../src/blab/solvers/julia_local/src/BeatEngineContract.jl):
+- [Python validator](../src/beat_engine/beat_contract/__init__.py) and
+  [Julia validator](../src/beat_engine/julia_local/src/BeatEngineContract.jl):
   structural validation plus identifier/reference and topology-length checks.
 
 The schema uses the [JSON Schema 2020-12 structure and reference conventions](https://json-schema.org/understanding-json-schema/structuring).
@@ -93,7 +93,7 @@ their defined engine fields/options and satisfy backend capability checks.
 
 - Geometry is scaled by `scale_to_m` then translated by `translation_m` in the
   global meter-based coordinate frame. Observation points use that same frame.
-  Sound speed is m/s, density is kg/m³, and frequency is Hz.
+  Sound speed is m/s, density is kg/mÂ³, and frequency is Hz.
 - V1 mesh paths are worker-local filesystem paths. Relative paths resolve against
   the worker's working directory, not the request JSON file or authoring project.
   Boundary Lab resolves project-relative mesh references before submission.
