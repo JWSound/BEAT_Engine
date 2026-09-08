@@ -1268,6 +1268,7 @@ function prepare_coupled_cache(
         device_bem_flux=device_bem_flux,
         device_sparse_blocks=device_sparse_blocks,
         field_cache=field_cache,
+        cuda_fem_analysis=Ref{Any}(nothing),
         timings=(
             fem_matrix_cache_s=fem_matrix_cache_s,
             interface_operator_cache_s=interface_operator_cache_s,
@@ -1312,6 +1313,7 @@ function release_coupled_cache!(cache)
         return nothing
     end
     cache.bem_backend == :cuda || return nothing
+    _release_cuda_fem_analysis!(cache.cuda_fem_analysis)
     _unsafe_free_cuda_fields!(
         cache.device_cache,
         (
@@ -1541,7 +1543,7 @@ function _rocm_coupled_bem_blocks(args...; kwargs...)
     return _accelerator_coupled_bem_blocks(amdgpu, amdgpu.ROCArray, args...; kwargs...)
 end
 
-function _build_cuda_fem_condensation(
+function _build_cuda_fem_condensation_fresh(
     fem_system::SparseMatrixCSC{Complex{T}},
     interface_operators::InterfaceOperators{T},
     retained_vertices,
@@ -1562,62 +1564,172 @@ function _build_cuda_fem_condensation(
 
     permutation = vcat(interior_vertices, retained_vertices)
     permuted_system = fem_system[permutation, permutation]
-    device_system = cuda.CUSPARSE.CuSparseMatrixCSR(permuted_system)
-    solver = cudss.CudssSolver(device_system, "G", 'F')
-    cudss.cudss_set(solver, "schur_mode", 1)
-    cudss.cudss_set(
-        solver,
-        "user_schur_indices",
-        vcat(
-            zeros(Cint, length(interior_vertices)),
-            ones(Cint, length(retained_vertices)),
-        ),
-    )
-    device_rhs = cuda.zeros(Complex{T}, fem_count)
-    device_solution = similar(device_rhs)
-    analysis_started = time_ns()
-    cudss.cudss("analysis", solver, device_solution, device_rhs; asynchronous=false)
-    analysis_s = (time_ns() - analysis_started) / 1.0e9
-    factorization_started = time_ns()
-    cudss.cudss(
-        "factorization",
-        solver,
-        device_solution,
-        device_rhs;
-        asynchronous=false,
-    )
-    factorization_s = (time_ns() - factorization_started) / 1.0e9
+    device_system = nothing
+    solver = nothing
+    device_rhs = nothing
+    device_solution = nothing
+    device_schur = nothing
+    schur_descriptor = nothing
+    try
+        device_system = cuda.CUSPARSE.CuSparseMatrixCSR(permuted_system)
+        solver = cudss.CudssSolver(device_system, "G", 'F')
+        cudss.cudss_set(solver, "schur_mode", 1)
+        cudss.cudss_set(
+            solver,
+            "user_schur_indices",
+            vcat(
+                zeros(Cint, length(interior_vertices)),
+                ones(Cint, length(retained_vertices)),
+            ),
+        )
+        device_rhs = cuda.zeros(Complex{T}, fem_count)
+        device_solution = similar(device_rhs)
+        analysis_started = time_ns()
+        cudss.cudss("analysis", solver, device_solution, device_rhs; asynchronous=false)
+        analysis_s = (time_ns() - analysis_started) / 1.0e9
+        factorization_started = time_ns()
+        cudss.cudss(
+            "factorization",
+            solver,
+            device_solution,
+            device_rhs;
+            asynchronous=false,
+        )
+        factorization_s = (time_ns() - factorization_started) / 1.0e9
 
-    schur_shape = cudss.cudss_get(solver, "schur_shape")
-    device_schur = cuda.zeros(Complex{T}, schur_shape[1], schur_shape[2])
-    schur_descriptor = cudss.CudssMatrix(device_schur)
-    schur_started = time_ns()
-    cudss.cudss_set(solver, "schur_matrix", schur_descriptor.matrix)
-    cudss.cudss_get(solver, "schur_matrix")
-    cuda.synchronize()
-    schur_extraction_s = (time_ns() - schur_started) / 1.0e9
-    cuda.unsafe_free!(device_rhs)
-    cuda.unsafe_free!(device_solution)
+        schur_shape = cudss.cudss_get(solver, "schur_shape")
+        device_schur = cuda.zeros(Complex{T}, schur_shape[1], schur_shape[2])
+        schur_descriptor = cudss.CudssMatrix(device_schur)
+        schur_started = time_ns()
+        cudss.cudss_set(solver, "schur_matrix", schur_descriptor.matrix)
+        cudss.cudss_get(solver, "schur_matrix")
+        cuda.synchronize()
+        schur_extraction_s = (time_ns() - schur_started) / 1.0e9
+        return (
+            backend=:cuda_cudss,
+            solver=solver,
+            device_system=device_system,
+            device_schur=device_schur,
+            schur_descriptor=schur_descriptor,
+            permutation=permutation,
+            interior_count=length(interior_vertices),
+            retained_count=length(retained_vertices),
+            timings=(
+                analysis_s=analysis_s,
+                factorization_s=factorization_s,
+                schur_extraction_s=schur_extraction_s,
+            ),
+        )
+    catch
+        if !isnothing(solver)
+            finalize(solver.data)
+            finalize(solver.config)
+            finalize(solver.matrix)
+        end
+        isnothing(schur_descriptor) || finalize(schur_descriptor)
+        isnothing(device_schur) || cuda.unsafe_free!(device_schur)
+        isnothing(device_system) || _unsafe_free_cuda_fields!(device_system, (:rowPtr, :colVal, :nzVal))
+        rethrow()
+    finally
+        isnothing(device_rhs) || cuda.unsafe_free!(device_rhs)
+        isnothing(device_solution) || cuda.unsafe_free!(device_solution)
+    end
+end
 
-    return (
-        backend=:cuda_cudss,
-        solver=solver,
-        device_system=device_system,
-        device_schur=device_schur,
-        schur_descriptor=schur_descriptor,
-        permutation=permutation,
-        interior_count=length(interior_vertices),
-        retained_count=length(retained_vertices),
-        timings=(
-            analysis_s=analysis_s,
-            factorization_s=factorization_s,
-            schur_extraction_s=schur_extraction_s,
-        ),
+function _release_cuda_fem_analysis!(cache)
+    workspace = cache[]
+    cache[] = nothing
+    isnothing(workspace) || _release_cuda_fem_condensation!(workspace.condensation)
+    return nothing
+end
+
+# A cached factorization is borrowed by exactly one frequency system at a time.
+# Only symbolic analysis survives: each frequency runs ordinary factorization,
+# allowing numerical pivoting to respond to changing frequency and damping.
+function _build_cuda_fem_condensation(
+    fem_system::SparseMatrixCSC{Complex{T}},
+    interface_operators::InterfaceOperators{T},
+    retained_vertices;
+    analysis_cache=nothing,
+) where {T<:AbstractFloat}
+    isnothing(analysis_cache) && return _build_cuda_fem_condensation_fresh(
+        fem_system, interface_operators, retained_vertices,
     )
+    cuda = BeatEngineCore.cuda_module()
+    cudss = _cudss_module()
+    retained = Int.(collect(retained_vertices))
+    workspace = analysis_cache[]
+    if !isnothing(workspace)
+        workspace.borrowed[] && error("Release the previous frequency system before reusing FEM analysis.")
+        compatible = workspace.device == cuda.device() &&
+            workspace.value_type == eltype(fem_system) &&
+            workspace.shape == size(fem_system) &&
+            workspace.colptr == fem_system.colptr &&
+            workspace.rowval == fem_system.rowval &&
+            workspace.retained == retained
+        if !compatible
+            _release_cuda_fem_analysis!(analysis_cache)
+            workspace = nothing
+        end
+    end
+    if isnothing(workspace)
+        condensation = _build_cuda_fem_condensation_fresh(
+            fem_system, interface_operators, retained,
+        )
+        workspace = (
+            condensation=condensation, borrowed=Ref(false), device=cuda.device(),
+            value_type=eltype(fem_system), shape=size(fem_system),
+            colptr=copy(fem_system.colptr), rowval=copy(fem_system.rowval),
+            retained=retained,
+        )
+        analysis_cache[] = workspace
+        timings = condensation.timings
+        reused = false
+    else
+        condensation = workspace.condensation
+        interior = condensation.permutation[1:condensation.interior_count]
+        nnz(interface_operators.fem_load[interior, :]) == 0 || error(
+            "FEM static condensation currently requires interface loads to have support only on interface nodes.",
+        )
+        device_values = nothing
+        device_rhs = nothing
+        device_solution = nothing
+        try
+            # Use the existing CSR conversion to preserve its exact value order.
+            # Keep the matrix descriptor and its GPU pointers stable across calls.
+            permutation = condensation.permutation
+            device_values = cuda.CUSPARSE.CuSparseMatrixCSR(fem_system[permutation, permutation])
+            copyto!(condensation.device_system.nzVal, device_values.nzVal)
+            device_rhs = cuda.zeros(Complex{T}, size(fem_system, 1))
+            device_solution = similar(device_rhs)
+            factorization_started = time_ns()
+            cudss.cudss("factorization", condensation.solver, device_solution, device_rhs; asynchronous=false)
+            factorization_s = (time_ns() - factorization_started) / 1.0e9
+            schur_started = time_ns()
+            cudss.cudss_get(condensation.solver, "schur_matrix")
+            cuda.synchronize()
+            schur_extraction_s = (time_ns() - schur_started) / 1.0e9
+            timings = (analysis_s=0.0, factorization_s=factorization_s, schur_extraction_s=schur_extraction_s)
+            reused = true
+        catch
+            _release_cuda_fem_analysis!(analysis_cache)
+            rethrow()
+        finally
+            isnothing(device_values) || _unsafe_free_cuda_fields!(device_values, (:rowPtr, :colVal, :nzVal))
+            isnothing(device_rhs) || cuda.unsafe_free!(device_rhs)
+            isnothing(device_solution) || cuda.unsafe_free!(device_solution)
+        end
+    end
+    workspace.borrowed[] = true
+    return merge(condensation, (timings=timings, analysis_reused=reused, borrowed=workspace.borrowed))
 end
 
 function _release_cuda_fem_condensation!(condensation)
     isnothing(condensation) && return nothing
+    if hasproperty(condensation, :borrowed)
+        condensation.borrowed[] = false
+        return nothing
+    end
     cuda = BeatEngineCore.cuda_module()
     finalize(condensation.solver.data)
     finalize(condensation.solver.config)
@@ -1994,7 +2106,8 @@ function build_coupled_system(
         _build_cuda_fem_condensation(
             fem_system,
             interface_operators,
-            retained_fem_vertices,
+            retained_fem_vertices;
+            analysis_cache=prepared.cuda_fem_analysis,
         )
     else
         _build_rocm_hybrid_fem_condensation(

@@ -52,6 +52,17 @@ projects. CPU reference success does not qualify CUDA, ROCm, or future Metal.
 Hardware release runs must inspect actual test execution; an unavailable-device
 skip is not a numerical pass.
 
+The CUDA coupled gate includes `cuda_fem_analysis_tests.jl`. It checks repeated
+value updates against fresh cuDSS Schur complements and an FP64 reference,
+multiple-right-hand-side forward/backward reconstruction, and cache invalidation
+when sparsity, retained-node ordering, or precision changes. A small weakly damped
+interior-pole sweep also compares reused and fresh analysis against the same
+rounded FP32 coefficients evaluated in FP64. A frequency system
+borrows the job's analysis workspace until `release_coupled_system!`; release it
+before building the next frequency with the same prepared cache. Job-cache
+release destroys the retained cuDSS resources. This reuse runs the ordinary
+numerical factorization phase at every frequency, retaining only the analysis.
+
 The larger noncubic-cavity convergence family remains in Boundary Lab's
 `tests/fixtures/noncubic_cavity` with its existing optional runner. It is extended
 application validation, not a dependency of this portable gate. Preserve that
