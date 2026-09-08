@@ -71,10 +71,10 @@ backends. Some historical research scripts and the optional noncubic-cavity test
 still require Boundary Lab's extended fixtures; they are not installed runtime
 requirements or part of the portable release gate.
 
-The first package candidate is `0.1.0rc1`. CI builds a wheel after independent
+The stable package release is `0.1.0`. CI builds a wheel after independent
 Python and CPU checks on Windows, Linux, and macOS. The manually dispatched release
 workflow requires a successful CI run for the tag's exact commit before attaching
-wheel/sdist artifacts to a GitHub prerelease. No PyPI publication is configured.
+wheel/sdist artifacts to a stable GitHub release. No PyPI publication is configured.
 
 History and original authorship were retained from Boundary Lab. See
 [extraction provenance](docs/EXTRACTION.md) and the repository [LICENSE](LICENSE).
