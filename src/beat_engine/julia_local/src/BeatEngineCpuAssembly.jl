@@ -753,6 +753,7 @@ function assemble_regular_galerkin_operators_cpu(
     image_near_correction_cache=nothing,
     symmetry_mode::Symbol=:off,
 ) where {T<:AbstractFloat}
+    k = outgoing_wavenumber(k)
     symmetry_mode = normalized_symmetry_mode(symmetry_mode)
 
     if cpu_cache !== nothing

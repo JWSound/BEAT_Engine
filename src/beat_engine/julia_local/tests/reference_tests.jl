@@ -17,3 +17,4 @@ using .BeatEngineCore
 include(joinpath(@__DIR__, "analytical_exterior_tests.jl"))
 include(joinpath(@__DIR__, "coupled_solver_tests.jl"))
 include(joinpath(@__DIR__, "coupled_condensed_tests.jl"))
+include(joinpath(@__DIR__, "phasor_tests.jl"))

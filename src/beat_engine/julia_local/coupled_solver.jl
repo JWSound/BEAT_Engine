@@ -19,6 +19,7 @@ const RUN_MESH_PROVENANCE = Ref{Any}([])
 
 function record_result_provenance!(result, request)
     diagnostics = result["diagnostics"]
+    diagnostics["phasor_convention"] = phasor_convention()
     backend = get(diagnostics, "bem_backend", get(diagnostics, "linear_backend", nothing))
     device, device_error = try
         accelerator = backend == "cuda" ? BeatEngineCore.CUDA_MODULE : backend == "rocm" ? BeatEngineCore.AMDGPU_MODULE : nothing
@@ -89,7 +90,7 @@ function speaker_interior_state_matrix(system)
     retained = system.retained_fem_vertices
     interface_operators = system.interface_operators
     transducer_operators = system.transducer_operators
-    normal_derivative_scale = Complex{T}(0, system.density * system.omega)
+    normal_derivative_scale = neumann_scale(system.density, system.omega)
 
     k_matrix = zeros(Complex{T}, layout.state_count, layout.state_count)
     k_matrix[layout.gamma_range, layout.gamma_range] .= Complex{T}.(schur)
@@ -222,7 +223,7 @@ function _speaker_rank_boundary_patterns(system, count::Int, sequence_offset::In
         if isodd(sample_index)
             for (row, vertex) in enumerate(vertices)
                 phase = system.wavenumber * dot(T.(vertex) .- center, direction)
-                patterns[row, column] = cis(phase)
+                patterns[row, column] = cis(propagation_sign() * phase)
             end
         else
             exit_distance = minimum(
@@ -234,7 +235,7 @@ function _speaker_rank_boundary_patterns(system, count::Int, sequence_offset::In
             source = center .+ (exit_distance + clearance) .* direction
             for (row, vertex) in enumerate(vertices)
                 distance = norm(T.(vertex) .- source)
-                patterns[row, column] = cis(system.wavenumber * distance) / distance
+                patterns[row, column] = cis(outgoing_wavenumber(system.wavenumber) * distance) / distance
             end
         end
     end
@@ -355,7 +356,7 @@ function speaker_rom_rank_experiment(system, raw_config)
     bem_force = system.transducer_operators.bem_force
     bem_flux = system.interface_operators.bem_flux
     bem_velocity = system.transducer_operators.bem_normal_velocity
-    normal_derivative_scale = Complex{T}(0, system.density * system.omega)
+    normal_derivative_scale = neumann_scale(system.density, system.omega)
     sectors = Dict{String,Any}[]
     solve_s = 0.0
     analysis_s = 0.0
@@ -686,7 +687,7 @@ function exterior_neumann(mesh, excitation, density::T, omega::T) where {T<:Abst
     for (tag, amplitude) in zip(excitation.tags, excitation.amplitudes)
         for face_index in eachindex(mesh.faces)
             mesh.physical_tags[face_index] == tag || continue
-            values[face_index] = Complex{T}(0, density * omega * amplitude)
+            values[face_index] = neumann_scale(density, omega) * amplitude
         end
     end
     return values
@@ -1943,10 +1944,10 @@ function solve_interior_request(request, system, bounded_regions; event_mode=fal
                 operator.thickness_m,
                 operator.flow_resistivity_pa_s_per_m2,
             )
-            fem_system -= Complex{FloatType}(0, density * omega) * admittance .* operator.matrix
+            fem_system -= neumann_scale(density, omega) * admittance .* operator.matrix
         end
         for operator in termination_operators
-            fem_system -= Complex{FloatType}(0, wavenumber) .* operator.matrix
+            fem_system -= Complex{FloatType}(0, outgoing_wavenumber(wavenumber)) .* operator.matrix
         end
 
         fem_count = length(fem_mesh.vertices)
@@ -1961,7 +1962,7 @@ function solve_interior_request(request, system, bounded_regions; event_mode=fal
         coupled = if transducer_count == 0
             SparseMatrixCSC{ComplexF64,Int}(fem_system)
         else
-            normal_derivative_scale = Complex{FloatType}(0, density * omega)
+            normal_derivative_scale = neumann_scale(density, omega)
             fem_motion = -normal_derivative_scale .* Complex{FloatType}.(
                 transducer_operators.fem_surface,
             )
@@ -2121,6 +2122,15 @@ function solve_interior_request(request, system, bounded_regions; event_mode=fal
 end
 
 function solve_request(request; event_mode=false)
+    convention = get(get(request, "solver_options", Dict()), "phasor_convention", NEGATIVE_TIME_PHASOR)
+    convention == POSITIVE_TIME_PHASOR && get(get(request, "solver_options", Dict()), "bem_backend", "cpu") == "rocm" &&
+        error("Positive-time ROCm solves require hardware qualification; use CPU or CUDA.")
+    return with_phasor_convention(convention) do
+        solve_request_impl(request; event_mode=event_mode)
+    end
+end
+
+function solve_request_impl(request; event_mode=false)
     validate_system_request(request)
     BeatEngineContract.BeatEngineProvenance.engine_identity()
     BeatEngineContract.BeatEngineProvenance.runtime_identity()
@@ -3236,6 +3246,14 @@ function retained_bem_field_evaluation_cache(
 end
 
 function evaluate_bem_field_request(request, request_path)
+    get(request, "phasor_convention", NEGATIVE_TIME_PHASOR) == POSITIVE_TIME_PHASOR && get(request, "bem_backend", "cpu") == "rocm" &&
+        error("Positive-time ROCm fields require hardware qualification; use CPU or CUDA.")
+    return with_phasor_convention(get(request, "phasor_convention", NEGATIVE_TIME_PHASOR)) do
+        evaluate_bem_field_request_impl(request, request_path)
+    end
+end
+
+function evaluate_bem_field_request_impl(request, request_path)
     precision_name = lowercase(String(get(request, "precision", "float32")))
     FloatType = precision_name == "float64" ? Float64 : precision_name == "float32" ? Float32 :
                 error("Exterior field precision must be float32 or float64.")
@@ -3328,7 +3346,8 @@ function worker_backend_availability()
         catch exception
             (false, sprint(showerror, exception))
         end
-        backends[name] = Dict("available" => available, "reason" => reason)
+        backends[name] = Dict("available" => available, "reason" => reason,
+            "phasor_conventions" => name == "rocm" ? [NEGATIVE_TIME_PHASOR] : [NEGATIVE_TIME_PHASOR, POSITIVE_TIME_PHASOR])
     end
     return backends
 end
@@ -3344,12 +3363,17 @@ function run_worker()
             request_path = String(submission["request"])
             request = JSON.parse(read(request_path, String))
             operation = String(get(submission, "operation", "solve"))
+            options = operation == "solve" ? get(request, "solver_options", Dict()) : request
+            get(options, "phasor_convention", NEGATIVE_TIME_PHASOR) ==
+                get(submission, "phasor_convention", NEGATIVE_TIME_PHASOR) ||
+                error("Request phasor convention differs from negotiated command.")
             if operation == "bem_field"
                 values = evaluate_bem_field_request(request, request_path)
                 println(
                     JSON.json(
                         Dict(
                             "type" => "field_result",
+                            "phasor_convention" => get(request, "phasor_convention", NEGATIVE_TIME_PHASOR),
                             "values_binary" => write_field_binary_result(
                                 request,
                                 request_path,

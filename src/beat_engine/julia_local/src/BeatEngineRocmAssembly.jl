@@ -169,6 +169,7 @@ function assemble_regular_galerkin_operators_rocm_regular(
     assembly_mode=nothing,
     symmetry_mode::Symbol=:off,
 ) where {T<:AbstractFloat}
+    k = outgoing_wavenumber(k)
     _require_rocm!()
     return_device || error("ROCm host-staged assembly requires return_device=true.")
     accelerator_quadrature || error("ROCm host-staged assembly requires accelerator_quadrature=true.")

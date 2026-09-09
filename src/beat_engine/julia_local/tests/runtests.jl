@@ -68,6 +68,7 @@ end
 include(joinpath(@__DIR__, "coupled_solver_tests.jl"))
 include(joinpath(@__DIR__, "speaker_rom_tests.jl"))
 include(joinpath(@__DIR__, "coupled_condensed_tests.jl"))
+include(joinpath(@__DIR__, "phasor_tests.jl"))
 
 @testset "cpu BLAS thread policy" begin
     @test beat_cpu_blas_thread_count(441; available_threads=16) == 1
@@ -585,6 +586,32 @@ end
         @test corrected_direct_system.near_pair_count == combined_image_corrected.near_pair_count
         @test Array(corrected_direct_system.matrix) ≈ Array(expected_direct_lhs) rtol=T(5e-3) atol=T(5e-4)
         @test Array(corrected_direct_system.rhs) ≈ Array(expected_direct_rhs) rtol=T(5e-3) atol=T(5e-4)
+        # The same near/image/singular geometry cache is valid in either convention.
+        with_phasor_convention(POSITIVE_TIME_PHASOR) do
+            positive_q = CUDA_MODULE.CuArray(conj.(direct_q))
+            positive_system = assemble_burton_miller_neumann_system_cuda(
+                mesh, p1, dp0, positive_q, k, base_rule;
+                device_cache=cuda_regular, singular_cache=singular_cache,
+                device_singular_cache=cuda_singular, device_image_singular_cache=cuda_image_singular,
+                near_correction_cache=near_cache, device_near_correction_cache=cuda_near,
+                image_near_correction_cache=image_cache, device_image_near_correction_cache=cuda_image_near,
+                symmetry_mode=:ground,
+            )
+            @test isapprox(Array(positive_system.matrix), conj.(Array(expected_direct_lhs)); rtol=T(5e-3), atol=T(5e-4))
+            @test isapprox(Array(positive_system.rhs), conj.(Array(expected_direct_rhs)); rtol=T(5e-3), atol=T(5e-4))
+            positive_rhs = assemble_burton_miller_rhs_cuda(
+                mesh, p1, dp0, positive_q, k, base_rule;
+                device_cache=cuda_regular, singular_cache=singular_cache,
+                device_singular_cache=cuda_singular, device_image_singular_cache=cuda_image_singular,
+                near_correction_cache=near_cache, device_near_correction_cache=cuda_near,
+                image_near_correction_cache=image_cache, device_image_near_correction_cache=cuda_image_near,
+                symmetry_mode=:ground,
+            )
+            @test isapprox(Array(positive_rhs), conj.(Array(expected_direct_rhs)); rtol=T(5e-3), atol=T(5e-4))
+            CUDA_MODULE.unsafe_free!(positive_rhs)
+            CUDA_MODULE.unsafe_free!(positive_q)
+            release_burton_miller_system_cuda!(positive_system)
+        end
         release_burton_miller_system_cuda!(corrected_direct_system)
         CUDA_MODULE.unsafe_free!(expected_direct_lhs)
         CUDA_MODULE.unsafe_free!(expected_direct_rhs)

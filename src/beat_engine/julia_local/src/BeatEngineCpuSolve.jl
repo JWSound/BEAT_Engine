@@ -43,7 +43,7 @@ function configure_beat_cpu_blas_threads!(
 end
 
 function burton_miller_neumann_matrices(operators, identity_p1_p1, identity_p1_dp0, k::T) where {T<:AbstractFloat}
-    coupling = Complex{T}(0, 1) / k
+    coupling = burton_miller_coupling(k)
     identity_p1_p1_complex = Complex{T}.(identity_p1_p1)
     identity_p1_dp0_complex = Complex{T}.(identity_p1_dp0)
 

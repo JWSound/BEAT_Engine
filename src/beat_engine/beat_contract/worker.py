@@ -101,6 +101,13 @@ def negotiate_submission(info: dict, request: dict, operation: str) -> dict:
     else:
         raise WorkerCompatibilityError(f"Unsupported client operation: {operation}")
     precision = str(options.get("precision", default_precision)).lower()
+    convention = options.get("phasor_convention", "exp(-i omega t)")
+    _require(
+        convention in info.get("phasor_conventions", ["exp(-i omega t)"]),
+        f"phasor convention {convention!r} is unavailable; update the engine worker.",
+    )
+    if "phasor_convention" in options:
+        command["phasor_convention"] = convention
     if operation == "solve" and kind != "exterior_bem":
         precision = {"complex64": "float32", "complex128": "float64"}.get(precision, precision)
     _require(precision in info["precisions"], f"precision {precision!r} is unavailable.")
@@ -108,6 +115,10 @@ def negotiate_submission(info: dict, request: dict, operation: str) -> dict:
     _require(
         backend.get("available") is True,
         f"backend {backend_name!r} is unavailable: {backend.get('reason', 'not advertised by this worker')}",
+    )
+    _require(
+        convention in backend.get("phasor_conventions", info.get("phasor_conventions", ["exp(-i omega t)"])),
+        f"phasor convention {convention!r} is not qualified for backend {backend_name!r}.",
     )
     return command
 

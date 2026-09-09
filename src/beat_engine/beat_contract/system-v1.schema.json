@@ -519,7 +519,16 @@
           "minItems": 0
         },
         "solver_options": {
-          "type": "object"
+          "type": "object",
+          "properties": {
+            "phasor_convention": {
+              "type": "string",
+              "enum": [
+                "exp(-i omega t)",
+                "exp(+i omega t)"
+              ]
+            }
+          }
         },
         "cancel_path": {
           "type": "string",

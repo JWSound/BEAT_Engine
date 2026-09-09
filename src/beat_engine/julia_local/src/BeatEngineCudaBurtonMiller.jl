@@ -373,6 +373,7 @@ function assemble_burton_miller_neumann_system_cuda(
     timing=nothing,
     identity_p1_p1_block=nothing,
 ) where {T<:AbstractFloat}
+    k = outgoing_wavenumber(k)
     CUDA.functional() || error("Direct Burton-Miller CUDA assembly requested, but CUDA.functional() is false.")
     length(q_neumann) == dp0_space.global_dof_count || error("Direct Burton-Miller Neumann vector size mismatch.")
     device_cache === nothing && error("Direct Burton-Miller CUDA assembly requires a regular device cache.")
@@ -526,6 +527,7 @@ function assemble_burton_miller_rhs_cuda(
     symmetry_mode::Symbol=:off,
     timing=nothing,
 ) where {T<:AbstractFloat}
+    k = outgoing_wavenumber(k)
     CUDA.functional() || error("Burton-Miller CUDA RHS assembly requested, but CUDA.functional() is false.")
     length(q_neumann) == dp0_space.global_dof_count || error("Burton-Miller Neumann vector size mismatch.")
     device_cache === nothing && error("Burton-Miller CUDA RHS assembly requires a regular device cache.")

@@ -234,7 +234,7 @@ end
 
 function electrical_impedance(transducer::ElectrodynamicTransducer{T}, omega) where {T<:AbstractFloat}
     angular_frequency = T(omega)
-    s = Complex{T}(zero(T), -angular_frequency)
+    s = time_derivative(angular_frequency)
     model = transducer.semi_inductance
     isnothing(model) && return Complex{T}(transducer.re_ohm) + s * transducer.le_h
     parallel_admittance =
@@ -253,14 +253,14 @@ function mechanical_impedance(
     angular_frequency = T(omega)
     impedance = Complex{T}(
         transducer.rms_n_s_per_m,
-        -angular_frequency * transducer.mmd_kg +
-        inv(angular_frequency * transducer.cms_m_per_n),
+        propagation_sign() * (-angular_frequency * transducer.mmd_kg +
+        inv(angular_frequency * transducer.cms_m_per_n)),
     )
     chamber = transducer.lumped_sealed_rear_chamber
     isnothing(chamber) && return impedance
     chamber_stiffness =
         T(density) * T(sound_speed)^2 * chamber.projected_area_m2^2 / chamber.volume_m3
-    return impedance + Complex{T}(zero(T), chamber_stiffness / angular_frequency)
+    return impedance + Complex{T}(zero(T), propagation_sign() * chamber_stiffness / angular_frequency)
 end
 
 function restrict_volume_mesh(mesh::VolumeMesh{T}, selected_tags) where {T<:AbstractFloat}
@@ -579,9 +579,9 @@ function assemble_fem_dynamic_stiffness(
     squared_wavenumber = wavenumber^2
     system = Complex{T}.(stiffness) - squared_wavenumber .* mass
     if isnothing(bulk_loss_mass)
-        return system - Complex{T}(0, bulk_loss_factor * squared_wavenumber) .* mass
+        return system - Complex{T}(0, propagation_sign() * bulk_loss_factor * squared_wavenumber) .* mass
     end
-    return system - Complex{T}(0, squared_wavenumber) .* bulk_loss_mass
+    return system - Complex{T}(0, propagation_sign() * squared_wavenumber) .* bulk_loss_mass
 end
 
 function miki_rigid_backed_surface_admittance(
@@ -609,8 +609,8 @@ function miki_rigid_backed_surface_admittance(
     )
     surface_impedance_positive = -Complex{T}(0, 1) * characteristic_impedance_positive *
                                  cot(porous_wavenumber_positive * thickness_m)
-    # Miki is conventionally written for exp(+i*omega*t); Boundary Lab uses exp(-i*omega*t).
-    surface_impedance = conj(surface_impedance_positive)
+    # Miki is conventionally written for positive time.
+    surface_impedance = propagation_sign() == 1 ? conj(surface_impedance_positive) : surface_impedance_positive
     admittance = inv(surface_impedance)
     real(admittance) >= zero(T) || error("Miki wall impedance produced a non-passive admittance.")
     return admittance
@@ -711,7 +711,7 @@ function assemble_prescribed_velocity_load(
     velocity::Complex{T},
 ) where {T<:AbstractFloat}
     load = zeros(Complex{T}, length(mesh.vertices))
-    normal_derivative = Complex{T}(0, density * omega) * velocity
+    normal_derivative = neumann_scale(density, omega) * velocity
     quadratic_reference_load = is_quadratic(mesh) ? _p2_triangle_reference_load(T) : nothing
     for face_index in eachindex(mesh.boundary_faces)
         mesh.boundary_physical_tags[face_index] == boundary_tag || continue
@@ -1403,7 +1403,7 @@ function _accelerator_coupled_bem_blocks(
     bem_motion_flux=nothing,
     bem_prescribed_neumann=nothing,
 ) where {T<:AbstractFloat}
-    coupling = Complex{T}(0, 1) / wavenumber
+    coupling = burton_miller_coupling(wavenumber)
     d_identity_p1_p1 = d_identity_p1_dp0 = d_bem_flux = nothing
     d_lhs = d_interface_block = d_interface_temp = d_rhs_operator = nothing
     d_motion_block = d_motion_temp = nothing
@@ -1988,7 +1988,7 @@ function build_coupled_system(
         for operator in prepared.wall_impedance_operators
     ]
     for (operator, admittance) in zip(prepared.wall_impedance_operators, wall_admittances)
-        fem_system -= Complex{T}(0, density * omega) * admittance .* operator.matrix
+        fem_system -= neumann_scale(density, omega) * admittance .* operator.matrix
     end
     interface_operators = prepared.interface_operators
     transducer_count = length(transducers)
@@ -1996,7 +1996,7 @@ function build_coupled_system(
         error("FEM transducer operator count does not match the transducer list.")
     size(resolved_transducer_operators.bem_surface, 2) == transducer_count ||
         error("BEM transducer operator count does not match the transducer list.")
-    normal_derivative_scale = Complex{T}(0, density * omega)
+    normal_derivative_scale = neumann_scale(density, omega)
     bem_motion_flux = normal_derivative_scale .* Complex{T}.(
         resolved_transducer_operators.bem_normal_velocity
     )
@@ -2195,7 +2195,7 @@ function build_coupled_system(
                 scatter_sparse!(
                     d_coupled,
                     prepared.device_sparse_blocks.bulk_loss_mass;
-                    alpha=Complex{T}(0, -(wavenumber^2)),
+                    alpha=Complex{T}(0, -propagation_sign() * (wavenumber^2)),
                     add=true,
                 )
                 for (wall_cache, admittance) in zip(
@@ -2205,7 +2205,7 @@ function build_coupled_system(
                     scatter_sparse!(
                         d_coupled,
                         wall_cache;
-                        alpha=-Complex{T}(0, density * omega) * admittance,
+                        alpha=-neumann_scale(density, omega) * admittance,
                         add=true,
                     )
                 end
@@ -2433,7 +2433,7 @@ function _coupled_solution_from_parts(
     T = system.scalar_type
     bem_neumann = (
         Complex{T}.(system.interface_operators.bem_flux) * interface_flux +
-        Complex{T}(0, system.density * system.omega) .*
+        neumann_scale(system.density, system.omega) .*
         (
             Complex{T}.(system.transducer_operators.bem_normal_velocity) *
             diaphragm_velocity

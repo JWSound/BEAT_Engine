@@ -23,6 +23,8 @@ function validate_worker_submission(submission)
     version = get(submission, "protocol_version", nothing)
     version isa Integer && !(version isa Bool) && version == WORKER["protocol"]["version"] ||
         error("Incompatible BEAT worker protocol; client must select protocol version 1.")
+    convention = get(submission, "phasor_convention", "exp(-i omega t)")
+    convention in WORKER["phasor_conventions"] || error("Unsupported phasor convention: $convention")
     operation = get(submission, "operation", nothing)
     operation in WORKER["operations"] || error("Unsupported BEAT worker operation: $operation")
     request = get(submission, "request", nothing)

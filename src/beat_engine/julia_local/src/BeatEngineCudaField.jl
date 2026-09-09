@@ -336,6 +336,7 @@ function evaluate_galerkin_field_cuda(
     return_gpu::Bool=false,
     weighted_sources=nothing,
 ) where {T<:AbstractFloat}
+    k = outgoing_wavenumber(k)
     points_on_gpu = eval_points isa CudaObservationPoints
     point_count = points_on_gpu ? eval_points.point_count : length(eval_points)
     point_count == 0 && return return_gpu ? CuArray(Complex{T}[]) : Complex{T}[]

@@ -44,5 +44,9 @@
       "process_exit"
     ],
     "max_entries": 2
-  }
+  },
+  "phasor_conventions": [
+    "exp(-i omega t)",
+    "exp(+i omega t)"
+  ]
 }
