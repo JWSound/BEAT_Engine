@@ -75,3 +75,10 @@ details differ later in a run. Per-frequency diagnostics identify which record
 belongs to each result. Older results and synthetic/reference backends without
 engine provenance remain readable and have an empty collection; missing identity
 is never presented as a verified revision or device.
+
+Coupled results also report effective `coupled_bem_assembly`,
+`coupled_bem_image_fusion`, and `coupled_bem_max_registers` in frequency diagnostics.
+These distinguish automatic diagnostic fallback and inactive fusion/caps from
+the requested options in execution provenance. The numerical source digest
+automatically includes `BeatEngineCudaCoupledBurtonMiller.jl`. See
+[Coupled CUDA Assembly](Coupled%20CUDA%20Assembly.md).

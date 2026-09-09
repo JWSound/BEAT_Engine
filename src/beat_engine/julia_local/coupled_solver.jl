@@ -2401,6 +2401,13 @@ function solve_request_impl(request; event_mode=false)
     singular_order = Int(get(solver_options, "singular_order", 2))
     validation_diagnostics = Bool(get(solver_options, "validation_diagnostics", true))
     cache_frequency_invariant = Bool(get(solver_options, "cache_frequency_invariant", true))
+    coupled_bem_assembly = Symbol(lowercase(String(get(solver_options, "coupled_bem_assembly", "auto"))))
+    coupled_bem_image_fusion = Bool(get(solver_options, "coupled_bem_image_fusion", true))
+    coupled_bem_max_registers = Int(get(solver_options, "coupled_bem_max_registers", 0))
+    effective_bem_assembly = BeatEngineCoupled.resolve_coupled_bem_assembly(
+        coupled_bem_assembly, bem_backend, validation_diagnostics)
+    (coupled_bem_max_registers == 0 || 32 <= coupled_bem_max_registers <= 255) ||
+        error("coupled_bem_max_registers must be 0 or 32 through 255.")
     static_condensation_requested = Bool(
         get(
             solver_options,
@@ -2478,6 +2485,7 @@ function solve_request_impl(request; event_mode=false)
                 quadrature_order=quadrature_order,
                 singular_order=singular_order,
                 bem_backend=bem_backend,
+                coupled_bem_assembly=effective_bem_assembly,
                 symmetry_mode=symmetry_mode,
                 retained_fem_vertices=retained_fem_vertices,
                 bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
@@ -2532,6 +2540,9 @@ function solve_request_impl(request; event_mode=false)
                     bem_backend=bem_backend,
                     symmetry_mode=symmetry_mode,
                     static_condensation=static_condensation,
+                    coupled_bem_assembly=coupled_bem_assembly,
+                    coupled_bem_image_fusion=coupled_bem_image_fusion,
+                    coupled_bem_max_registers=coupled_bem_max_registers,
                     bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
                     wall_impedances=fem_domains.wall_impedances,
                     transducers=transducers,
@@ -2885,6 +2896,9 @@ function solve_request_impl(request; event_mode=false)
             diagnostics = Dict{String,Any}(
                 "precision" => precision_name,
                 "bem_backend" => String(bem_backend),
+                "coupled_bem_assembly" => hasproperty(coupled_system, :coupled_bem_assembly) ? String(coupled_system.coupled_bem_assembly) : "operators",
+                "coupled_bem_image_fusion" => hasproperty(coupled_system, :coupled_bem_image_fusion) && coupled_system.coupled_bem_image_fusion,
+                "coupled_bem_max_registers" => hasproperty(coupled_system, :coupled_bem_max_registers) ? coupled_system.coupled_bem_max_registers : 0,
                 "linear_backend" => String(coupled_system.linear_backend),
                 "fem_symbolic_analysis_reused" => !isnothing(coupled_system.condensation) &&
                     hasproperty(coupled_system.condensation, :analysis_reused) &&

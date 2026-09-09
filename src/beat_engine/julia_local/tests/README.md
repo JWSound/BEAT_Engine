@@ -71,3 +71,11 @@ family if it is included in a future engine release's extended qualification.
 The remaining source-request reference harness is retained. Remove it only when
 the physical-system replacement covers the comparisons it provides; this gate
 creates a portable baseline and does not silently retire additional comparisons.
+
+The CUDA suite also runs `coupled_bem_cuda_tests.jl`: combined A/C versus original
+operator matrices, complex/signed sparse projection, separate/fused image
+assembly, an explicit register cap, both phasor conventions, symmetry modes,
+coupled cache reuse across frequencies, and full-diagnostic fallback. The tests
+preserve complex pressure/flux and independent source columns. Run with the
+CUDA Julia project and a functional device; an unavailable-device skip does not
+qualify this architecture.

@@ -157,3 +157,13 @@ instead of calling `asdict` on the compiled object. Adding an application datacl
 field therefore cannot silently change the wire format. The `beat_contract`
 directory, its schema/examples, and the Julia validator can move with BEAT when
 the engine repository is extracted.
+
+## Coupled CUDA assembly options
+
+`solver_options.coupled_bem_assembly` accepts `auto` (default), `combined`, or
+`operators`. `coupled_bem_image_fusion` defaults to true;
+`coupled_bem_max_registers` defaults to 0, with explicit caps from 32 through 255.
+These options affect the coupled CUDA numerical path, independently of the
+exterior-only `burton_miller_assembly` option. Diagnostics retain the individual
+operators. Unsupported modes/backends fail before frequency assembly. See
+[Coupled CUDA Assembly](Coupled%20CUDA%20Assembly.md) for applicability and cache semantics.

@@ -1039,6 +1039,14 @@ function assemble_transducer_operators(
     )
 end
 
+# Diagnostics retain the individual operators needed for replay/residual checks.
+function resolve_coupled_bem_assembly(mode::Symbol, backend::Symbol, diagnostics::Bool)
+    mode in (:auto, :combined, :operators) || error(
+        "coupled_bem_assembly must be auto, combined, or operators.")
+    mode == :combined && backend != :cuda && error("Combined coupled BEM assembly requires CUDA.")
+    return backend == :cuda && !diagnostics && mode != :operators ? :combined : :operators
+end
+
 function prepare_coupled_cache(
     fem_mesh::VolumeMesh{T},
     bem_mesh::BoundaryMesh{T},
@@ -1048,6 +1056,7 @@ function prepare_coupled_cache(
     bem_backend::Symbol=:cpu,
     symmetry_mode::Symbol=:off,
     retained_fem_vertices=interface_map.fem_vertex_indices,
+    coupled_bem_assembly::Symbol=:auto,
     bulk_loss_factor_by_vertex=zeros(T, length(fem_mesh.vertices)),
     wall_impedances=NamedTuple[],
 ) where {T<:AbstractFloat}
@@ -1056,6 +1065,7 @@ function prepare_coupled_cache(
     )
     bem_backend in (:cpu, :cuda, :rocm) ||
         error("Unsupported coupled BEM backend: $bem_backend. Expected :cpu, :cuda, or :rocm.")
+    resolve_coupled_bem_assembly(coupled_bem_assembly, bem_backend, false)
     normalized_symmetry = BeatEngineCore.normalized_symmetry_mode(symmetry_mode)
     validate_symmetry_fundamental_domain!(bem_mesh, normalized_symmetry)
 
@@ -1179,6 +1189,7 @@ function prepare_coupled_cache(
     device_block_started = time_ns()
     device_identity_cache = nothing
     device_bem_flux = nothing
+    device_bem_flux_sparse = nothing
     device_sparse_blocks = nothing
     if bem_backend in (:cuda, :rocm)
         accelerator = bem_backend == :cuda ?
@@ -1197,9 +1208,13 @@ function prepare_coupled_cache(
             )
         end
         device_bem_flux = if bem_backend == :cuda
-            accelerator.CuArray(Complex{T}.(Matrix(interface_operators.bem_flux)))
+            coupled_bem_assembly == :operators ?
+                accelerator.CuArray(Complex{T}.(Matrix(interface_operators.bem_flux))) : nothing
         else
             accelerator.ROCArray(Complex{T}.(Matrix(interface_operators.bem_flux)))
+        end
+        if bem_backend == :cuda
+            device_bem_flux_sparse = BeatEngineCore.build_cuda_bem_flux_cache(interface_operators.bem_flux)
         end
         build_sparse_cache = bem_backend == :cuda ?
                              build_cuda_sparse_scatter_cache :
@@ -1266,6 +1281,7 @@ function prepare_coupled_cache(
         identity_p1_dp0=identity_p1_dp0,
         device_identity_cache=device_identity_cache,
         device_bem_flux=device_bem_flux,
+        device_bem_flux_sparse=device_bem_flux_sparse,
         device_sparse_blocks=device_sparse_blocks,
         field_cache=field_cache,
         cuda_fem_analysis=Ref{Any}(nothing),
@@ -1376,7 +1392,8 @@ function release_coupled_cache!(cache)
         ),
     )
     release_cuda_burton_miller_identity_cache!(cache.device_identity_cache)
-    BeatEngineCore.cuda_module().unsafe_free!(cache.device_bem_flux)
+    cache.device_bem_flux === nothing || BeatEngineCore.cuda_module().unsafe_free!(cache.device_bem_flux)
+    BeatEngineCore.release_cuda_bem_flux_cache!(cache.device_bem_flux_sparse)
     for (name, sparse_cache) in pairs(cache.device_sparse_blocks)
         if name == :wall_impedance
             for wall_cache in sparse_cache
@@ -1925,7 +1942,13 @@ function build_coupled_system(
     transducers::AbstractVector{ElectrodynamicTransducer{T}}=ElectrodynamicTransducer{T}[],
     transducer_operators=nothing,
     prescribed_bem_normal_velocity=nothing,
+    coupled_bem_assembly::Symbol=:auto,
+    coupled_bem_image_fusion::Bool=true,
+    coupled_bem_max_registers::Int=0,
 ) where {T<:AbstractFloat}
+    assembly_mode = resolve_coupled_bem_assembly(coupled_bem_assembly, bem_backend, validation_diagnostics)
+    (coupled_bem_max_registers == 0 || 32 <= coupled_bem_max_registers <= 255) ||
+        error("coupled_bem_max_registers must be 0 (compiler default) or 32 through 255.")
     static_condensation && !(bem_backend in (:cuda, :rocm)) && error(
         "FEM static condensation is currently available only for CUDA and ROCm coupled backends.",
     )
@@ -1956,6 +1979,7 @@ function build_coupled_system(
         bem_backend=bem_backend,
         symmetry_mode=symmetry_mode,
         retained_fem_vertices=retained_fem_vertices,
+        coupled_bem_assembly=assembly_mode,
         bulk_loss_factor_by_vertex=(
             isnothing(bulk_loss_factor_by_vertex) ?
             fill(bulk_loss_factor, length(fem_mesh.vertices)) :
@@ -2013,7 +2037,12 @@ function build_coupled_system(
     fem_system_s = (time_ns() - fem_stage_started) / 1.0e9
 
     bem_operator_started = time_ns()
-    operators = assemble_regular_galerkin_operators(
+    fuse_images = assembly_mode == :combined && coupled_bem_image_fusion &&
+        length(BeatEngineCore.symmetry_image_transforms(prepared.symmetry_mode)) > 1
+    image_max_registers = fuse_images ? coupled_bem_max_registers : 0
+    operators = assembly_mode == :combined ? BeatEngineCore.assemble_coupled_burton_miller_cuda(
+        bem_mesh, prepared, wavenumber; fused=fuse_images, max_registers=image_max_registers,
+    ) : assemble_regular_galerkin_operators(
         bem_mesh,
         prepared.p1,
         prepared.dp0,
@@ -2035,13 +2064,20 @@ function build_coupled_system(
     bem_matrix_started = time_ns()
     linear_backend = bem_backend in (:cuda, :rocm) && !validation_diagnostics ?
                      bem_backend : :cpu
-    bem_blocks = if bem_backend in (:cuda, :rocm)
+    bem_blocks = if assembly_mode == :combined
+        BeatEngineCore.build_cuda_combined_bem_blocks(operators, prepared.device_bem_flux_sparse,
+            bem_motion_flux, bem_prescribed_neumann)
+    elseif bem_backend in (:cuda, :rocm)
         accelerator = bem_backend == :cuda ?
                       BeatEngineCore.cuda_module() : BeatEngineCore.amdgpu_module()
         device_array = bem_backend == :cuda ? accelerator.CuArray : accelerator.ROCArray
         device_bem_motion_flux = nothing
         device_bem_prescribed_neumann = nothing
+        temporary_bem_flux = nothing
         try
+            if prepared.device_bem_flux === nothing
+                temporary_bem_flux = device_array(Complex{T}.(Matrix(interface_operators.bem_flux)))
+            end
             if transducer_count > 0
                 device_bem_motion_flux = device_array(
                     Matrix(bem_motion_flux),
@@ -2058,7 +2094,7 @@ function build_coupled_system(
                 operators,
                 prepared.device_identity_cache.identity_p1_p1,
                 prepared.device_identity_cache.identity_p1_dp0,
-                prepared.device_bem_flux,
+                temporary_bem_flux === nothing ? prepared.device_bem_flux : temporary_bem_flux,
                 wavenumber;
                 validation_diagnostics=validation_diagnostics,
                 keep_device=linear_backend in (:cuda, :rocm),
@@ -2068,6 +2104,7 @@ function build_coupled_system(
             )
         finally
             release_operator_storage!(operators)
+            temporary_bem_flux === nothing || accelerator.unsafe_free!(temporary_bem_flux)
             isnothing(device_bem_motion_flux) ||
                 accelerator.unsafe_free!(device_bem_motion_flux)
             isnothing(device_bem_prescribed_neumann) ||
@@ -2378,6 +2415,9 @@ function build_coupled_system(
         prescribed_bem_rhs=bem_prescribed_rhs,
         prescribed_bem_neumann=bem_prescribed_neumann,
         bem_backend=bem_backend,
+        coupled_bem_assembly=assembly_mode,
+        coupled_bem_image_fusion=fuse_images,
+        coupled_bem_max_registers=image_max_registers,
         linear_backend=linear_backend,
         symmetry_mode=prepared.symmetry_mode,
         cache=prepared,

@@ -836,3 +836,7 @@ end
         release_cuda_image_singular_correction_cache!(image_cache)
     end
 end
+
+if cuda_available()
+    include(joinpath(@__DIR__, "coupled_bem_cuda_tests.jl"))
+end

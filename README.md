@@ -79,6 +79,12 @@ CPU and ROCm continue to use that path. The result diagnostics report the
 effective assembly mode and factorization count. Coupled FEM-BEM solves are
 unaffected by this exterior option.
 
+Coupled CUDA solves without full diagnostics now default to combined A/C
+Burton-Miller assembly, job-cached sparse interface projection, and fused symmetry
+images. The original operator path remains available for comparisons and full
+diagnostics. Register caps are explicit hardware tuning options; the compiler
+default is preserved. See [coupled CUDA architecture and controls](docs/Coupled%20CUDA%20Assembly.md).
+
 The stable package release is `0.1.0`. CI builds a wheel after independent
 Python and CPU checks on Windows, Linux, and macOS. The manually dispatched release
 workflow requires a successful CI run for the tag's exact commit before attaching
