@@ -10,6 +10,7 @@ function _cuda_bm_identity_kernel!(
     p1_dof_count,
     face_count,
     rhs_only,
+    identity_p1_p1_block=nothing,
 )
     face_index = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     face_index > face_count && return nothing
@@ -21,11 +22,17 @@ function _cuda_bm_identity_kernel!(
     off_diagonal = area / typeof(area)(12)
 
     if !rhs_only
-        for (row, col, value) in (
+        for (entry, (row, col, value)) in enumerate((
             (row1, row1, diagonal), (row1, row2, off_diagonal), (row1, row3, off_diagonal),
             (row2, row1, off_diagonal), (row2, row2, diagonal), (row2, row3, off_diagonal),
             (row3, row1, off_diagonal), (row3, row2, off_diagonal), (row3, row3, diagonal),
-        )
+        ))
+            # Optional quadrature-consistent mass block for the main exterior
+            # solver, including its deliberately underintegrated order-1 rule.
+            # The P1 mass block is symmetric, so row/column tuple order agrees.
+            if identity_p1_p1_block !== nothing
+                value = area * identity_p1_p1_block[entry]
+            end
             _cuda_atomic_add!(matrix_re, row + (col - 1) * p1_dof_count, typeof(area)(0.5) * value)
         end
     end
@@ -364,6 +371,7 @@ function assemble_burton_miller_neumann_system_cuda(
     device_image_near_correction_cache=nothing,
     symmetry_mode::Symbol=:off,
     timing=nothing,
+    identity_p1_p1_block=nothing,
 ) where {T<:AbstractFloat}
     CUDA.functional() || error("Direct Burton-Miller CUDA assembly requested, but CUDA.functional() is false.")
     length(q_neumann) == dp0_space.global_dof_count || error("Direct Burton-Miller Neumann vector size mismatch.")
@@ -455,6 +463,7 @@ function assemble_burton_miller_neumann_system_cuda(
                 p1_count,
                 length(mesh.faces),
                 false,
+                identity_p1_p1_block,
             )
             CUDA.synchronize()
         end

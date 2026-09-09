@@ -714,6 +714,52 @@ function exterior_component_impedance(mesh, pressure, excitation, symmetry_mode,
     return force * T(symmetry_reduction_factor(symmetry_mode))
 end
 
+function solve_exterior_direct_cuda(
+    mesh, p1_space, dp0_space, neumann_values, wavenumber, rule; kwargs...,
+)
+    # Deploy's direct assembler forms A and b without materializing S, D, D' or H.
+    # Keep one pivoted factorization for all independently retained excitations.
+    cuda = BeatEngineCore.CUDA_MODULE
+    system = factorization = device_neumann = rhs = pressure = nothing
+    rhs_columns = Any[]
+    try
+        assembly_started = time_ns()
+        device_neumann = cuda.CuArray(first(neumann_values))
+        system = assemble_burton_miller_neumann_system_cuda(
+            mesh, p1_space, dp0_space, device_neumann, wavenumber, rule;
+            identity_p1_p1_block=Tuple(BeatEngineCore.l2_identity_element_matrix(
+                one(wavenumber), :p1, :p1, rule,
+            )),
+            kwargs...,
+        )
+        for neumann in Iterators.drop(neumann_values, 1)
+            copyto!(device_neumann, neumann)
+            push!(rhs_columns, assemble_burton_miller_rhs_cuda(
+                mesh, p1_space, dp0_space, device_neumann, wavenumber, rule; kwargs...,
+            ))
+        end
+        rhs = isempty(rhs_columns) ? system.rhs : hcat(system.rhs, rhs_columns...)
+        cuda.synchronize()
+        assembly_s = (time_ns() - assembly_started) / 1.0e9
+        solve_started = time_ns()
+        factorization = lu!(system.matrix)
+        pressure = factorization \ rhs
+        host_pressure = reshape(Array(pressure), p1_space.global_dof_count, length(neumann_values))
+        pressures = [copy(column) for column in eachcol(host_pressure)]
+        solve_s = (time_ns() - solve_started) / 1.0e9
+        return pressures, assembly_s, solve_s
+    finally
+        pressure === nothing || cuda.unsafe_free!(pressure)
+        (rhs === nothing || (system !== nothing && rhs === system.rhs)) || cuda.unsafe_free!(rhs)
+        for column in rhs_columns
+            cuda.unsafe_free!(column)
+        end
+        factorization === nothing || cuda.unsafe_free!(factorization.ipiv)
+        system === nothing || release_burton_miller_system_cuda!(system)
+        device_neumann === nothing || cuda.unsafe_free!(device_neumann)
+    end
+end
+
 function solve_exterior_request(request, system, unbounded_region; event_mode=false)
     meshes = system["meshes"]
     boundaries = system["boundaries"]
@@ -725,6 +771,12 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 error("Exterior precision must be float32 or float64.")
     backend = Symbol(lowercase(String(get(options, "bem_backend", "cpu"))))
     backend in (:cpu, :cuda, :rocm) || error("Exterior BEM backend must be cpu, cuda, or rocm.")
+    requested_assembly = lowercase(String(get(options, "burton_miller_assembly", "direct_system")))
+    requested_assembly in ("direct_system", "operator_matrices") || error(
+        "Exterior burton_miller_assembly must be direct_system or operator_matrices.",
+    )
+    direct_cuda_assembly = backend == :cuda && requested_assembly == "direct_system"
+    assembly_mode = direct_cuda_assembly ? "direct_system" : "operator_matrices"
     symmetry_mode = BeatEngineCore.normalized_symmetry_mode(get(options, "symmetry", "off"))
     sound_speed = FloatType(unbounded_region["sound_speed_m_per_s"])
     density = FloatType(unbounded_region["density_kg_per_m3"])
@@ -751,10 +803,10 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     singular_order = Int(get(options, "singular_order", 4))
     base_rule = triangle_rule(FloatType, base_order)
     singular_cache = build_singular_correction_cache(mesh, singular_order)
-    identity_p1_p1 = assemble_l2_identity_matrix(
+    identity_p1_p1 = direct_cuda_assembly ? nothing : assemble_l2_identity_matrix(
         mesh, p1_space, dp0_space, base_rule, :p1, :p1; symmetry_mode=symmetry_mode,
     )
-    identity_p1_dp0 = assemble_l2_identity_matrix(
+    identity_p1_dp0 = direct_cuda_assembly ? nothing : assemble_l2_identity_matrix(
         mesh, p1_space, dp0_space, base_rule, :p1, :dp0; symmetry_mode=symmetry_mode,
     )
     cpu_field_cache = build_field_evaluation_cache(mesh, base_rule; symmetry_mode=symmetry_mode)
@@ -791,7 +843,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                                   build_cuda_image_singular_correction_cache(
         mesh, p1_space, dp0_space, singular_order, eachindex(mesh.faces), symmetry_mode,
     ) : nothing
-    device_identity_cache = if backend == :cuda
+    device_identity_cache = if backend == :cuda && !direct_cuda_assembly
         build_cuda_burton_miller_identity_cache(identity_p1_p1, identity_p1_dp0, FloatType)
     elseif backend == :rocm
         build_rocm_burton_miller_identity_cache(identity_p1_p1, identity_p1_dp0, FloatType)
@@ -844,43 +896,53 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     symmetry_mode=symmetry_mode,
                 )
             end : nothing
-            assembly_started = time_ns()
-            operators = assemble_regular_galerkin_operators(
-                mesh,
-                p1_space,
-                dp0_space,
-                wavenumber,
-                rule;
-                skip_singular=false,
-                singular_order=singular_order,
-                backend=backend,
-                device_cache=device_cache,
-                return_device=accelerator_backend,
-                accelerator_quadrature=accelerator_backend,
-                singular_cache=singular_cache,
-                cpu_cache=selected_cpu_cache,
-                device_singular_cache=device_singular_cache,
-                device_image_singular_cache=device_image_singular_cache,
-                symmetry_mode=symmetry_mode,
-            )
-            assembly_s = (time_ns() - assembly_started) / 1.0e9
-            solve_started = time_ns()
-            cpu_system = backend == :cpu ? build_burton_miller_neumann_cpu_system(
-                operators, selected_identity[1], selected_identity[2], wavenumber,
-            ) : nothing
-            pressures = Vector{Vector{Complex{FloatType}}}()
-            neumann_values = Vector{Vector{Complex{FloatType}}}()
-            for excitation in excitations
-                neumann = exterior_neumann(mesh, excitation, density, omega)
-                pressure = backend == :cpu ?
-                           solve_burton_miller_neumann_cpu_system(cpu_system, neumann, FloatType) :
-                           solve_burton_miller_neumann(
-                    operators, device_identity_cache, neumann, wavenumber,
+            neumann_values = [exterior_neumann(mesh, excitation, density, omega) for excitation in excitations]
+            operators = nothing
+            if direct_cuda_assembly
+                pressures, assembly_s, solve_s = solve_exterior_direct_cuda(
+                    mesh, p1_space, dp0_space, neumann_values, wavenumber, rule;
+                    device_cache=device_cache,
+                    singular_cache=singular_cache,
+                    device_singular_cache=device_singular_cache,
+                    device_image_singular_cache=device_image_singular_cache,
+                    symmetry_mode=symmetry_mode,
                 )
-                push!(pressures, Complex{FloatType}.(pressure))
-                push!(neumann_values, neumann)
+            else
+                assembly_started = time_ns()
+                operators = assemble_regular_galerkin_operators(
+                    mesh,
+                    p1_space,
+                    dp0_space,
+                    wavenumber,
+                    rule;
+                    skip_singular=false,
+                    singular_order=singular_order,
+                    backend=backend,
+                    device_cache=device_cache,
+                    return_device=accelerator_backend,
+                    accelerator_quadrature=accelerator_backend,
+                    singular_cache=singular_cache,
+                    cpu_cache=selected_cpu_cache,
+                    device_singular_cache=device_singular_cache,
+                    device_image_singular_cache=device_image_singular_cache,
+                    symmetry_mode=symmetry_mode,
+                )
+                assembly_s = (time_ns() - assembly_started) / 1.0e9
+                solve_started = time_ns()
+                cpu_system = backend == :cpu ? build_burton_miller_neumann_cpu_system(
+                    operators, selected_identity[1], selected_identity[2], wavenumber,
+                ) : nothing
+                pressures = Vector{Vector{Complex{FloatType}}}()
+                for neumann in neumann_values
+                    pressure = backend == :cpu ?
+                               solve_burton_miller_neumann_cpu_system(cpu_system, neumann, FloatType) :
+                               solve_burton_miller_neumann(
+                        operators, device_identity_cache, neumann, wavenumber,
+                    )
+                    push!(pressures, Complex{FloatType}.(pressure))
+                end
+                solve_s = (time_ns() - solve_started) / 1.0e9
             end
-            solve_s = (time_ns() - solve_started) / 1.0e9
             quantities = Dict{String,Any}[]
             field_s = 0.0
             for output in outputs
@@ -971,6 +1033,8 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 "bem_backend" => String(backend),
                 "symmetry" => String(symmetry_mode),
                 "formulation" => "exterior_burton_miller_neumann",
+                "burton_miller_assembly" => assembly_mode,
+                "factorization_count" => direct_cuda_assembly || backend == :cpu ? 1 : length(excitations),
                 "linear_solver" => backend == :cpu ?
                                    "cpu_dense_lu" :
                                    backend == :cuda ? "cuda_dense_lu" : "rocm_rocsolver_dense_lu",
@@ -997,7 +1061,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
             record_result_provenance!(result, request)
             println(JSON.json(event_mode ? Dict("type" => "result", "result" => result) : result))
             flush(stdout)
-            release_operator_storage!(operators)
+            operators === nothing || release_operator_storage!(operators)
             solved_count = frequency_index
         end
     finally

@@ -71,6 +71,14 @@ backends. Some historical research scripts and the optional noncubic-cavity test
 still require Boundary Lab's extended fixtures; they are not installed runtime
 requirements or part of the portable release gate.
 
+Exterior-only compiled-system CUDA solves default to direct Burton–Miller
+assembly, using the same assembler as Deploy. One pivoted LU factorization
+serves all excitation right-hand sides at a frequency. Set the solver option
+`burton_miller_assembly` to `operator_matrices` for the previous assembly path;
+CPU and ROCm continue to use that path. The result diagnostics report the
+effective assembly mode and factorization count. Coupled FEM-BEM solves are
+unaffected by this exterior option.
+
 The stable package release is `0.1.0`. CI builds a wheel after independent
 Python and CPU checks on Windows, Linux, and macOS. The manually dispatched release
 workflow requires a successful CI run for the tag's exact commit before attaching
