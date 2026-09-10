@@ -1,6 +1,7 @@
 # BEAT Engine Apple Metal
 
-BEAT Engine Apple Metal is Boundary Lab's local Apple Silicon GPU backend. It
+BEAT Engine Apple Metal is the engine's Apple Silicon GPU backend, used by
+Boundary Lab and by any other client of the worker. It
 uses the same mesh model, Burton-Miller formulation, symmetry rules, and result
 protocol as the other BEAT Engine backends while moving the dense BEM operator
 assembly and exterior-field evaluation to the GPU through Metal.jl.
@@ -15,8 +16,34 @@ The backend supports:
   points.
 
 Production solves use `Float32` and `ComplexF32`, which is also the only
-floating-point precision Apple GPUs provide. See [BEAT Engine
-Core](beat-engine-core.md) for the shared boundary-integral formulation.
+floating-point precision Apple GPUs provide. Boundary Lab's [BEAT Engine
+Core](https://github.com/JWSound/boundary-lab/blob/main/docs/advanced/beat-engine-core.md)
+notes describe the shared boundary-integral formulation.
+
+## Compiled-system requests
+
+Select the backend with `solver_options.bem_backend = "metal"` in a
+compiled-system request; Boundary Lab exposes this as **BEAT Engine (Apple
+Metal)** (`beat_metal`). The worker advertises `metal` in its ready handshake
+when Metal.jl reports a functional device, with both phasor conventions: the
+kernels receive the signed outgoing wavenumber at host entry exactly as CUDA
+and ROCm do, and the fused Burton-Miller kernels combine the coupling with that
+same signed value. See [Phasor Convention](Phasor%20Convention.md).
+
+Exterior solves honour `burton_miller_assembly`. The default `direct_system`
+is the fused path described below, which forms the system on the GPU without
+the four operators and factorizes once on the host; `operator_matrices`
+assembles the four operators and combines them on the host, and the diagnostic
+kernel modes (`host_staged` assembly, the `host` singular mode, the reference
+regular kernels) fall back to it. Diagnostics report the effective mode and a
+`linear_solver` of `metal_assembly_cpu_dense_lu` or `metal_assembly_cpu_dense_gmres`.
+The `BLAB_BEAT_FUSED_BM` variable below governs the source-request driver only.
+
+Coupled solves keep `coupled_bem_assembly = operators`. The combined A/C
+assembly is a CUDA device-block path; Metal assembles the four operators on the
+GPU and runs the coupled algebra and the FEM static condensation on the host
+through `metal_host_operators`, so requesting `combined` on Metal fails clearly.
+See [Coupled CUDA Assembly](Coupled%20CUDA%20Assembly.md).
 
 ## Execution model
 
@@ -26,8 +53,8 @@ coupled FEM-BEM-LEM solves, the `host_staged` assembly fallback and the `host`
 singular mode use, and `BLAB_BEAT_FUSED_BM=0` selects it for exterior solves
 too.
 
-Boundary Lab prepares mesh topology, quadrature rules, symmetry transforms, and
-frequency-independent cache data on the CPU. The Metal worker then:
+The worker prepares mesh topology, quadrature rules, symmetry transforms, and
+frequency-independent cache data on the CPU. The Metal path then:
 
 1. allocates the single-layer, double-layer, adjoint double-layer, and
    hypersingular matrices as `MtlArray` objects;
@@ -291,7 +318,7 @@ inside `build_coupled_system` with a `ccall` binding to Apple Accelerate's
 sparse LU as an optional interior solver (`BLAB_METAL_FEM_CONDENSATION=accelerate`).
 Both are gone from this tree. Tag `archive/metal-host-condensation` is the last
 commit that carries them, and [Options: speeding up FEM static condensation on
-Apple Metal](beat-engine-metal-condensation-options.md) records the full
+Apple Metal](Metal%20FEM%20Condensation%20Options.md) records the full
 argument.
 
 Why: the host condensation duplicated what the condensed solver already does
@@ -310,25 +337,34 @@ touching the numerics.
 
 - An M-series Mac running macOS 14 or newer.
 - Julia 1.10 to 1.12.
-- The dedicated `src/blab/solvers/julia_metal` environment with Metal.jl.
+- The dedicated `src/beat_engine/julia_metal` environment with Metal.jl.
 
 To prepare the Julia environment from the repository root:
 
 ```bash
-julia --project=src/blab/solvers/julia_metal -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
+python -m beat_engine instantiate --backend metal
+python -m beat_engine doctor --backend metal --threads 2
+```
+
+or directly with Julia:
+
+```bash
+julia --project=src/beat_engine/julia_metal -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
 ```
 
 Verify the runtime:
 
 ```bash
-julia --project=src/blab/solvers/julia_metal -e 'using Metal; Metal.functional() || error("Metal unavailable"); Metal.versioninfo()'
+julia --project=src/beat_engine/julia_metal -e 'using Metal; Metal.functional() || error("Metal unavailable"); Metal.versioninfo()'
 ```
 
 ## Selecting the backend
 
-In application preferences, select **BEAT Engine (Apple Metal)**. The backend
-identifier used by project and server workflows is `beat_metal`. The entry
-is only offered on Apple Silicon macOS.
+A compiled-system request selects Metal with `solver_options.bem_backend =
+"metal"`, and a source request with `config.beat_backend = "metal"`; the worker
+must run with the `julia_metal` project (`engine_paths("metal")`). Boundary Lab
+exposes this in application preferences as **BEAT Engine (Apple Metal)**, backend
+identifier `beat_metal`, and only offers it on Apple Silicon macOS.
 
 ## Runtime controls
 
@@ -352,8 +388,8 @@ Normal application use does not require these environment variables.
 | `BLAB_SCHUR_BLOCK` | unset | Coupled solves: pins the Schur complement right-hand-side block width, bypassing the thread-count balancing. For measurement only. |
 | `BLAB_BEAT_FUSED_BM` | `1` | Set to `0` to assemble the four operators and combine them on the host for exterior solves. Coupled solves, `host_staged` assembly and the `host` singular mode always take the four-operator path. |
 
-The fused system is then solved by the adaptive dense solve described in
-[BEAT Engine Core](beat-engine-core.md#adaptive-dense-solve) — dense LU or
+The fused system is then solved by the adaptive dense solve described at the
+head of [`BeatEngineDenseSolve.jl`](../src/beat_engine/julia_local/src/BeatEngineDenseSolve.jl) — dense LU or
 diagonally preconditioned GMRES, chosen per solve. Metal has no GPU LU, so
 both routes run on the host; shared storage means the host reads the assembled
 matrix in place rather than copying it. Its environment overrides:
@@ -388,8 +424,8 @@ CPU-versus-Metal validation scripts:
 For example:
 
 ```bash
-julia -t auto --project=src/blab/solvers/julia_metal \
-  src/blab/solvers/julia_local/scripts/validate_metal_exterior.jl
+julia -t auto --project=src/beat_engine/julia_metal \
+  src/beat_engine/julia_local/scripts/validate_metal_exterior.jl
 ```
 
 `BLAB_VALIDATE_MESH`, `BLAB_VALIDATE_REGULAR_ORDER`,

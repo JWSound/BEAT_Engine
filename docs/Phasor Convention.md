@@ -19,7 +19,8 @@ FEM loss `+i eta k^2 M`, and electrical `s=+i omega`. Physical frequency and
 wavenumber remain positive. CUDA/ROCm kernels receive signed propagation
 parameters at host entry, without allocating conjugated dense operators.
 
-CPU and CUDA are qualified. The ROCm arithmetic is wired but positive-time
+CPU, CUDA, and Metal are qualified; Metal on an Apple M1 Pro through the Metal
+arm of the native conjugation test. The ROCm arithmetic is wired but positive-time
 worker requests are blocked until AMD hardware qualification. Legacy ROCm
 requests remain supported.
 

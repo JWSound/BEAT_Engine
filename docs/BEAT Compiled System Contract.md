@@ -167,3 +167,7 @@ These options affect the coupled CUDA numerical path, independently of the
 exterior-only `burton_miller_assembly` option. Diagnostics retain the individual
 operators. Unsupported modes/backends fail before frequency assembly. See
 [Coupled CUDA Assembly](Coupled%20CUDA%20Assembly.md) for applicability and cache semantics.
+`burton_miller_assembly` applies to CUDA and Metal exterior solves; on Metal,
+`direct_system` selects the fused assembler described in
+[Metal Backend](Metal%20Backend.md), and `coupled_bem_assembly` resolves to
+`operators`.

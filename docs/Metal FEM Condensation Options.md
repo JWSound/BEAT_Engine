@@ -3,7 +3,7 @@
 Written for review. This records where the time actually goes in the coupled
 per-frequency budget on Apple Metal, the four options for reducing it, and the
 tradeoffs of each. It is a decision document, not a description of shipped
-behaviour — see [BEAT Engine Apple Metal](beat-engine-metal.md) for what the
+behaviour — see [BEAT Engine Apple Metal](Metal%20Backend.md) for what the
 backend does today.
 
 ## Why this came up
@@ -267,8 +267,8 @@ premise of this document was that the condensation had to get *faster*. It did
 not: it had to stop being on the critical path. The condensation is independent
 of the BEM operator assembly within a frequency, and on an accelerator backend
 the two use different processors, so they now run concurrently — see [Stage
-overlap](beat-engine-metal.md#stage-overlap). Together with the Schur block
-balancing in [Schur block balance](beat-engine-metal.md#schur-block-balance),
+overlap](Metal%20Backend.md#stage-overlap). Together with the Schur block
+balancing in [Schur block balance](Metal%20Backend.md#schur-block-balance),
 `F2B_FLH` went from 2.68 s to 1.70 s per frequency, and Metal from a tie with
 BEAT CPU to 1.62x ahead of it, with bit-identical outputs.
 

@@ -46,9 +46,18 @@ discretization. The analytical exterior tests independently use order 3. Ordinar
 
 ## Accelerator and extended qualification
 
-The existing `BLAB_RUN_COUPLED_CUDA=1` and `BLAB_RUN_COUPLED_ROCM=1` gates in
-`runtests.jl` still require functioning hardware and their corresponding Julia
-projects. CPU reference success does not qualify CUDA, ROCm, or future Metal.
+The existing `BLAB_RUN_COUPLED_CUDA=1`, `BLAB_RUN_COUPLED_ROCM=1` and
+`BLAB_RUN_COUPLED_METAL=1` gates in `runtests.jl` still require functioning
+hardware and their corresponding Julia projects. CPU reference success does not
+qualify CUDA, ROCm, or Metal.
+
+The Metal gate runs with the `julia_metal` project on Apple Silicon. Its
+`metal production pipeline` testset solves `off`, `x` and `xy` on the meshes
+that are fundamental domains for each, checks the operators land on the GPU
+and come back as host matrices, compares the fused Burton-Miller system with
+the four-operator one, and asserts two assemblies are bit-identical, which the
+gather write-back guarantees and an atomic scatter cannot. The coupled Metal
+tests and the Metal arm of the phasor conjugation test run under the same gate.
 Hardware release runs must inspect actual test execution; an unavailable-device
 skip is not a numerical pass.
 
