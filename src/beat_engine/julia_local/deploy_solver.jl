@@ -1047,6 +1047,7 @@ function solve_deploy_request_impl(
         release_deploy_boundary_state!()
         DEPLOY_BOUNDARY_STATE[] = (
             solution_key=solution_key,
+            phasor_convention=phasor_convention(),
             backend=beat_backend,
             frequency=frequency,
             wavenumber=k,
@@ -1316,6 +1317,7 @@ function evaluate_deploy_field_request_impl(request)
     solution_key == state.solution_key || error(
         "Deploy field request does not match the cached boundary solution.",
     )
+    phasor_convention() == state.phasor_convention || error("Deploy field convention does not match cached solution.")
     beat_backend = beat_backend_from_request(request)
     beat_backend == state.backend || error("Deploy field request backend does not match the cached solution.")
     FloatType = Float32

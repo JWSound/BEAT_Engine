@@ -2,6 +2,9 @@
 
 using Base64, JSON, LinearAlgebra, SparseArrays, StaticArrays, Statistics
 
+include(joinpath(@__DIR__, "src", "BeatEngineContract.jl"))
+using .BeatEngineContract
+
 include(joinpath(@__DIR__, "src", "BeatEngineCore.jl"))
 using .BeatEngineCore
 include(joinpath(@__DIR__, "src", "BeatEngineCoupled.jl"))
@@ -12,16 +15,32 @@ include(joinpath(@__DIR__, "src", "BeatEngineSpeakerRom.jl"))
 using .BeatEngineSpeakerRom
 
 const DEFAULT_TRANSDUCER_REFERENCE_VOLTAGE_V = 2.83
+const RUN_MESH_PROVENANCE = Ref{Any}([])
+
+function record_result_provenance!(result, request)
+    diagnostics = result["diagnostics"]
+    diagnostics["phasor_convention"] = phasor_convention()
+    backend = get(diagnostics, "bem_backend", get(diagnostics, "linear_backend", nothing))
+    device, device_error = try
+        accelerator = backend == "cuda" ? BeatEngineCore.CUDA_MODULE : backend == "rocm" ? BeatEngineCore.AMDGPU_MODULE :
+                      backend == "metal" ? BeatEngineCore.METAL_MODULE : nothing
+        (backend == "cpu" ? Sys.CPU_NAME : accelerator === nothing ? nothing : string(accelerator.device()), nothing)
+    catch exception
+        (nothing, sprint(showerror, exception))
+    end
+    diagnostics["engine_provenance"] = Dict(
+        "schema_version" => 1,
+        "engine" => merge(deepcopy(BeatEngineContract.WORKER["engine"]), BeatEngineContract.BeatEngineProvenance.engine_identity()),
+        "runtime" => BeatEngineContract.BeatEngineProvenance.runtime_identity(),
+        "execution" => Dict("backend" => backend, "device" => device, "device_query_error" => device_error,
+            "precision" => get(diagnostics, "precision", nothing), "solver_options" => deepcopy(request["solver_options"])),
+        "meshes" => deepcopy(RUN_MESH_PROVENANCE[]),
+    )
+    return result
+end
 const BEM_FIELD_EVALUATION_CACHES = Dict{String,Any}()
 const BEM_FIELD_EVALUATION_CACHE_ORDER = String[]
-const MAX_BEM_FIELD_EVALUATION_CACHES = 2
-const SPEAKER_MACRO_QUANTITIES = Set([
-    "speaker_macro_k",
-    "speaker_macro_c",
-    "speaker_macro_d",
-    "speaker_macro_b",
-    "speaker_macro_e",
-])
+const MAX_BEM_FIELD_EVALUATION_CACHES = Int(BeatEngineContract.WORKER["field_cache"]["max_entries"])
 const SPEAKER_ROM_QUANTITIES = Set([
     "speaker_rom_k",
     "speaker_rom_c",
@@ -34,7 +53,7 @@ const SPEAKER_ROM_QUANTITIES = Set([
     "speaker_rom_current_drive",
 ])
 
-function speaker_macro_state_layout(system)
+function speaker_interior_state_layout(system)
     gamma_count = length(system.gamma_range)
     interface_count = length(system.flux_range)
     transducer_count = length(system.transducers)
@@ -55,9 +74,9 @@ function speaker_macro_state_layout(system)
     )
 end
 
-function speaker_macro_k_matrix(system)
+function speaker_interior_state_matrix(system)
     system.formulation == :fem_interface_condensed || error(
-        "Speaker macro construction requires the FEM-interface-condensed formulation.",
+        "Speaker ROM construction requires the FEM-interface-condensed formulation.",
     )
     condensation = system.condensation
     schur = if hasproperty(condensation, :schur)
@@ -65,14 +84,14 @@ function speaker_macro_k_matrix(system)
     elseif hasproperty(condensation, :device_schur)
         Array(condensation.device_schur)
     else
-        error("Speaker macro construction requires a retained FEM Schur complement.")
+        error("Speaker ROM construction requires a retained FEM Schur complement.")
     end
     T = system.scalar_type
-    layout = speaker_macro_state_layout(system)
+    layout = speaker_interior_state_layout(system)
     retained = system.retained_fem_vertices
     interface_operators = system.interface_operators
     transducer_operators = system.transducer_operators
-    normal_derivative_scale = Complex{T}(0, system.density * system.omega)
+    normal_derivative_scale = neumann_scale(system.density, system.omega)
 
     k_matrix = zeros(Complex{T}, layout.state_count, layout.state_count)
     k_matrix[layout.gamma_range, layout.gamma_range] .= Complex{T}.(schur)
@@ -205,7 +224,7 @@ function _speaker_rank_boundary_patterns(system, count::Int, sequence_offset::In
         if isodd(sample_index)
             for (row, vertex) in enumerate(vertices)
                 phase = system.wavenumber * dot(T.(vertex) .- center, direction)
-                patterns[row, column] = cis(phase)
+                patterns[row, column] = cis(propagation_sign() * phase)
             end
         else
             exit_distance = minimum(
@@ -217,14 +236,14 @@ function _speaker_rank_boundary_patterns(system, count::Int, sequence_offset::In
             source = center .+ (exit_distance + clearance) .* direction
             for (row, vertex) in enumerate(vertices)
                 distance = norm(T.(vertex) .- source)
-                patterns[row, column] = cis(system.wavenumber * distance) / distance
+                patterns[row, column] = cis(outgoing_wavenumber(system.wavenumber) * distance) / distance
             end
         end
     end
     return patterns
 end
 
-function _speaker_macro_factorization(system, k_matrix)
+function _speaker_interior_factorization(system, k_matrix)
     if system.linear_backend == :cuda
         cuda = BeatEngineCore.cuda_module()
         device_matrix = cuda.CuArray(k_matrix)
@@ -235,13 +254,13 @@ function _speaker_macro_factorization(system, k_matrix)
     return (backend=:cpu, factorization=lu!(k_matrix), storage=nothing)
 end
 
-function _release_speaker_macro_factorization!(factor)
+function _release_speaker_interior_factorization!(factor)
     factor.backend == :cuda || return nothing
     BeatEngineCore.cuda_module().unsafe_free!(factor.storage)
     return nothing
 end
 
-function _speaker_macro_solve(factor, rhs)
+function _speaker_interior_solve(factor, rhs)
     if factor.backend == :cuda
         cuda = BeatEngineCore.cuda_module()
         device_rhs = cuda.CuArray(rhs)
@@ -330,15 +349,15 @@ function speaker_rom_rank_experiment(system, raw_config)
     patterns_s = (time_ns() - patterns_started) / 1.0e9
 
     factor_started = time_ns()
-    k_matrix, layout = speaker_macro_k_matrix(system)
-    factor = _speaker_macro_factorization(system, k_matrix)
+    k_matrix, layout = speaker_interior_state_matrix(system)
+    factor = _speaker_interior_factorization(system, k_matrix)
     factor_s = (time_ns() - factor_started) / 1.0e9
     T = system.scalar_type
     trace_operator = system.interface_operators.bem_trace
     bem_force = system.transducer_operators.bem_force
     bem_flux = system.interface_operators.bem_flux
     bem_velocity = system.transducer_operators.bem_normal_velocity
-    normal_derivative_scale = Complex{T}(0, system.density * system.omega)
+    normal_derivative_scale = neumann_scale(system.density, system.omega)
     sectors = Dict{String,Any}[]
     solve_s = 0.0
     analysis_s = 0.0
@@ -360,7 +379,7 @@ function speaker_rom_rank_experiment(system, raw_config)
                 rhs[layout.mechanical_range, :] .= -transpose(bem_force) * pressure
             end
             sector_solve_started = time_ns()
-            state = _speaker_macro_solve(factor, rhs)
+            state = _speaker_interior_solve(factor, rhs)
             solve_s += (time_ns() - sector_solve_started) / 1.0e9
             output = bem_flux * view(state, layout.flux_range, :)
             if !isempty(layout.mechanical_range)
@@ -404,7 +423,7 @@ function speaker_rom_rank_experiment(system, raw_config)
             analysis_s += (time_ns() - sector_analysis_started) / 1.0e9
         end
     finally
-        _release_speaker_macro_factorization!(factor)
+        _release_speaker_interior_factorization!(factor)
     end
     complex_bytes = sizeof(Complex{T})
     package_estimates = [
@@ -464,123 +483,6 @@ function translated_volume_mesh(resource, ::Type{T}) where {T<:AbstractFloat}
         mesh.physical_names,
         mesh.quadratic_tetrahedra,
         mesh.quadratic_boundary_faces,
-    )
-end
-
-function speaker_macro_matrices(system, excitations, interface_ids, interface_ranges)
-    system.formulation == :fem_interface_condensed || error(
-        "Speaker macro export requires the FEM-interface-condensed formulation.",
-    )
-    system.linear_backend == :cpu || error(
-        "Speaker macro export currently requires the BEAT CPU condensation backend.",
-    )
-    T = system.scalar_type
-    k_matrix, layout = speaker_macro_k_matrix(system)
-    gamma_count = length(layout.gamma_range)
-    interface_count = length(layout.flux_range)
-    transducer_count = length(system.transducers)
-    bem_node_count = length(system.bem_mesh.vertices)
-    bem_face_count = length(system.bem_mesh.faces)
-    excitation_count = length(excitations)
-    gamma_range = layout.gamma_range
-    flux_range = layout.flux_range
-    mechanical_range = layout.mechanical_range
-    electrical_range = layout.electrical_range
-    state_count = layout.state_count
-
-    retained = system.retained_fem_vertices
-    interface_operators = system.interface_operators
-    transducer_operators = system.transducer_operators
-    normal_derivative_scale = Complex{T}(0, system.density * system.omega)
-
-    c_matrix = zeros(Complex{T}, state_count, bem_node_count)
-    c_matrix[flux_range, :] .= -Complex{T}.(Matrix(interface_operators.bem_trace))
-    if transducer_count > 0
-        c_matrix[mechanical_range, :] .= Complex{T}.(
-            transpose(Matrix(transducer_operators.bem_force)),
-        )
-    end
-
-    d_matrix = zeros(Complex{T}, bem_face_count, state_count)
-    d_matrix[:, flux_range] .= Complex{T}.(Matrix(interface_operators.bem_flux))
-    if transducer_count > 0
-        d_matrix[:, mechanical_range] .= normal_derivative_scale .* Complex{T}.(
-            Matrix(transducer_operators.bem_normal_velocity),
-        )
-    end
-
-    fem_rhs = zeros(Complex{T}, length(system.fem_mesh.vertices), excitation_count)
-    b_matrix = zeros(Complex{T}, state_count, excitation_count)
-    e_matrix = zeros(Complex{T}, bem_face_count, excitation_count)
-    for (column, excitation) in enumerate(excitations)
-        kind = Symbol(excitation.kind)
-        if kind == :normal_velocity
-            fem_boundary_tags = hasproperty(excitation, :fem_boundary_tags) ?
-                                Int.(excitation.fem_boundary_tags) :
-                                [Int(excitation.radiator_tag)]
-            fem_boundary_weights = hasproperty(excitation, :fem_boundary_weights) ?
-                                   T.(excitation.fem_boundary_weights) :
-                                   ones(T, length(fem_boundary_tags))
-            for (tag, weight) in zip(fem_boundary_tags, fem_boundary_weights)
-                fem_rhs[:, column] .+= assemble_prescribed_velocity_load(
-                    system.fem_mesh,
-                    tag,
-                    system.density,
-                    system.omega,
-                    Complex{T}(weight),
-                )
-            end
-            bem_source_index = hasproperty(excitation, :bem_source_index) ?
-                               Int(excitation.bem_source_index) :
-                               0
-            if bem_source_index > 0
-                e_matrix[:, column] .= view(
-                    system.prescribed_bem_neumann,
-                    :,
-                    bem_source_index,
-                )
-            end
-        elseif kind == :voltage
-            transducer_index = Int(excitation.transducer_index)
-            b_matrix[first(electrical_range) + transducer_index - 1, column] = one(Complex{T})
-        else
-            error("Unsupported speaker macro excitation kind: $kind.")
-        end
-    end
-    reduced_rhs, _interior_rhs = BeatEngineCoupledCondensed._forward_schur(
-        system.condensation,
-        fem_rhs,
-    )
-    b_matrix[gamma_range, :] .+= reduced_rhs
-
-    metadata = Dict{String,Any}(
-        "format_version" => 1,
-        "state_count" => state_count,
-        "state_blocks" => [
-            Dict("name" => "retained_fem_pressure", "offset" => 0, "count" => gamma_count, "unit" => "Pa"),
-            Dict("name" => "interface_normal_derivative", "offset" => gamma_count, "count" => interface_count, "unit" => "Pa/m"),
-            Dict("name" => "diaphragm_velocity", "offset" => gamma_count + interface_count, "count" => transducer_count, "unit" => "m/s"),
-            Dict("name" => "voice_coil_current", "offset" => gamma_count + interface_count + transducer_count, "count" => transducer_count, "unit" => "A"),
-        ],
-        "retained_fem_vertex_indices" => Int.(retained) .- 1,
-        "interface_ids" => String.(interface_ids),
-        "interface_offsets" => [first(range) - 1 for range in interface_ranges],
-        "interface_counts" => [length(range) for range in interface_ranges],
-        "transducer_component_ids" => [transducer.id for transducer in system.transducers],
-        "pressure_space" => "P1",
-        "normal_derivative_space" => "DP0",
-        "boundary_pressure_definition" => "exterior BEM Dirichlet trace in exported bem_node order",
-        "boundary_normal_derivative_definition" => "mesh-oriented exterior BEM normal derivative in exported bem_face order",
-        "input_normalization" => Dict("voltage" => "1 V", "normal_velocity" => "1 m/s"),
-        "equations" => ["K z + C p = B u", "q = D z + E u"],
-    )
-    return Dict(
-        "speaker_macro_k" => k_matrix,
-        "speaker_macro_c" => c_matrix,
-        "speaker_macro_d" => d_matrix,
-        "speaker_macro_b" => b_matrix,
-        "speaker_macro_e" => e_matrix,
-        "metadata" => metadata,
     )
 end
 
@@ -786,7 +688,7 @@ function exterior_neumann(mesh, excitation, density::T, omega::T) where {T<:Abst
     for (tag, amplitude) in zip(excitation.tags, excitation.amplitudes)
         for face_index in eachindex(mesh.faces)
             mesh.physical_tags[face_index] == tag || continue
-            values[face_index] = Complex{T}(0, density * omega * amplitude)
+            values[face_index] = neumann_scale(density, omega) * amplitude
         end
     end
     return values
@@ -816,6 +718,52 @@ function exterior_component_impedance(mesh, pressure, excitation, symmetry_mode,
     return force * T(symmetry_reduction_factor(symmetry_mode))
 end
 
+function solve_exterior_direct_cuda(
+    mesh, p1_space, dp0_space, neumann_values, wavenumber, rule; kwargs...,
+)
+    # Deploy's direct assembler forms A and b without materializing S, D, D' or H.
+    # Keep one pivoted factorization for all independently retained excitations.
+    cuda = BeatEngineCore.CUDA_MODULE
+    system = factorization = device_neumann = rhs = pressure = nothing
+    rhs_columns = Any[]
+    try
+        assembly_started = time_ns()
+        device_neumann = cuda.CuArray(first(neumann_values))
+        system = assemble_burton_miller_neumann_system_cuda(
+            mesh, p1_space, dp0_space, device_neumann, wavenumber, rule;
+            identity_p1_p1_block=Tuple(BeatEngineCore.l2_identity_element_matrix(
+                one(wavenumber), :p1, :p1, rule,
+            )),
+            kwargs...,
+        )
+        for neumann in Iterators.drop(neumann_values, 1)
+            copyto!(device_neumann, neumann)
+            push!(rhs_columns, assemble_burton_miller_rhs_cuda(
+                mesh, p1_space, dp0_space, device_neumann, wavenumber, rule; kwargs...,
+            ))
+        end
+        rhs = isempty(rhs_columns) ? system.rhs : hcat(system.rhs, rhs_columns...)
+        cuda.synchronize()
+        assembly_s = (time_ns() - assembly_started) / 1.0e9
+        solve_started = time_ns()
+        factorization = lu!(system.matrix)
+        pressure = factorization \ rhs
+        host_pressure = reshape(Array(pressure), p1_space.global_dof_count, length(neumann_values))
+        pressures = [copy(column) for column in eachcol(host_pressure)]
+        solve_s = (time_ns() - solve_started) / 1.0e9
+        return pressures, assembly_s, solve_s
+    finally
+        pressure === nothing || cuda.unsafe_free!(pressure)
+        (rhs === nothing || (system !== nothing && rhs === system.rhs)) || cuda.unsafe_free!(rhs)
+        for column in rhs_columns
+            cuda.unsafe_free!(column)
+        end
+        factorization === nothing || cuda.unsafe_free!(factorization.ipiv)
+        system === nothing || release_burton_miller_system_cuda!(system)
+        device_neumann === nothing || cuda.unsafe_free!(device_neumann)
+    end
+end
+
 function solve_exterior_request(request, system, unbounded_region; event_mode=false)
     meshes = system["meshes"]
     boundaries = system["boundaries"]
@@ -827,6 +775,12 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 error("Exterior precision must be float32 or float64.")
     backend = Symbol(lowercase(String(get(options, "bem_backend", "cpu"))))
     backend in (:cpu, :cuda, :rocm, :metal) || error("Exterior BEM backend must be cpu, cuda, rocm, or metal.")
+    requested_assembly = lowercase(String(get(options, "burton_miller_assembly", "direct_system")))
+    requested_assembly in ("direct_system", "operator_matrices") || error(
+        "Exterior burton_miller_assembly must be direct_system or operator_matrices.",
+    )
+    direct_cuda_assembly = backend == :cuda && requested_assembly == "direct_system"
+    assembly_mode = direct_cuda_assembly ? "direct_system" : "operator_matrices"
     symmetry_mode = BeatEngineCore.normalized_symmetry_mode(get(options, "symmetry", "off"))
     sound_speed = FloatType(unbounded_region["sound_speed_m_per_s"])
     density = FloatType(unbounded_region["density_kg_per_m3"])
@@ -853,10 +807,10 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     singular_order = Int(get(options, "singular_order", 4))
     base_rule = triangle_rule(FloatType, base_order)
     singular_cache = build_singular_correction_cache(mesh, singular_order)
-    identity_p1_p1 = assemble_l2_identity_matrix(
+    identity_p1_p1 = direct_cuda_assembly ? nothing : assemble_l2_identity_matrix(
         mesh, p1_space, dp0_space, base_rule, :p1, :p1; symmetry_mode=symmetry_mode,
     )
-    identity_p1_dp0 = assemble_l2_identity_matrix(
+    identity_p1_dp0 = direct_cuda_assembly ? nothing : assemble_l2_identity_matrix(
         mesh, p1_space, dp0_space, base_rule, :p1, :dp0; symmetry_mode=symmetry_mode,
     )
     cpu_field_cache = build_field_evaluation_cache(mesh, base_rule; symmetry_mode=symmetry_mode)
@@ -906,7 +860,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                                   build_cuda_image_singular_correction_cache(
         mesh, p1_space, dp0_space, singular_order, eachindex(mesh.faces), symmetry_mode,
     ) : nothing
-    device_identity_cache = if backend == :cuda
+    device_identity_cache = if backend == :cuda && !direct_cuda_assembly
         build_cuda_burton_miller_identity_cache(identity_p1_p1, identity_p1_dp0, FloatType)
     elseif backend == :rocm
         build_rocm_burton_miller_identity_cache(identity_p1_p1, identity_p1_dp0, FloatType)
@@ -959,50 +913,60 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     symmetry_mode=symmetry_mode,
                 )
             end : nothing
-            assembly_started = time_ns()
-            operators = assemble_regular_galerkin_operators(
-                mesh,
-                p1_space,
-                dp0_space,
-                wavenumber,
-                rule;
-                skip_singular=false,
-                singular_order=singular_order,
-                backend=backend,
-                device_cache=device_cache,
-                return_device=accelerator_backend,
-                accelerator_quadrature=accelerator_backend,
-                singular_cache=singular_cache,
-                cpu_cache=selected_cpu_cache,
-                device_singular_cache=device_singular_cache,
-                device_image_singular_cache=device_image_singular_cache,
-                symmetry_mode=symmetry_mode,
-            )
-            if backend == :metal
-                # Metal has no GPU LU: unified memory lets the host wrap
-                # the operators in place, and one CPU factorization is shared
-                # across every excitation port. The host tuple owns the device
-                # storage and is released after this frequency's solves.
-                operators = metal_host_operators(operators)
-            end
-            assembly_s = (time_ns() - assembly_started) / 1.0e9
-            solve_started = time_ns()
-            cpu_system = backend in (:cpu, :metal) ? build_burton_miller_neumann_cpu_system(
-                operators, selected_identity[1], selected_identity[2], wavenumber,
-            ) : nothing
-            pressures = Vector{Vector{Complex{FloatType}}}()
-            neumann_values = Vector{Vector{Complex{FloatType}}}()
-            for excitation in excitations
-                neumann = exterior_neumann(mesh, excitation, density, omega)
-                pressure = backend in (:cpu, :metal) ?
-                           solve_burton_miller_neumann_cpu_system(cpu_system, neumann, FloatType) :
-                           solve_burton_miller_neumann(
-                    operators, device_identity_cache, neumann, wavenumber,
+            neumann_values = [exterior_neumann(mesh, excitation, density, omega) for excitation in excitations]
+            operators = nothing
+            if direct_cuda_assembly
+                pressures, assembly_s, solve_s = solve_exterior_direct_cuda(
+                    mesh, p1_space, dp0_space, neumann_values, wavenumber, rule;
+                    device_cache=device_cache,
+                    singular_cache=singular_cache,
+                    device_singular_cache=device_singular_cache,
+                    device_image_singular_cache=device_image_singular_cache,
+                    symmetry_mode=symmetry_mode,
                 )
-                push!(pressures, Complex{FloatType}.(pressure))
-                push!(neumann_values, neumann)
+            else
+                assembly_started = time_ns()
+                operators = assemble_regular_galerkin_operators(
+                    mesh,
+                    p1_space,
+                    dp0_space,
+                    wavenumber,
+                    rule;
+                    skip_singular=false,
+                    singular_order=singular_order,
+                    backend=backend,
+                    device_cache=device_cache,
+                    return_device=accelerator_backend,
+                    accelerator_quadrature=accelerator_backend,
+                    singular_cache=singular_cache,
+                    cpu_cache=selected_cpu_cache,
+                    device_singular_cache=device_singular_cache,
+                    device_image_singular_cache=device_image_singular_cache,
+                    symmetry_mode=symmetry_mode,
+                )
+                if backend == :metal
+                    # Metal has no GPU LU: unified memory lets the host wrap
+                    # the operators in place, and one CPU factorization is shared
+                    # across every excitation port. The host tuple owns the device
+                    # storage and is released after this frequency's solves.
+                    operators = metal_host_operators(operators)
+                end
+                assembly_s = (time_ns() - assembly_started) / 1.0e9
+                solve_started = time_ns()
+                cpu_system = backend in (:cpu, :metal) ? build_burton_miller_neumann_cpu_system(
+                    operators, selected_identity[1], selected_identity[2], wavenumber,
+                ) : nothing
+                pressures = Vector{Vector{Complex{FloatType}}}()
+                for neumann in neumann_values
+                    pressure = backend in (:cpu, :metal) ?
+                               solve_burton_miller_neumann_cpu_system(cpu_system, neumann, FloatType) :
+                               solve_burton_miller_neumann(
+                        operators, device_identity_cache, neumann, wavenumber,
+                    )
+                    push!(pressures, Complex{FloatType}.(pressure))
+                end
+                solve_s = (time_ns() - solve_started) / 1.0e9
             end
-            solve_s = (time_ns() - solve_started) / 1.0e9
             quantities = Dict{String,Any}[]
             field_s = 0.0
             for output in outputs
@@ -1093,6 +1057,8 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 "bem_backend" => String(backend),
                 "symmetry" => String(symmetry_mode),
                 "formulation" => "exterior_burton_miller_neumann",
+                "burton_miller_assembly" => assembly_mode,
+                "factorization_count" => direct_cuda_assembly || backend in (:cpu, :metal) ? 1 : length(excitations),
                 "linear_solver" => backend == :cpu ?
                                    "cpu_dense_lu" :
                                    backend == :cuda ? "cuda_dense_lu" :
@@ -1118,9 +1084,10 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 "quantities" => quantities,
                 "diagnostics" => diagnostics,
             )
+            record_result_provenance!(result, request)
             println(JSON.json(event_mode ? Dict("type" => "result", "result" => result) : result))
             flush(stdout)
-            release_operator_storage!(operators)
+            operators === nothing || release_operator_storage!(operators)
             solved_count = frequency_index
         end
     finally
@@ -2008,10 +1975,10 @@ function solve_interior_request(request, system, bounded_regions; event_mode=fal
                 operator.thickness_m,
                 operator.flow_resistivity_pa_s_per_m2,
             )
-            fem_system -= Complex{FloatType}(0, density * omega) * admittance .* operator.matrix
+            fem_system -= neumann_scale(density, omega) * admittance .* operator.matrix
         end
         for operator in termination_operators
-            fem_system -= Complex{FloatType}(0, wavenumber) .* operator.matrix
+            fem_system -= Complex{FloatType}(0, outgoing_wavenumber(wavenumber)) .* operator.matrix
         end
 
         fem_count = length(fem_mesh.vertices)
@@ -2026,7 +1993,7 @@ function solve_interior_request(request, system, bounded_regions; event_mode=fal
         coupled = if transducer_count == 0
             SparseMatrixCSC{ComplexF64,Int}(fem_system)
         else
-            normal_derivative_scale = Complex{FloatType}(0, density * omega)
+            normal_derivative_scale = neumann_scale(density, omega)
             fem_motion = -normal_derivative_scale .* Complex{FloatType}.(
                 transducer_operators.fem_surface,
             )
@@ -2173,6 +2140,7 @@ function solve_interior_request(request, system, bounded_regions; event_mode=fal
             "quantities" => quantities,
             "diagnostics" => diagnostics,
         )
+        record_result_provenance!(result, request)
         if event_mode
             println(JSON.json(Dict("type" => "result", "result" => result)))
         else
@@ -2185,7 +2153,20 @@ function solve_interior_request(request, system, bounded_regions; event_mode=fal
 end
 
 function solve_request(request; event_mode=false)
-    Int(get(request, "schema_version", 0)) == 1 || error("Unsupported system solve request schema.")
+    convention = get(get(request, "solver_options", Dict()), "phasor_convention", NEGATIVE_TIME_PHASOR)
+    convention == POSITIVE_TIME_PHASOR && get(get(request, "solver_options", Dict()), "bem_backend", "cpu") == "rocm" &&
+        error("Positive-time ROCm solves require hardware qualification; use CPU or CUDA.")
+    return with_phasor_convention(convention) do
+        solve_request_impl(request; event_mode=event_mode)
+    end
+end
+
+function solve_request_impl(request; event_mode=false)
+    validate_system_request(request)
+    BeatEngineContract.BeatEngineProvenance.engine_identity()
+    BeatEngineContract.BeatEngineProvenance.runtime_identity()
+    RUN_MESH_PROVENANCE[] = [Dict("id" => mesh["id"], "file" => mesh["file"],
+        "sha256" => BeatEngineContract.BeatEngineProvenance.file_hash(mesh["file"])) for mesh in request["compiled_system"]["meshes"]]
     cancel_path = get(request, "cancel_path", nothing)
     cancel_requested() = cancel_path !== nothing && isfile(String(cancel_path))
     cancel_requested() && return (cancelled=true, solved_count=0)
@@ -2451,6 +2432,13 @@ function solve_request(request; event_mode=false)
     singular_order = Int(get(solver_options, "singular_order", 2))
     validation_diagnostics = Bool(get(solver_options, "validation_diagnostics", true))
     cache_frequency_invariant = Bool(get(solver_options, "cache_frequency_invariant", true))
+    coupled_bem_assembly = Symbol(lowercase(String(get(solver_options, "coupled_bem_assembly", "auto"))))
+    coupled_bem_image_fusion = Bool(get(solver_options, "coupled_bem_image_fusion", true))
+    coupled_bem_max_registers = Int(get(solver_options, "coupled_bem_max_registers", 0))
+    effective_bem_assembly = BeatEngineCoupled.resolve_coupled_bem_assembly(
+        coupled_bem_assembly, bem_backend, validation_diagnostics)
+    (coupled_bem_max_registers == 0 || 32 <= coupled_bem_max_registers <= 255) ||
+        error("coupled_bem_max_registers must be 0 or 32 through 255.")
     static_condensation_requested = Bool(
         get(
             solver_options,
@@ -2530,6 +2518,7 @@ function solve_request(request; event_mode=false)
                 quadrature_order=quadrature_order,
                 singular_order=singular_order,
                 bem_backend=bem_backend,
+                coupled_bem_assembly=effective_bem_assembly,
                 symmetry_mode=symmetry_mode,
                 retained_fem_vertices=retained_fem_vertices,
                 bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
@@ -2539,258 +2528,330 @@ function solve_request(request; event_mode=false)
         cache_setup_s = (time_ns() - cache_setup_started) / 1.0e9
     end
     outputs = get(request, "outputs", Any[])
-    for (frequency_index, frequency_value) in enumerate(request["frequencies_hz"])
-        if cancel_requested()
-            cancelled = true
-            break
-        end
-        frequency_hz = FloatType(frequency_value)
-        println(stderr, "Coupled $(precision_name)/$(bem_backend): assembling $(frequency_hz) Hz")
-        assembly_started = time_ns()
-        coupled_system = if use_condensed_solver
-            build_condensed_coupled_system(
-                fem_mesh,
-                bem_mesh,
-                interface_map,
-                frequency_hz,
-                sound_speed,
-                density;
-                quadrature_order=quadrature_order,
-                regular_quadrature_order=quadrature_selections[frequency_index].order,
-                singular_order=singular_order,
-                cache=coupled_cache,
-                validation_diagnostics=validation_diagnostics,
-                symmetry_mode=symmetry_mode,
-                bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
-                wall_impedances=fem_domains.wall_impedances,
-                transducers=transducers,
-                transducer_operators=transducer_operators,
-                prescribed_bem_normal_velocity=prescribed_bem_normal_velocity,
+    coupled_system = nothing
+    try
+        for (frequency_index, frequency_value) in enumerate(request["frequencies_hz"])
+            if cancel_requested()
+                cancelled = true
+                break
+            end
+            frequency_hz = FloatType(frequency_value)
+            println(stderr, "Coupled $(precision_name)/$(bem_backend): assembling $(frequency_hz) Hz")
+            assembly_started = time_ns()
+            coupled_system = if use_condensed_solver
+                build_condensed_coupled_system(
+                    fem_mesh,
+                    bem_mesh,
+                    interface_map,
+                    frequency_hz,
+                    sound_speed,
+                    density;
+                    quadrature_order=quadrature_order,
+                    regular_quadrature_order=quadrature_selections[frequency_index].order,
+                    singular_order=singular_order,
+                    cache=coupled_cache,
+                    validation_diagnostics=validation_diagnostics,
+                    symmetry_mode=symmetry_mode,
+                    bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
+                    wall_impedances=fem_domains.wall_impedances,
+                    transducers=transducers,
+                    transducer_operators=transducer_operators,
+                    prescribed_bem_normal_velocity=prescribed_bem_normal_velocity,
+                )
+            else
+                build_coupled_system(
+                    fem_mesh,
+                    bem_mesh,
+                    interface_map,
+                    frequency_hz,
+                    sound_speed,
+                    density;
+                    quadrature_order=quadrature_order,
+                    singular_order=singular_order,
+                    cache=coupled_cache,
+                    validation_diagnostics=validation_diagnostics,
+                    bem_backend=bem_backend,
+                    symmetry_mode=symmetry_mode,
+                    static_condensation=static_condensation,
+                    coupled_bem_assembly=coupled_bem_assembly,
+                    coupled_bem_image_fusion=coupled_bem_image_fusion,
+                    coupled_bem_max_registers=coupled_bem_max_registers,
+                    bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
+                    wall_impedances=fem_domains.wall_impedances,
+                    transducers=transducers,
+                    transducer_operators=transducer_operators,
+                    prescribed_bem_normal_velocity=prescribed_bem_normal_velocity,
+                )
+            end
+            assembly_s = (time_ns() - assembly_started) / 1.0e9
+            solve_started = time_ns()
+            solutions = use_condensed_solver ?
+                        solve_condensed_coupled_excitations(coupled_system, excitations) :
+                        solve_coupled_excitations(coupled_system, excitations)
+            solve_s = (time_ns() - solve_started) / 1.0e9
+            interface_error_sets = [
+                per_interface_errors(
+                    solution,
+                    fem_mesh,
+                    bem_mesh,
+                    combined_interfaces.maps,
+                    combined_interfaces.ranges,
+                    FloatType,
+                )
+                for solution in solutions
+            ]
+            interface_pressure_errors = [
+                maximum(errors[1][index] for errors in interface_error_sets)
+                for index in eachindex(interfaces)
+            ]
+            interface_flux_errors = [
+                maximum(errors[2][index] for errors in interface_error_sets)
+                for index in eachindex(interfaces)
+            ]
+            field_s = 0.0
+            quantities = Dict{String,Any}[]
+            rom_requested = any(
+                String(output["quantity"]) in SPEAKER_ROM_QUANTITIES for output in outputs
             )
-        else
-            build_coupled_system(
-                fem_mesh,
-                bem_mesh,
-                interface_map,
-                frequency_hz,
-                sound_speed,
-                density;
-                quadrature_order=quadrature_order,
-                singular_order=singular_order,
-                cache=coupled_cache,
-                validation_diagnostics=validation_diagnostics,
-                bem_backend=bem_backend,
-                symmetry_mode=symmetry_mode,
-                static_condensation=static_condensation,
-                bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
-                wall_impedances=fem_domains.wall_impedances,
-                transducers=transducers,
-                transducer_operators=transducer_operators,
-                prescribed_bem_normal_velocity=prescribed_bem_normal_velocity,
-            )
-        end
-        assembly_s = (time_ns() - assembly_started) / 1.0e9
-        solve_started = time_ns()
-        solutions = use_condensed_solver ?
-                    solve_condensed_coupled_excitations(coupled_system, excitations) :
-                    solve_coupled_excitations(coupled_system, excitations)
-        solve_s = (time_ns() - solve_started) / 1.0e9
-        interface_error_sets = [
-            per_interface_errors(
-                solution,
-                fem_mesh,
-                bem_mesh,
-                combined_interfaces.maps,
-                combined_interfaces.ranges,
-                FloatType,
-            )
-            for solution in solutions
-        ]
-        interface_pressure_errors = [
-            maximum(errors[1][index] for errors in interface_error_sets)
-            for index in eachindex(interfaces)
-        ]
-        interface_flux_errors = [
-            maximum(errors[2][index] for errors in interface_error_sets)
-            for index in eachindex(interfaces)
-        ]
-        field_s = 0.0
-        quantities = Dict{String,Any}[]
-        macro_requested = any(
-            String(output["quantity"]) in SPEAKER_MACRO_QUANTITIES for output in outputs
-        )
-        macro_matrices = macro_requested ? speaker_macro_matrices(
-            coupled_system,
-            excitations,
-            [String(interface["id"]) for interface in interfaces],
-            combined_interfaces.ranges,
-        ) : nothing
-        rom_requested = any(
-            String(output["quantity"]) in SPEAKER_ROM_QUANTITIES for output in outputs
-        )
-        rom_options = get(solver_options, "speaker_rom", Dict{String,Any}())
-        rom_matrices = if rom_requested
-            rom_k, rom_layout = speaker_macro_k_matrix(coupled_system)
-            build_parity_petrov_galerkin_rom(
-                coupled_system,
-                rom_k,
-                rom_layout,
-                excitations;
-                rank=Int(get(rom_options, "rank_per_sector", 32)),
-                training_count=Int(get(rom_options, "training_count_per_sector", 96)),
-                validation_count=Int(get(rom_options, "validation_count_per_sector", 24)),
-            )
-        else
-            nothing
-        end
-        for output in outputs
-            quantity = String(output["quantity"])
-            if quantity == "fem_nodal_pressure"
-                push!(
-                    quantities,
-                    quantity_wire(
-                        output,
-                        rows([solution.fem_pressure for solution in solutions], FloatType),
-                        "Pa",
-                        ["excitation", "fem_node"],
-                        metadata=Dict(
-                            "mesh_ids" => [domain.mesh_id for domain in fem_domains.domains],
-                            "region_ids" => [domain.id for domain in fem_domains.domains],
-                            "node_offsets" => [
-                                domain.vertex_offset for domain in fem_domains.domains
-                            ],
-                            "node_counts" => [
-                                domain.vertex_count for domain in fem_domains.domains
-                            ],
-                        ),
-                    ),
+            rom_options = get(solver_options, "speaker_rom", Dict{String,Any}())
+            rom_matrices = if rom_requested
+                rom_k, rom_layout = speaker_interior_state_matrix(coupled_system)
+                build_parity_petrov_galerkin_rom(
+                    coupled_system,
+                    rom_k,
+                    rom_layout,
+                    excitations;
+                    rank=Int(get(rom_options, "rank_per_sector", 32)),
+                    training_count=Int(get(rom_options, "training_count_per_sector", 96)),
+                    validation_count=Int(get(rom_options, "validation_count_per_sector", 24)),
+                    symmetry=Symbol(lowercase(String(get(rom_options, "symmetry", "xy")))),
                 )
-            elseif quantity == "bem_boundary_pressure"
-                push!(
-                    quantities,
-                    quantity_wire(
-                        output,
-                        rows([solution.bem_pressure for solution in solutions], FloatType),
-                        "Pa",
-                        ["excitation", "bem_node"],
-                        metadata=Dict(
-                            "mesh_ids" => String.(unbounded_region["mesh_ids"]),
-                            "vertex_offsets" => [
-                                bem_domain.vertex_offset_by_mesh_id[String(mesh_id)]
-                                for mesh_id in unbounded_region["mesh_ids"]
-                            ],
-                            "vertex_counts" => [
-                                bem_domain.vertex_count_by_mesh_id[String(mesh_id)]
-                                for mesh_id in unbounded_region["mesh_ids"]
-                            ],
+            else
+                nothing
+            end
+            for output in outputs
+                quantity = String(output["quantity"])
+                if quantity == "fem_nodal_pressure"
+                    push!(
+                        quantities,
+                        quantity_wire(
+                            output,
+                            rows([solution.fem_pressure for solution in solutions], FloatType),
+                            "Pa",
+                            ["excitation", "fem_node"],
+                            metadata=Dict(
+                                "mesh_ids" => [domain.mesh_id for domain in fem_domains.domains],
+                                "region_ids" => [domain.id for domain in fem_domains.domains],
+                                "node_offsets" => [
+                                    domain.vertex_offset for domain in fem_domains.domains
+                                ],
+                                "node_counts" => [
+                                    domain.vertex_count for domain in fem_domains.domains
+                                ],
+                            ),
                         ),
-                    ),
-                )
-            elseif quantity == "bem_boundary_neumann"
-                push!(
-                    quantities,
-                    quantity_wire(
-                        output,
-                        rows([solution.bem_neumann for solution in solutions], FloatType),
-                        "Pa/m",
-                        ["excitation", "bem_face"],
-                        metadata=Dict(
-                            "mesh_ids" => String.(unbounded_region["mesh_ids"]),
-                            "face_offsets" => [
-                                bem_domain.face_offset_by_mesh_id[String(mesh_id)]
-                                for mesh_id in unbounded_region["mesh_ids"]
-                            ],
-                            "face_counts" => [
-                                bem_domain.face_count_by_mesh_id[String(mesh_id)]
-                                for mesh_id in unbounded_region["mesh_ids"]
-                            ],
+                    )
+                elseif quantity == "bem_boundary_pressure"
+                    push!(
+                        quantities,
+                        quantity_wire(
+                            output,
+                            rows([solution.bem_pressure for solution in solutions], FloatType),
+                            "Pa",
+                            ["excitation", "bem_node"],
+                            metadata=Dict(
+                                "mesh_ids" => String.(unbounded_region["mesh_ids"]),
+                                "vertex_offsets" => [
+                                    bem_domain.vertex_offset_by_mesh_id[String(mesh_id)]
+                                    for mesh_id in unbounded_region["mesh_ids"]
+                                ],
+                                "vertex_counts" => [
+                                    bem_domain.vertex_count_by_mesh_id[String(mesh_id)]
+                                    for mesh_id in unbounded_region["mesh_ids"]
+                                ],
+                            ),
                         ),
-                    ),
-                )
-            elseif quantity == "interface_normal_derivative"
-                push!(
-                    quantities,
-                    quantity_wire(
-                        output,
-                        rows([solution.interface_flux for solution in solutions], FloatType),
-                        "Pa/m",
-                        ["excitation", "interface_node"],
-                        metadata=Dict(
-                            "interface_ids" => [
-                                String(interface["id"]) for interface in interfaces
-                            ],
-                            "interface_offsets" => [
-                                first(range) - 1 for range in combined_interfaces.ranges
-                            ],
-                            "interface_counts" => [
-                                length(range) for range in combined_interfaces.ranges
-                            ],
+                    )
+                elseif quantity == "bem_boundary_neumann"
+                    push!(
+                        quantities,
+                        quantity_wire(
+                            output,
+                            rows([solution.bem_neumann for solution in solutions], FloatType),
+                            "Pa/m",
+                            ["excitation", "bem_face"],
+                            metadata=Dict(
+                                "mesh_ids" => String.(unbounded_region["mesh_ids"]),
+                                "face_offsets" => [
+                                    bem_domain.face_offset_by_mesh_id[String(mesh_id)]
+                                    for mesh_id in unbounded_region["mesh_ids"]
+                                ],
+                                "face_counts" => [
+                                    bem_domain.face_count_by_mesh_id[String(mesh_id)]
+                                    for mesh_id in unbounded_region["mesh_ids"]
+                                ],
+                            ),
                         ),
-                    ),
-                )
-            elseif quantity == "diaphragm_velocity"
-                push!(
-                    quantities,
-                    quantity_wire(
-                        output,
-                        rows(
-                            [solution.diaphragm_velocity for solution in solutions],
-                            FloatType,
+                    )
+                elseif quantity == "interface_normal_derivative"
+                    push!(
+                        quantities,
+                        quantity_wire(
+                            output,
+                            rows([solution.interface_flux for solution in solutions], FloatType),
+                            "Pa/m",
+                            ["excitation", "interface_node"],
+                            metadata=Dict(
+                                "interface_ids" => [
+                                    String(interface["id"]) for interface in interfaces
+                                ],
+                                "interface_offsets" => [
+                                    first(range) - 1 for range in combined_interfaces.ranges
+                                ],
+                                "interface_counts" => [
+                                    length(range) for range in combined_interfaces.ranges
+                                ],
+                            ),
                         ),
-                        "m/s",
-                        ["excitation", "transducer"],
-                        metadata=Dict(
-                            "component_ids" => [transducer.id for transducer in transducers],
-                            "surface_completion_factors" => [
-                                transducer.surface_completion_factor
-                                for transducer in transducers
-                            ],
-                            "physical_driver_orbit_counts" => [
-                                transducer.physical_driver_orbit_count
-                                for transducer in transducers
-                            ],
+                    )
+                elseif quantity == "diaphragm_velocity"
+                    push!(
+                        quantities,
+                        quantity_wire(
+                            output,
+                            rows(
+                                [solution.diaphragm_velocity for solution in solutions],
+                                FloatType,
+                            ),
+                            "m/s",
+                            ["excitation", "transducer"],
+                            metadata=Dict(
+                                "component_ids" => [transducer.id for transducer in transducers],
+                                "surface_completion_factors" => [
+                                    transducer.surface_completion_factor
+                                    for transducer in transducers
+                                ],
+                                "physical_driver_orbit_counts" => [
+                                    transducer.physical_driver_orbit_count
+                                    for transducer in transducers
+                                ],
+                            ),
                         ),
-                    ),
-                )
-            elseif quantity == "voice_coil_current"
-                push!(
-                    quantities,
-                    quantity_wire(
-                        output,
-                        rows(
-                            [solution.voice_coil_current for solution in solutions],
-                            FloatType,
+                    )
+                elseif quantity == "voice_coil_current"
+                    push!(
+                        quantities,
+                        quantity_wire(
+                            output,
+                            rows(
+                                [solution.voice_coil_current for solution in solutions],
+                                FloatType,
+                            ),
+                            "A",
+                            ["excitation", "transducer"],
+                            metadata=Dict(
+                                "component_ids" => [transducer.id for transducer in transducers],
+                                "surface_completion_factors" => [
+                                    transducer.surface_completion_factor
+                                    for transducer in transducers
+                                ],
+                                "physical_driver_orbit_counts" => [
+                                    transducer.physical_driver_orbit_count
+                                    for transducer in transducers
+                                ],
+                            ),
                         ),
-                        "A",
-                        ["excitation", "transducer"],
-                        metadata=Dict(
-                            "component_ids" => [transducer.id for transducer in transducers],
-                            "surface_completion_factors" => [
-                                transducer.surface_completion_factor
-                                for transducer in transducers
-                            ],
-                            "physical_driver_orbit_counts" => [
-                                transducer.physical_driver_orbit_count
-                                for transducer in transducers
-                            ],
-                        ),
-                    ),
-                )
-            elseif quantity == "exterior_pressure"
-                field_started = time_ns()
-                options = get(output, "options", Dict{String,Any}())
-                raw_points = get(options, "points_m", Any[])
-                isempty(raw_points) && error("exterior_pressure output requires options.points_m.")
-                points = [SVector{3,FloatType}(FloatType.(point)) for point in raw_points]
-                raw_weights = get(options, "excitation_weights", Any[])
-                if isempty(raw_weights)
-                    pressures = [
-                        if bem_backend == :cuda
+                    )
+                elseif quantity == "exterior_pressure"
+                    field_started = time_ns()
+                    options = get(output, "options", Dict{String,Any}())
+                    raw_points = get(options, "points_m", Any[])
+                    isempty(raw_points) && error("exterior_pressure output requires options.points_m.")
+                    points = [SVector{3,FloatType}(FloatType.(point)) for point in raw_points]
+                    raw_weight_sweep = get(options, "excitation_weights_sweep", Any[])
+                    if !isempty(raw_weight_sweep)
+                        length(raw_weight_sweep) == length(request["frequencies_hz"]) || error(
+                            "exterior_pressure excitation_weights_sweep must match the frequency count.",
+                        )
+                    end
+                    raw_weights = isempty(raw_weight_sweep) ?
+                                  get(options, "excitation_weights", Any[]) :
+                                  raw_weight_sweep[frequency_index]
+                    if isempty(raw_weights)
+                        pressures = [
+                            if bem_backend == :cuda
+                                evaluate_galerkin_field_cuda(
+                                    points,
+                                    bem_mesh,
+                                    solution.bem_pressure,
+                                    solution.bem_neumann,
+                                    coupled_system.wavenumber,
+                                    coupled_system.field_cache,
+                                )
+                            elseif bem_backend == :rocm
+                                evaluate_galerkin_field_rocm(
+                                    points,
+                                    bem_mesh,
+                                    solution.bem_pressure,
+                                    solution.bem_neumann,
+                                    coupled_system.wavenumber,
+                                    coupled_system.field_cache,
+                                )
+                            elseif bem_backend == :metal
+                                evaluate_galerkin_field_metal(
+                                    points,
+                                    bem_mesh,
+                                    solution.bem_pressure,
+                                    solution.bem_neumann,
+                                    coupled_system.wavenumber,
+                                    coupled_system.field_cache,
+                                )
+                            else
+                                evaluate_galerkin_field_cpu(
+                                    points,
+                                    bem_mesh,
+                                    solution.bem_pressure,
+                                    solution.bem_neumann,
+                                    coupled_system.wavenumber,
+                                    coupled_system.field_cache,
+                                )
+                            end
+                            for solution in solutions
+                        ]
+                        push!(
+                            quantities,
+                            quantity_wire(
+                                output,
+                                rows(pressures, FloatType),
+                                "Pa",
+                                ["excitation", "observation"],
+                            ),
+                        )
+                    else
+                        length(raw_weights) == length(solutions) || error(
+                            "exterior_pressure excitation_weights must match the excitation count.",
+                        )
+                        weights = Complex{FloatType}[
+                            Complex{FloatType}(
+                                FloatType(get(raw_weight, "real", 0.0)),
+                                FloatType(get(raw_weight, "imag", 0.0)),
+                            )
+                            for raw_weight in raw_weights
+                        ]
+                        combined_pressure = similar(first(solutions).bem_pressure)
+                        combined_neumann = similar(first(solutions).bem_neumann)
+                        fill!(combined_pressure, zero(Complex{FloatType}))
+                        fill!(combined_neumann, zero(Complex{FloatType}))
+                        for (weight, solution) in zip(weights, solutions)
+                            combined_pressure .+= weight .* solution.bem_pressure
+                            combined_neumann .+= weight .* solution.bem_neumann
+                        end
+                        pressure = if bem_backend == :cuda
                             evaluate_galerkin_field_cuda(
                                 points,
                                 bem_mesh,
-                                solution.bem_pressure,
-                                solution.bem_neumann,
+                                combined_pressure,
+                                combined_neumann,
                                 coupled_system.wavenumber,
                                 coupled_system.field_cache,
                             )
@@ -2798,8 +2859,8 @@ function solve_request(request; event_mode=false)
                             evaluate_galerkin_field_rocm(
                                 points,
                                 bem_mesh,
-                                solution.bem_pressure,
-                                solution.bem_neumann,
+                                combined_pressure,
+                                combined_neumann,
                                 coupled_system.wavenumber,
                                 coupled_system.field_cache,
                             )
@@ -2807,8 +2868,8 @@ function solve_request(request; event_mode=false)
                             evaluate_galerkin_field_metal(
                                 points,
                                 bem_mesh,
-                                solution.bem_pressure,
-                                solution.bem_neumann,
+                                combined_pressure,
+                                combined_neumann,
                                 coupled_system.wavenumber,
                                 coupled_system.field_cache,
                             )
@@ -2816,315 +2877,237 @@ function solve_request(request; event_mode=false)
                             evaluate_galerkin_field_cpu(
                                 points,
                                 bem_mesh,
-                                solution.bem_pressure,
-                                solution.bem_neumann,
+                                combined_pressure,
+                                combined_neumann,
                                 coupled_system.wavenumber,
                                 coupled_system.field_cache,
                             )
                         end
-                        for solution in solutions
-                    ]
-                    push!(
-                        quantities,
-                        quantity_wire(
-                            output,
-                            rows(pressures, FloatType),
-                            "Pa",
-                            ["excitation", "observation"],
-                        ),
-                    )
-                else
-                    length(raw_weights) == length(solutions) || error(
-                        "exterior_pressure excitation_weights must match the excitation count.",
-                    )
-                    weights = Complex{FloatType}[
-                        Complex{FloatType}(
-                            FloatType(get(raw_weight, "real", 0.0)),
-                            FloatType(get(raw_weight, "imag", 0.0)),
+                        push!(
+                            quantities,
+                            quantity_wire(
+                                output,
+                                pressure,
+                                "Pa",
+                                ["observation"],
+                                metadata=Dict(
+                                    "synthesized_excitation_count" => length(solutions),
+                                ),
+                            ),
                         )
-                        for raw_weight in raw_weights
-                    ]
-                    combined_pressure = similar(first(solutions).bem_pressure)
-                    combined_neumann = similar(first(solutions).bem_neumann)
-                    fill!(combined_pressure, zero(Complex{FloatType}))
-                    fill!(combined_neumann, zero(Complex{FloatType}))
-                    for (weight, solution) in zip(weights, solutions)
-                        combined_pressure .+= weight .* solution.bem_pressure
-                        combined_neumann .+= weight .* solution.bem_neumann
                     end
-                    pressure = if bem_backend == :cuda
-                        evaluate_galerkin_field_cuda(
-                            points,
-                            bem_mesh,
-                            combined_pressure,
-                            combined_neumann,
-                            coupled_system.wavenumber,
-                            coupled_system.field_cache,
-                        )
-                    elseif bem_backend == :rocm
-                        evaluate_galerkin_field_rocm(
-                            points,
-                            bem_mesh,
-                            combined_pressure,
-                            combined_neumann,
-                            coupled_system.wavenumber,
-                            coupled_system.field_cache,
-                        )
-                    elseif bem_backend == :metal
-                        evaluate_galerkin_field_metal(
-                            points,
-                            bem_mesh,
-                            combined_pressure,
-                            combined_neumann,
-                            coupled_system.wavenumber,
-                            coupled_system.field_cache,
-                        )
+                    field_s += (time_ns() - field_started) / 1.0e9
+                elseif quantity in SPEAKER_ROM_QUANTITIES
+                    axes = if quantity == "speaker_rom_k"
+                        ["parity_sector", "reduced_row", "reduced_column"]
+                    elseif quantity == "speaker_rom_c"
+                        ["parity_sector", "reduced_row", "boundary_node_orbit"]
+                    elseif quantity == "speaker_rom_d"
+                        ["parity_sector", "boundary_face_orbit", "reduced_column"]
+                    elseif quantity == "speaker_rom_b"
+                        ["parity_sector", "reduced_row", "input_port"]
+                    elseif quantity == "speaker_rom_e"
+                        ["parity_sector", "boundary_face_orbit", "input_port"]
+                    elseif quantity == "speaker_rom_velocity"
+                        ["parity_sector", "transducer", "reduced_column"]
+                    elseif quantity == "speaker_rom_current"
+                        ["parity_sector", "transducer", "reduced_column"]
                     else
-                        evaluate_galerkin_field_cpu(
-                            points,
-                            bem_mesh,
-                            combined_pressure,
-                            combined_neumann,
-                            coupled_system.wavenumber,
-                            coupled_system.field_cache,
-                        )
+                        ["parity_sector", "transducer", "input_port"]
                     end
                     push!(
                         quantities,
                         quantity_wire(
                             output,
-                            pressure,
-                            "Pa",
-                            ["observation"],
-                            metadata=Dict(
-                                "synthesized_excitation_count" => length(solutions),
+                            rom_matrices[quantity],
+                            "mixed",
+                            axes,
+                            metadata=merge(
+                                copy(rom_matrices["metadata"]),
+                                Dict("matrix" => quantity),
                             ),
                         ),
                     )
-                end
-                field_s += (time_ns() - field_started) / 1.0e9
-            elseif quantity in SPEAKER_MACRO_QUANTITIES
-                axes = if quantity == "speaker_macro_k"
-                    ["state_row", "state_column"]
-                elseif quantity == "speaker_macro_c"
-                    ["state_row", "bem_node"]
-                elseif quantity == "speaker_macro_d"
-                    ["bem_face", "state_column"]
-                elseif quantity == "speaker_macro_b"
-                    ["state_row", "excitation"]
                 else
-                    ["bem_face", "excitation"]
+                    error("Unsupported coupled output quantity: $quantity")
                 end
-                push!(
-                    quantities,
-                    quantity_wire(
-                        output,
-                        macro_matrices[quantity],
-                        "mixed",
-                        axes,
-                        metadata=merge(
-                            copy(macro_matrices["metadata"]),
-                            Dict("matrix" => uppercase(last(split(quantity, "_")))),
-                        ),
-                    ),
-                )
-            elseif quantity in SPEAKER_ROM_QUANTITIES
-                axes = if quantity == "speaker_rom_k"
-                    ["parity_sector", "reduced_row", "reduced_column"]
-                elseif quantity == "speaker_rom_c"
-                    ["parity_sector", "reduced_row", "boundary_node_orbit"]
-                elseif quantity == "speaker_rom_d"
-                    ["parity_sector", "boundary_face_orbit", "reduced_column"]
-                elseif quantity == "speaker_rom_b"
-                    ["parity_sector", "reduced_row", "input_port"]
-                elseif quantity == "speaker_rom_e"
-                    ["parity_sector", "boundary_face_orbit", "input_port"]
-                elseif quantity == "speaker_rom_velocity"
-                    ["parity_sector", "transducer", "reduced_column"]
-                elseif quantity == "speaker_rom_current"
-                    ["parity_sector", "transducer", "reduced_column"]
-                else
-                    ["parity_sector", "transducer", "input_port"]
-                end
-                push!(
-                    quantities,
-                    quantity_wire(
-                        output,
-                        rom_matrices[quantity],
-                        "mixed",
-                        axes,
-                        metadata=merge(
-                            copy(rom_matrices["metadata"]),
-                            Dict("matrix" => quantity),
-                        ),
-                    ),
-                )
-            else
-                error("Unsupported coupled output quantity: $quantity")
             end
-        end
 
-        rank_experiment_config = get(
-            solver_options,
-            "speaker_rom_rank_experiment",
-            nothing,
-        )
-        rank_experiment = isnothing(rank_experiment_config) ?
-                          nothing :
-                          speaker_rom_rank_experiment(
-            coupled_system,
-            rank_experiment_config,
-        )
-        diagnostics = Dict{String,Any}(
-            "precision" => precision_name,
-            "bem_backend" => String(bem_backend),
-            "linear_backend" => String(coupled_system.linear_backend),
-            "symmetry" => String(symmetry_mode),
-            "formulation" => String(coupled_system.formulation),
-            "linear_solver" => if coupled_system.formulation == :fem_interface_condensed
-                if coupled_system.linear_backend == :rocm
-                    "rocm_hybrid_cpu_sparse_schur_plus_rocsolver_dense_lu"
-                elseif coupled_system.linear_backend == :cuda
-                    "cuda_cudss_schur_plus_dense_lu"
-                elseif coupled_system.condensation.backend == :cpu_noop
-                    "cpu_dense_lu_noop_schur"
-                else
-                    "cpu_umfpack_schur_plus_dense_lu"
-                end
-            elseif coupled_system.linear_backend == :rocm
-                "rocm_rocsolver_dense_lu"
-            else
-                "$(coupled_system.linear_backend)_dense_lu"
-            end,
-            "full_system_order" => coupled_system.full_system_order,
-            "solved_system_order" => coupled_system.solved_system_order,
-            "bounded_region_count" => length(bounded_regions),
-            "interface_count" => length(interfaces),
-            "transducer_count" => length(transducers),
-            "transducer_reference_voltage_v" => transducer_reference_voltage_v,
-            "fem_bulk_loss_factors_by_region" => Dict(
-                String(region["id"]) => Float64(
-                    get(get(region, "loss_model", Dict{String,Any}()), "bulk_loss_factor", 0.0),
-                )
-                for region in bounded_regions
-            ),
-            "wall_impedance_boundary_ids" => [spec.boundary_id for spec in fem_domains.wall_impedances],
-            "static_condensation_requested" => static_condensation_requested,
-            "static_condensation_active" => static_condensation,
-            "fem_condensation_backend" => isnothing(coupled_system.condensation) ?
-                                          nothing :
-                                          String(coupled_system.condensation.backend),
-            "fem_schur_block_size" => isnothing(coupled_system.condensation) ||
-                                      !hasproperty(
-                coupled_system.condensation,
-                :schur_block_size,
-            ) ? 0 : coupled_system.condensation.schur_block_size,
-            "fem_schur_thread_count" => isnothing(coupled_system.condensation) ||
-                                        !hasproperty(
-                coupled_system.condensation,
-                :schur_thread_count,
-            ) ? 0 : coupled_system.condensation.schur_thread_count,
-            "pressure_continuity_error" => isempty(interface_pressure_errors) ?
-                                           nothing :
-                                           maximum(interface_pressure_errors),
-            "flux_conservation_error" => isempty(interface_flux_errors) ?
-                                         nothing :
-                                         maximum(interface_flux_errors),
-            "interface_ids" => [String(interface["id"]) for interface in interfaces],
-            "interface_pressure_continuity_errors" => interface_pressure_errors,
-            "interface_flux_conservation_errors" => interface_flux_errors,
-            "timings" => Dict(
-                "assembly_s" => assembly_s,
-                "solve_s" => solve_s,
-                "field_s" => field_s,
-                "mesh_setup_s" => frequency_index == 1 ? mesh_setup_s : 0.0,
-                "cache_setup_s" => frequency_index == 1 ? cache_setup_s : 0.0,
-                "fem_matrix_cache_s" => frequency_index == 1 ?
-                                        coupled_system.cache.timings.fem_matrix_cache_s : 0.0,
-                "interface_operator_cache_s" => frequency_index == 1 ?
-                                                coupled_system.cache.timings.interface_operator_cache_s : 0.0,
-                "bem_space_cache_s" => frequency_index == 1 ?
-                                       coupled_system.cache.timings.bem_space_cache_s : 0.0,
-                "bem_singular_cache_s" => frequency_index == 1 ?
-                                          coupled_system.cache.timings.bem_singular_cache_s : 0.0,
-                "bem_cpu_assembly_cache_s" => frequency_index == 1 ?
-                                              coupled_system.cache.timings.bem_cpu_assembly_cache_s : 0.0,
-                "bem_device_regular_cache_s" => frequency_index == 1 ?
-                                                coupled_system.cache.timings.bem_device_regular_cache_s : 0.0,
-                "bem_device_singular_cache_s" => frequency_index == 1 ?
-                                                 coupled_system.cache.timings.bem_device_singular_cache_s : 0.0,
-                "bem_device_image_cache_s" => frequency_index == 1 ?
-                                              coupled_system.cache.timings.bem_device_image_cache_s : 0.0,
-                "bem_identity_cache_s" => frequency_index == 1 ?
-                                          coupled_system.cache.timings.bem_identity_cache_s : 0.0,
-                "device_block_cache_s" => frequency_index == 1 ?
-                                          coupled_system.cache.timings.device_block_cache_s : 0.0,
-                "field_cache_s" => frequency_index == 1 ?
-                                   coupled_system.cache.timings.field_cache_s : 0.0,
-                "fem_system_s" => coupled_system.timings.fem_system_s,
-                "bem_operator_s" => coupled_system.timings.bem_operator_s,
-                "bem_matrix_s" => coupled_system.timings.bem_matrix_s,
-                "fem_condensation_s" => coupled_system.timings.fem_condensation_s,
-                "fem_condensation_analysis_s" => isnothing(coupled_system.condensation) ?
-                                                 0.0 :
-                                                 coupled_system.condensation.timings.analysis_s,
-                "fem_condensation_factorization_s" => isnothing(coupled_system.condensation) ?
-                                                      0.0 :
-                                                      coupled_system.condensation.timings.factorization_s,
-                "fem_condensation_partition_s" => isnothing(coupled_system.condensation) ||
-                                                   !hasproperty(
-                    coupled_system.condensation.timings,
-                    :partition_s,
-                ) ? 0.0 : coupled_system.condensation.timings.partition_s,
-                "fem_schur_extraction_s" => isnothing(coupled_system.condensation) ?
-                                            0.0 :
-                                            coupled_system.condensation.timings.schur_extraction_s,
-                "fem_schur_upload_s" => isnothing(coupled_system.condensation) ||
-                                        !hasproperty(
-                    coupled_system.condensation.timings,
-                    :upload_s,
-                ) ? 0.0 : coupled_system.condensation.timings.upload_s,
-                "fem_rhs_condensation_s" => maximum(
-                    something(solution.fem_rhs_condensation_s, 0.0) for solution in solutions
-                ),
-                "fem_reconstruction_s" => maximum(
-                    something(solution.fem_reconstruction_s, 0.0) for solution in solutions
-                ),
-                "block_assembly_s" => coupled_system.timings.block_assembly_s,
-                "coupled_factorization_s" => coupled_system.timings.coupled_factorization_s,
-                "replay_factorization_s" => coupled_system.timings.replay_factorization_s,
-            ),
-        )
-        if validation_diagnostics
-            diagnostics["relative_residual"] = maximum(solution.relative_residual for solution in solutions)
-            diagnostics["all_bem_replay_error"] = maximum(
-                solution.all_bem_replay_error for solution in solutions
+            rank_experiment_config = get(
+                solver_options,
+                "speaker_rom_rank_experiment",
+                nothing,
             )
+            rank_experiment = isnothing(rank_experiment_config) ?
+                              nothing :
+                              speaker_rom_rank_experiment(
+                coupled_system,
+                rank_experiment_config,
+            )
+            diagnostics = Dict{String,Any}(
+                "precision" => precision_name,
+                "bem_backend" => String(bem_backend),
+                "coupled_bem_assembly" => hasproperty(coupled_system, :coupled_bem_assembly) ? String(coupled_system.coupled_bem_assembly) : "operators",
+                "coupled_bem_image_fusion" => hasproperty(coupled_system, :coupled_bem_image_fusion) && coupled_system.coupled_bem_image_fusion,
+                "coupled_bem_max_registers" => hasproperty(coupled_system, :coupled_bem_max_registers) ? coupled_system.coupled_bem_max_registers : 0,
+                "linear_backend" => String(coupled_system.linear_backend),
+                "fem_symbolic_analysis_reused" => !isnothing(coupled_system.condensation) &&
+                    hasproperty(coupled_system.condensation, :analysis_reused) &&
+                    coupled_system.condensation.analysis_reused,
+                "symmetry" => String(symmetry_mode),
+                "formulation" => String(coupled_system.formulation),
+                "linear_solver" => if coupled_system.formulation == :fem_interface_condensed
+                    if coupled_system.linear_backend == :rocm
+                        "rocm_hybrid_cpu_sparse_schur_plus_rocsolver_dense_lu"
+                    elseif coupled_system.linear_backend == :cuda
+                        "cuda_cudss_schur_plus_dense_lu"
+                    elseif coupled_system.condensation.backend == :cpu_noop
+                        "cpu_dense_lu_noop_schur"
+                    else
+                        "cpu_umfpack_schur_plus_dense_lu"
+                    end
+                elseif coupled_system.linear_backend == :rocm
+                    "rocm_rocsolver_dense_lu"
+                else
+                    "$(coupled_system.linear_backend)_dense_lu"
+                end,
+                "full_system_order" => coupled_system.full_system_order,
+                "solved_system_order" => coupled_system.solved_system_order,
+                "bounded_region_count" => length(bounded_regions),
+                "interface_count" => length(interfaces),
+                "transducer_count" => length(transducers),
+                "transducer_reference_voltage_v" => transducer_reference_voltage_v,
+                "fem_bulk_loss_factors_by_region" => Dict(
+                    String(region["id"]) => Float64(
+                        get(get(region, "loss_model", Dict{String,Any}()), "bulk_loss_factor", 0.0),
+                    )
+                    for region in bounded_regions
+                ),
+                "wall_impedance_boundary_ids" => [spec.boundary_id for spec in fem_domains.wall_impedances],
+                "static_condensation_requested" => static_condensation_requested,
+                "static_condensation_active" => static_condensation,
+                "fem_condensation_backend" => isnothing(coupled_system.condensation) ?
+                                              nothing :
+                                              String(coupled_system.condensation.backend),
+                "fem_schur_block_size" => isnothing(coupled_system.condensation) ||
+                                          !hasproperty(
+                    coupled_system.condensation,
+                    :schur_block_size,
+                ) ? 0 : coupled_system.condensation.schur_block_size,
+                "fem_schur_thread_count" => isnothing(coupled_system.condensation) ||
+                                            !hasproperty(
+                    coupled_system.condensation,
+                    :schur_thread_count,
+                ) ? 0 : coupled_system.condensation.schur_thread_count,
+                "pressure_continuity_error" => isempty(interface_pressure_errors) ?
+                                               nothing :
+                                               maximum(interface_pressure_errors),
+                "flux_conservation_error" => isempty(interface_flux_errors) ?
+                                             nothing :
+                                             maximum(interface_flux_errors),
+                "interface_ids" => [String(interface["id"]) for interface in interfaces],
+                "interface_pressure_continuity_errors" => interface_pressure_errors,
+                "interface_flux_conservation_errors" => interface_flux_errors,
+                "timings" => Dict(
+                    "assembly_s" => assembly_s,
+                    "solve_s" => solve_s,
+                    "field_s" => field_s,
+                    "mesh_setup_s" => frequency_index == 1 ? mesh_setup_s : 0.0,
+                    "cache_setup_s" => frequency_index == 1 ? cache_setup_s : 0.0,
+                    "fem_matrix_cache_s" => frequency_index == 1 ?
+                                            coupled_system.cache.timings.fem_matrix_cache_s : 0.0,
+                    "interface_operator_cache_s" => frequency_index == 1 ?
+                                                    coupled_system.cache.timings.interface_operator_cache_s : 0.0,
+                    "bem_space_cache_s" => frequency_index == 1 ?
+                                           coupled_system.cache.timings.bem_space_cache_s : 0.0,
+                    "bem_singular_cache_s" => frequency_index == 1 ?
+                                              coupled_system.cache.timings.bem_singular_cache_s : 0.0,
+                    "bem_cpu_assembly_cache_s" => frequency_index == 1 ?
+                                                  coupled_system.cache.timings.bem_cpu_assembly_cache_s : 0.0,
+                    "bem_device_regular_cache_s" => frequency_index == 1 ?
+                                                    coupled_system.cache.timings.bem_device_regular_cache_s : 0.0,
+                    "bem_device_singular_cache_s" => frequency_index == 1 ?
+                                                     coupled_system.cache.timings.bem_device_singular_cache_s : 0.0,
+                    "bem_device_image_cache_s" => frequency_index == 1 ?
+                                                  coupled_system.cache.timings.bem_device_image_cache_s : 0.0,
+                    "bem_identity_cache_s" => frequency_index == 1 ?
+                                              coupled_system.cache.timings.bem_identity_cache_s : 0.0,
+                    "device_block_cache_s" => frequency_index == 1 ?
+                                              coupled_system.cache.timings.device_block_cache_s : 0.0,
+                    "field_cache_s" => frequency_index == 1 ?
+                                       coupled_system.cache.timings.field_cache_s : 0.0,
+                    "fem_system_s" => coupled_system.timings.fem_system_s,
+                    "bem_operator_s" => coupled_system.timings.bem_operator_s,
+                    "bem_matrix_s" => coupled_system.timings.bem_matrix_s,
+                    "fem_condensation_s" => coupled_system.timings.fem_condensation_s,
+                    "fem_condensation_analysis_s" => isnothing(coupled_system.condensation) ?
+                                                     0.0 :
+                                                     coupled_system.condensation.timings.analysis_s,
+                    "fem_condensation_factorization_s" => isnothing(coupled_system.condensation) ?
+                                                          0.0 :
+                                                          coupled_system.condensation.timings.factorization_s,
+                    "fem_condensation_partition_s" => isnothing(coupled_system.condensation) ||
+                                                       !hasproperty(
+                        coupled_system.condensation.timings,
+                        :partition_s,
+                    ) ? 0.0 : coupled_system.condensation.timings.partition_s,
+                    "fem_schur_extraction_s" => isnothing(coupled_system.condensation) ?
+                                                0.0 :
+                                                coupled_system.condensation.timings.schur_extraction_s,
+                    "fem_schur_upload_s" => isnothing(coupled_system.condensation) ||
+                                            !hasproperty(
+                        coupled_system.condensation.timings,
+                        :upload_s,
+                    ) ? 0.0 : coupled_system.condensation.timings.upload_s,
+                    "fem_rhs_condensation_s" => maximum(
+                        something(solution.fem_rhs_condensation_s, 0.0) for solution in solutions
+                    ),
+                    "fem_reconstruction_s" => maximum(
+                        something(solution.fem_reconstruction_s, 0.0) for solution in solutions
+                    ),
+                    "block_assembly_s" => coupled_system.timings.block_assembly_s,
+                    "coupled_factorization_s" => coupled_system.timings.coupled_factorization_s,
+                    "replay_factorization_s" => coupled_system.timings.replay_factorization_s,
+                ),
+            )
+            if validation_diagnostics
+                diagnostics["relative_residual"] = maximum(solution.relative_residual for solution in solutions)
+                diagnostics["all_bem_replay_error"] = maximum(
+                    solution.all_bem_replay_error for solution in solutions
+                )
+            end
+            diagnostics["fem_interior_residual"] = use_condensed_solver ?
+                maximum(solution.fem_interior_residual for solution in solutions) : nothing
+            isnothing(rank_experiment) ||
+                (diagnostics["speaker_rom_rank_experiment"] = rank_experiment)
+            result = Dict(
+                "schema_version" => 2,
+                "freq_hz" => frequency_hz,
+                "excitation_port_ids" => excitation_port_ids,
+                "quantities" => quantities,
+                "diagnostics" => diagnostics,
+            )
+            record_result_provenance!(result, request)
+            if event_mode
+                println(JSON.json(Dict("type" => "result", "result" => result)))
+            else
+                println(JSON.json(result))
+            end
+            flush(stdout)
+            use_condensed_solver ? release_condensed_coupled_system!(coupled_system) :
+            release_coupled_system!(coupled_system)
+            coupled_system = nothing
+            solved_count = frequency_index
         end
-        diagnostics["fem_interior_residual"] = use_condensed_solver ?
-            maximum(solution.fem_interior_residual for solution in solutions) : nothing
-        isnothing(rank_experiment) ||
-            (diagnostics["speaker_rom_rank_experiment"] = rank_experiment)
-        result = Dict(
-            "schema_version" => 2,
-            "freq_hz" => frequency_hz,
-            "excitation_port_ids" => excitation_port_ids,
-            "quantities" => quantities,
-            "diagnostics" => diagnostics,
-        )
-        if event_mode
-            println(JSON.json(Dict("type" => "result", "result" => result)))
-        else
-            println(JSON.json(result))
+    finally
+        if coupled_system !== nothing
+            use_condensed_solver ? release_condensed_coupled_system!(coupled_system) :
+            release_coupled_system!(coupled_system)
         end
-        flush(stdout)
-        use_condensed_solver ? release_condensed_coupled_system!(coupled_system) :
-        release_coupled_system!(coupled_system)
-        solved_count = frequency_index
-    end
-    if coupled_cache !== nothing
-        use_condensed_solver ? release_condensed_coupled_cache!(coupled_cache) :
-        release_coupled_cache!(coupled_cache)
+        if coupled_cache !== nothing
+            use_condensed_solver ? release_condensed_coupled_cache!(coupled_cache) :
+            release_coupled_cache!(coupled_cache)
+        end
     end
     cancelled = cancelled || cancel_requested()
     return (cancelled=cancelled, solved_count=solved_count)
@@ -3332,6 +3315,14 @@ function retained_bem_field_evaluation_cache(
 end
 
 function evaluate_bem_field_request(request, request_path)
+    get(request, "phasor_convention", NEGATIVE_TIME_PHASOR) == POSITIVE_TIME_PHASOR && get(request, "bem_backend", "cpu") == "rocm" &&
+        error("Positive-time ROCm fields require hardware qualification; use CPU or CUDA.")
+    return with_phasor_convention(get(request, "phasor_convention", NEGATIVE_TIME_PHASOR)) do
+        evaluate_bem_field_request_impl(request, request_path)
+    end
+end
+
+function evaluate_bem_field_request_impl(request, request_path)
     precision_name = lowercase(String(get(request, "precision", "float32")))
     FloatType = precision_name == "float64" ? Float64 : precision_name == "float32" ? Float32 :
                 error("Exterior field precision must be float32 or float64.")
@@ -3417,22 +3408,50 @@ function evaluate_bem_field_request(request, request_path)
     )
 end
 
+function worker_backend_availability()
+    backends = Dict{String,Any}("cpu" => Dict("available" => true, "reason" => ""))
+    for (name, accelerator) in (("cuda", BeatEngineCore.CUDA_MODULE), ("rocm", BeatEngineCore.AMDGPU_MODULE))
+        available, reason = try
+            if accelerator === nothing
+                (false, "Package is not loaded in this Julia environment.")
+            else
+                functional = accelerator.functional()
+                if functional && name == "rocm"
+                    functional = accelerator.functional(:rocblas) && accelerator.functional(:rocsolver)
+                end
+                (functional, functional ? "" : "Runtime/device or required solver libraries are not functional.")
+            end
+        catch exception
+            (false, sprint(showerror, exception))
+        end
+        backends[name] = Dict("available" => available, "reason" => reason,
+            "phasor_conventions" => name == "rocm" ? [NEGATIVE_TIME_PHASOR] : [NEGATIVE_TIME_PHASOR, POSITIVE_TIME_PHASOR])
+    end
+    return backends
+end
+
 function run_worker()
-    println(JSON.json(Dict("type" => "ready")))
+    println(JSON.json(worker_ready(worker_backend_availability())))
     flush(stdout)
     for line in eachline(stdin)
         isempty(strip(line)) && continue
         try
             submission = JSON.parse(line)
+            validate_worker_submission(submission)
             request_path = String(submission["request"])
             request = JSON.parse(read(request_path, String))
             operation = String(get(submission, "operation", "solve"))
+            options = operation == "solve" ? get(request, "solver_options", Dict()) : request
+            get(options, "phasor_convention", NEGATIVE_TIME_PHASOR) ==
+                get(submission, "phasor_convention", NEGATIVE_TIME_PHASOR) ||
+                error("Request phasor convention differs from negotiated command.")
             if operation == "bem_field"
                 values = evaluate_bem_field_request(request, request_path)
                 println(
                     JSON.json(
                         Dict(
                             "type" => "field_result",
+                            "phasor_convention" => get(request, "phasor_convention", NEGATIVE_TIME_PHASOR),
                             "values_binary" => write_field_binary_result(
                                 request,
                                 request_path,
@@ -3457,7 +3476,7 @@ function run_worker()
         catch exception
             reclaim_accelerator_memory!()
             error_text = sprint(showerror, exception, catch_backtrace())
-            println(JSON.json(Dict("type" => "failed", "error" => error_text)))
+            println(JSON.json(Dict("type" => "failed", "error" => error_text, "code" => "worker_request_failed")))
         end
         flush(stdout)
     end

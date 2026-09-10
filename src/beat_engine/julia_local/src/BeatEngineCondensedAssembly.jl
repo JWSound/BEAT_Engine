@@ -202,6 +202,7 @@ function assemble_condensed_regular_operators(
     cpu_cache=nothing,
     symmetry_mode::Symbol=:off,
 ) where {T<:AbstractFloat}
+    k = outgoing_wavenumber(k)
     symmetry_mode = BeatEngineCore.normalized_symmetry_mode(symmetry_mode)
 
     if cpu_cache !== nothing

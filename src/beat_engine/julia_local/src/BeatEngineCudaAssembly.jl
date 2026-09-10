@@ -20,6 +20,7 @@ function assemble_regular_galerkin_operators_cuda_regular(
     cuda_image_near_correction_cache=nothing,
     symmetry_mode::Symbol=:off,
 ) where {T<:AbstractFloat}
+    k = outgoing_wavenumber(k)
     CUDA.functional() || error("CUDA regular-pair assembly requested, but CUDA.functional() is false.")
     parallel_quadrature || error("Balanced CUDA regular assembly requires parallel_quadrature=true.")
     return_gpu || error("BEAT Engine is CUDA-only; CPU operator materialization has been removed.")

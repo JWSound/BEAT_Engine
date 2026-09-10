@@ -157,7 +157,7 @@ function _sample_patterns(points, wavenumber, count::Int, offset::Int, ::Type{T}
         direction = T[radial * cos(phi), radial * sin(phi), z]
         if isodd(sample_index)
             for (row, point) in enumerate(points)
-                patterns[row, column] = cis(wavenumber * dot(T.(point) .- center, direction))
+                patterns[row, column] = cis(outgoing_wavenumber(wavenumber) * dot(T.(point) .- center, direction))
             end
         else
             exit_distance = minimum(
@@ -168,7 +168,7 @@ function _sample_patterns(points, wavenumber, count::Int, offset::Int, ::Type{T}
             source = center .+ (exit_distance + levels[mod1(sample_index, 6)] * scale) .* direction
             for (row, point) in enumerate(points)
                 distance = norm(T.(point) .- source)
-                patterns[row, column] = cis(wavenumber * distance) / distance
+                patterns[row, column] = cis(outgoing_wavenumber(wavenumber) * distance) / distance
             end
         end
     end
@@ -224,7 +224,7 @@ function _boundary_output(system, layout, state)
     T = system.scalar_type
     result = system.interface_operators.bem_flux * view(state, layout.flux_range, :)
     if !isempty(layout.mechanical_range)
-        scale = Complex{T}(0, system.density * system.omega)
+        scale = neumann_scale(system.density, system.omega)
         result .+= scale .* (
             system.transducer_operators.bem_normal_velocity *
             view(state, layout.mechanical_range, :)
@@ -238,7 +238,7 @@ function _left_hand_side(system, layout, face_test)
     rhs = zeros(Complex{T}, layout.state_count, size(face_test, 2))
     rhs[layout.flux_range, :] .= adjoint(system.interface_operators.bem_flux) * face_test
     if !isempty(layout.mechanical_range)
-        scale = Complex{T}(0, system.density * system.omega)
+        scale = neumann_scale(system.density, system.omega)
         rhs[layout.mechanical_range, :] .= conj(scale) .* (
             adjoint(system.transducer_operators.bem_normal_velocity) * face_test
         )

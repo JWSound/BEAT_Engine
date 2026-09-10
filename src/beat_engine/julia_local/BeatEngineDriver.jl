@@ -26,6 +26,12 @@ function emit_event(event_type::String; kwargs...)
     for (key, value) in kwargs
         payload[String(key)] = value
     end
+    payload["phasor_convention"] = phasor_convention()
+    if event_type == "ready"
+        payload["phasor_conventions"] = [NEGATIVE_TIME_PHASOR, POSITIVE_TIME_PHASOR]
+    elseif event_type == "result" && haskey(payload, "result")
+        get!(payload["result"], "diagnostics", Dict{String,Any}())["phasor_convention"] = phasor_convention()
+    end
     println(JSON.json(payload))
     flush(stdout)
 end
@@ -294,9 +300,8 @@ function butterworth_response(crossover_type::String, order::Int, cutoff_hz, fre
     cutoff = T(cutoff_hz)
     omega = T(2pi) * freq
     omega_c = T(2pi) * cutoff
-    # Channel DSP is applied directly to BEAT's exp(-i omega t) solver
-    # phasors, so evaluate the causal analog response at s = -i*omega.
-    s = Complex{T}(0, -omega)
+    # Evaluate channel DSP at the time derivative selected for this request.
+    s = time_derivative(omega)
     response = one(Complex{T})
 
     for pole in butterworth_poles(order, T)
@@ -328,7 +333,7 @@ end
 function channel_drive(channel, freq::T) where {T<:AbstractFloat}
     omega = T(2pi) * freq
     level = T(10.0) ^ (T(channel["level_db"]) / T(20.0))
-    delay = exp(Complex{T}(0, omega * T(channel["delay_ms"]) / T(1000.0)))
+    delay = exp(Complex{T}(0, propagation_sign() * omega * T(channel["delay_ms"]) / T(1000.0)))
     crossover = crossover_response(get_value(channel, "hpf", nothing), freq) *
         crossover_response(get_value(channel, "lpf", nothing), freq)
     return Complex{T}(T(channel["polarity"]) * level) * delay * crossover
@@ -416,7 +421,7 @@ function drive_for_radiator(radiator, channels, freq::T) where {T<:AbstractFloat
     polarity = T(radiator["polarity"])
     delay_ms = T(radiator["delay_ms"])
     level = T(10.0) ^ (level_db / T(20.0))
-    delay = exp(Complex{T}(0, omega * delay_ms / T(1000.0)))
+    delay = exp(Complex{T}(0, propagation_sign() * omega * delay_ms / T(1000.0)))
     crossover = crossover_response(get_value(radiator, "hpf", nothing), freq) *
         crossover_response(get_value(radiator, "lpf", nothing), freq)
     return Complex{T}(polarity * level) * delay * crossover
@@ -470,7 +475,7 @@ function pressure_for_drives(
         drive = drives[radiator_index]
         for element_index in eachindex(mesh.physical_tags)
             if mesh.physical_tags[element_index] == tag && radiator_owns_element(radiator, element_mesh_ids, element_index)
-                q_neumann[element_index] = ComplexType(0, rho * omega) * drive
+                q_neumann[element_index] = neumann_scale(rho, omega) * drive
             end
         end
     end
@@ -679,7 +684,7 @@ function impedance_for_radiators(mesh, element_mesh_ids, pressure, radiators, dr
         end
         total_force *= eltype(pressure)(10.0)
         z_complex = total_force / drive
-        push!(impedance, [Float32(real(z_complex) / 2), Float32(-imag(z_complex) / 2)])
+        push!(impedance, [Float32(real(z_complex) / 2), Float32(-propagation_sign() * imag(z_complex) / 2)])
     end
     return impedance
 end
@@ -687,6 +692,15 @@ end
 include(joinpath(@__DIR__, "deploy_solver.jl"))
 
 function solve_request(request)
+    convention = get_value(request, "phasor_convention", get_value(get_value(request, "config", Dict()), "phasor_convention", NEGATIVE_TIME_PHASOR))
+    convention == POSITIVE_TIME_PHASOR && beat_backend_from_request(request) == :rocm &&
+        error("Positive-time ROCm solves require hardware qualification; use CPU, CUDA, or Metal.")
+    return with_phasor_convention(convention) do
+        solve_request_with_convention(request)
+    end
+end
+
+function solve_request_with_convention(request)
     try
         schema = String(get_value(request, "schema", ""))
         if schema in ("boundary_lab_deploy_solve", "boundary_lab_deploy_rom")

@@ -53,7 +53,7 @@ N x N complex copy of a matrix that is 99.9% zeros -- 419 MB at 10,230 P1 dofs,
 every frequency.
 """
 function burton_miller_neumann_lhs(operators, identity_p1_p1, k::T) where {T<:AbstractFloat}
-    coupling = Complex{T}(0, 1) / k
+    coupling = burton_miller_coupling(k)
     return Complex{T}(0.5) .* identity_p1_p1 .- operators.double_layer .+ coupling .* operators.hypersingular
 end
 
@@ -68,7 +68,7 @@ products cost a fraction of writing it. This mirrors what the CUDA path already
 does above 768 dofs (`_cuda_burton_miller_rhs`).
 """
 function burton_miller_neumann_rhs(operators, identity_p1_dp0, q_neumann, k::T) where {T<:AbstractFloat}
-    coupling = Complex{T}(0, 1) / k
+    coupling = burton_miller_coupling(k)
     q = Complex{T}.(q_neumann)
     rhs = Vector{Complex{T}}(undef, size(operators.single_layer, 1))
     mul!(rhs, operators.single_layer, q, -one(Complex{T}), zero(Complex{T}))
@@ -103,7 +103,7 @@ function _add_scaled_matvec!(rhs::Vector{Complex{T}}, matrix::AbstractMatrix,
 end
 
 function burton_miller_neumann_matrices(operators, identity_p1_p1, identity_p1_dp0, k::T) where {T<:AbstractFloat}
-    coupling = Complex{T}(0, 1) / k
+    coupling = burton_miller_coupling(k)
     lhs = burton_miller_neumann_lhs(operators, identity_p1_p1, k)
     rhs_operator = -operators.single_layer .- coupling .* (operators.adjoint_double_layer .+ Complex{T}(0.5) .* identity_p1_dp0)
     return lhs, rhs_operator
