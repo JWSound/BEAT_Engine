@@ -26,3 +26,30 @@ jobs:
         with:
           name: beat-engine-${{ matrix.os }}
           path: dist/*
+
+  # The Metal backend, as far as a runner without a GPU can take it.
+  #
+  # GitHub's macOS runners are Apple Silicon but virtualized under Apple's
+  # Virtualization Framework, which exposes no GPU, so Metal.functional() is
+  # false and no kernel runs here. What this job does cover is the part that
+  # breaks silently otherwise: instantiating julia_metal resolves Metal.jl and
+  # precompiles BeatEngineMetalBundle, which compiles every BeatEngineMetal*.jl
+  # source, and metal_host_tests.jl then checks the entry points the solver
+  # dispatches to and the environment controls that select kernel and
+  # write-back modes.
+  #
+  # Kernel correctness needs a self-hosted Apple Silicon runner; that belongs
+  # in hardware.yml alongside cuda and rocm, not here.
+  metal:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: "1.12"
+      - run: python -m pip install -e .
+      - run: python -m beat_engine instantiate --backend metal
+      - run: julia --threads=2 --startup-file=no --project=src/beat_engine/julia_metal src/beat_engine/julia_local/tests/metal_host_tests.jl
