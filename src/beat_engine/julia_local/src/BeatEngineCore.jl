@@ -2,6 +2,10 @@ module BeatEngineCore
 
 using Base.Threads, LinearAlgebra, SparseArrays, StaticArrays
 
+include("BeatEnginePhasor.jl")
+export NEGATIVE_TIME_PHASOR, POSITIVE_TIME_PHASOR, phasor_convention, propagation_sign,
+    outgoing_wavenumber, neumann_scale, time_derivative, burton_miller_coupling, with_phasor_convention
+
 const BEAT_ACCELERATOR_HINT = let
     # A bundle package in julia_engine/ names its backend here, and it has to:
     # when these sources are loaded from a package, the environment variable and
@@ -848,6 +852,7 @@ function surface_curls(vertices::NTuple{3,SVector{3,T}}, normal::SVector{3,T}) w
 end
 
 function helmholtz_single_layer_kernel(x, y, k::T) where {T<:AbstractFloat}
+    k = outgoing_wavenumber(k)
     radius = norm(y - x)
     radius == zero(T) && return zero(Complex{T})
     return exp(Complex{T}(1im) * k * radius) / (T(4.0) * T(pi) * radius)
@@ -855,6 +860,7 @@ end
 helmholtz_single_layer_kernel(x, y, test_normal, trial_normal, k::T) where {T<:AbstractFloat} = helmholtz_single_layer_kernel(x, y, k)
 
 function helmholtz_double_layer_kernel(x, y, source_normal, k::T) where {T<:AbstractFloat}
+    k = outgoing_wavenumber(k)
     r_vec = y - x
     radius = norm(r_vec)
     radius == zero(T) && return zero(Complex{T})
@@ -865,6 +871,7 @@ end
 helmholtz_double_layer_kernel(x, y, test_normal, trial_normal, k::T) where {T<:AbstractFloat} = helmholtz_double_layer_kernel(x, y, trial_normal, k)
 
 function helmholtz_adjoint_double_layer_kernel(x, y, test_normal, k::T) where {T<:AbstractFloat}
+    k = outgoing_wavenumber(k)
     r_vec = y - x
     radius = norm(r_vec)
     radius == zero(T) && return zero(Complex{T})
@@ -1497,7 +1504,7 @@ function solve_burton_miller_neumann(
     get(operators, :on_gpu, false) || error("Cached CUDA solve requires GPU-resident operators.")
     cuda = cuda_module()
     cuda.functional() || error("CUDA solve requested, but CUDA.functional() is false.")
-    coupling = Complex{T}(0, 1) / k
+    coupling = burton_miller_coupling(k)
     d_q_neumann = d_lhs = d_rhs_operator = d_rhs = d_pressure = nothing
     pressure = nothing
     neumann_on_gpu = q_neumann isa cuda.CuArray

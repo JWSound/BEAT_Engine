@@ -632,7 +632,7 @@ function build_condensed_coupled_system(
         for operator in prepared.wall_impedance_operators
     ]
     for (operator, admittance) in zip(prepared.wall_impedance_operators, wall_admittances)
-        fem_system -= Complex{T}(0, density * omega) * admittance .* operator.matrix
+        fem_system -= neumann_scale(density, omega) * admittance .* operator.matrix
     end
     interface_operators = prepared.interface_operators
     transducer_count = length(transducers)
@@ -640,7 +640,7 @@ function build_condensed_coupled_system(
         error("FEM transducer operator count does not match the transducer list.")
     size(resolved_transducer_operators.bem_surface, 2) == transducer_count ||
         error("BEM transducer operator count does not match the transducer list.")
-    normal_derivative_scale = Complex{T}(0, density * omega)
+    normal_derivative_scale = neumann_scale(density, omega)
     bem_motion_flux = normal_derivative_scale .* Complex{T}.(
         resolved_transducer_operators.bem_normal_velocity
     )
@@ -853,7 +853,7 @@ function _solution_from_parts(
     T = system.scalar_type
     bem_neumann = (
         Complex{T}.(system.interface_operators.bem_flux) * interface_flux +
-        Complex{T}(0, system.density * system.omega) .*
+        neumann_scale(system.density, system.omega) .*
         (Complex{T}.(system.transducer_operators.bem_normal_velocity) * diaphragm_velocity) +
         prescribed_bem_neumann
     )

@@ -156,6 +156,7 @@ function evaluate_galerkin_field_rocm(
     cache::RocmFieldEvaluationCache{T};
     return_device::Bool=false,
 ) where {T<:AbstractFloat}
+    k = outgoing_wavenumber(k)
     point_count = length(eval_points)
     point_count == 0 && return return_device ? AMDGPU.ROCArray(Complex{T}[]) : Complex{T}[]
     _require_rocm!()
