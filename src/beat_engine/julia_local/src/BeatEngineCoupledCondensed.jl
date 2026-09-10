@@ -719,7 +719,9 @@ function build_condensed_coupled_system(
             device_singular_cache=prepared.device_singular_cache,
             symmetry_mode=prepared.symmetry_mode,
         )
-        # Wraps the shared device storage in place; the host tuple owns it.
+        # Wraps shared device storage in place (copies it when the storage mode
+        # is private); either way the host tuple owns the device buffers, so
+        # `device_operators` must not be released separately.
         metal_host_operators(device_operators)
     else
         assemble_condensed_regular_operators(
@@ -744,6 +746,10 @@ function build_condensed_coupled_system(
         prepared.identity_p1_dp0,
         wavenumber,
     )
+    # `operators` is dead from here on and the matrices above are freshly
+    # allocated host arrays, so free the Metal buffers now rather than leaking
+    # one operator set per condensed frequency.
+    prepared.bem_backend == :metal && release_operator_storage!(operators)
     bem_interface_block = -(bem_rhs_operator * Complex{T}.(interface_operators.bem_flux))
     bem_motion_block = transducer_count == 0 ? nothing : -(bem_rhs_operator * bem_motion_flux)
     bem_prescribed_rhs = prescribed_bem_count == 0 ?

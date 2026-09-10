@@ -976,6 +976,10 @@ function solve_request_impl(request)
         return ((kind=:operators, operators=assembled), time() - started)
     end
     pending_assembly = nothing
+    # The payload fetched for the frequency currently being solved. Held out
+    # here so the outer `finally` can free its device buffers when the solve,
+    # field evaluation, synthesis, or diagnostics throw.
+    current_assembly_payload = nothing
     if metal_pipeline && !isempty(frequencies)
         first_k = FloatType(2pi) * FloatType(frequencies[1]) / sound_speed
         pending_assembly = Threads.@spawn assemble_for_frequency(first_k)
@@ -984,7 +988,12 @@ function solve_request_impl(request)
     try
         for (index, freq_raw) in enumerate(frequencies)
             if cancel_path !== nothing && isfile(String(cancel_path))
-                pending_assembly === nothing || release_assembly_payload!(fetch(pending_assembly)[1])
+                if pending_assembly !== nothing
+                    release_assembly_payload!(fetch(pending_assembly)[1])
+                    # Cleared so the outer `finally` does not fetch and release
+                    # the same payload a second time on the way out.
+                    pending_assembly = nothing
+                end
                 emit_event("cancelled"; solved_count=index - 1)
                 return
             end
@@ -1090,6 +1099,7 @@ function solve_request_impl(request)
             end
         end
         metal_pipeline && (t_assembly = pipelined_assembly_seconds)
+        current_assembly_payload = assembly_payload
         operators = get(assembly_payload, :operators, nothing)
 
         t_solve = 0.0
@@ -1204,6 +1214,7 @@ function solve_request_impl(request)
         end
 
         release_assembly_payload!(assembly_payload)
+        current_assembly_payload = nothing
         emit_event(
             "result";
             solved_count=index,
@@ -1264,6 +1275,12 @@ function solve_request_impl(request)
         )
         end
     finally
+        if current_assembly_payload !== nothing
+            try
+                release_assembly_payload!(current_assembly_payload)
+            catch
+            end
+        end
         if pending_assembly !== nothing
             try
                 release_assembly_payload!(fetch(pending_assembly)[1])

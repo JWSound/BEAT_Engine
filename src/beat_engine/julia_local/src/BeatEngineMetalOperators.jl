@@ -55,13 +55,13 @@ Present Metal-resident operators to the host as a NamedTuple with the same
 keys and `on_gpu=false`, so every CPU solve routine accepts it.
 
 Shared-storage buffers are wrapped in place, so this costs nothing and the
-returned arrays alias device memory: the returned tuple carries the device
-arrays under `metal_backing` and takes ownership of them, so
-`release_operator_storage!` on *it* is what frees them. Release exactly once,
-through whichever tuple you still hold: freeing the device tuple while the host
-views are alive leaves them dangling. Private-storage buffers are copied as
-before, and then the returned tuple owns nothing and the device tuple is still
-the caller's to free.
+returned arrays alias device memory; private-storage buffers are copied. Either
+way the returned tuple carries the device arrays under `metal_backing` and takes
+ownership of them, so `release_operator_storage!` on *it* is what frees them.
+Callers may therefore overwrite their device tuple with the returned host tuple
+and still release the device buffers exactly once. Release exactly once, through
+whichever tuple you still hold: with shared storage, freeing the device tuple
+while the host views are alive leaves them dangling.
 """
 function metal_host_operators(operators::NamedTuple)
     get(operators, :gpu_backend, nothing) == :metal || error("metal_host_operators requires Metal operators.")
@@ -82,9 +82,12 @@ function metal_host_operators(operators::NamedTuple)
             hypersingular=Array(operators.hypersingular),
         )
     end
-    backing = shared ? NamedTuple{_METAL_OPERATOR_KEYS}(
+    # The device arrays are handed to the returned tuple in both storage modes:
+    # shared views alias them, private copies do not, but in neither case does
+    # the caller keep a tuple that still owns them.
+    backing = NamedTuple{_METAL_OPERATOR_KEYS}(
         map(key -> getfield(operators, key), _METAL_OPERATOR_KEYS),
-    ) : nothing
+    )
     extras = Base.structdiff(operators, NamedTuple{(:single_layer, :double_layer, :adjoint_double_layer, :hypersingular, :on_gpu, :metal_backing)})
     return merge(extras, host, (on_gpu=false, host_copy_of=:metal, metal_backing=backing))
 end

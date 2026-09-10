@@ -67,6 +67,10 @@ function build_metal_singular_correction_cache(cache::SingularCorrectionCache{T}
     )
 end
 
+# `host_staged` assembly never builds this cache, so the release paths that run
+# for every Metal solve may legitimately be handed `nothing`.
+release_metal_singular_correction_cache!(::Nothing) = nothing
+
 function release_metal_singular_correction_cache!(cache::MetalSingularCorrectionCache)
     Metal.unsafe_free!(cache.pair_offsets)
     Metal.unsafe_free!(cache.test_indices)
