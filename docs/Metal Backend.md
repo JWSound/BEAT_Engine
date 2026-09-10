@@ -184,7 +184,7 @@ at once.
 
 - An M-series Mac running macOS 14 or newer.
 - Julia 1.10 to 1.12.
-- The dedicated `src/blab/solvers/julia_metal` environment with Metal.jl.
+- The dedicated `src/beat_engine/julia_metal` environment with Metal.jl.
 
 To prepare the Julia environment from the repository root:
 
