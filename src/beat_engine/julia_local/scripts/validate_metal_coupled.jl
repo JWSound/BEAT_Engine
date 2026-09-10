@@ -12,9 +12,7 @@ using .BeatEngineCoupledCondensed
 
 using LinearAlgebra, Printf, SparseArrays, StaticArrays
 
-const FIXTURE_ROOT = normpath(
-    joinpath(@__DIR__, "..", "..", "..", "..", "..", "tests", "fixtures"),
-)
+const FIXTURE_ROOT = normpath(joinpath(@__DIR__, "..", "tests", "fixtures"))
 
 function relative_error(reference, candidate)
     scale = norm(reference)

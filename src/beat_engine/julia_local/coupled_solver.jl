@@ -852,7 +852,10 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     elseif backend == :rocm
         build_rocm_singular_correction_cache(singular_cache)
     elseif backend == :metal
-        build_metal_singular_correction_cache(singular_cache)
+        # Metal's host-staged assembly runs the singular correction on the CPU
+        # and rejects a native device cache, so only build one for :native.
+        BeatEngineCore._normalized_metal_assembly_mode(nothing) == :native ?
+        build_metal_singular_correction_cache(singular_cache) : nothing
     else
         nothing
     end
@@ -878,6 +881,10 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     cancel_path = get(request, "cancel_path", nothing)
     cancel_requested() = cancel_path !== nothing && isfile(String(cancel_path))
     solved_count = 0
+    # The operator set for the frequency currently in flight. Held out here so
+    # the outer `finally` frees its device buffers when the solve, the field
+    # evaluation, or result emission throws.
+    current_operators = nothing
     try
         for (frequency_index, raw_frequency) in enumerate(request["frequencies_hz"])
             cancel_requested() && return (cancelled=true, solved_count=solved_count)
@@ -951,6 +958,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     # storage and is released after this frequency's solves.
                     operators = metal_host_operators(operators)
                 end
+                current_operators = operators
                 assembly_s = (time_ns() - assembly_started) / 1.0e9
                 solve_started = time_ns()
                 cpu_system = backend in (:cpu, :metal) ? build_burton_miller_neumann_cpu_system(
@@ -1088,9 +1096,16 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
             println(JSON.json(event_mode ? Dict("type" => "result", "result" => result) : result))
             flush(stdout)
             operators === nothing || release_operator_storage!(operators)
+            current_operators = nothing
             solved_count = frequency_index
         end
     finally
+        if current_operators !== nothing
+            try
+                release_operator_storage!(current_operators)
+            catch
+            end
+        end
         if device_identity_cache !== nothing
             backend == :cuda ?
             release_cuda_burton_miller_identity_cache!(device_identity_cache) :

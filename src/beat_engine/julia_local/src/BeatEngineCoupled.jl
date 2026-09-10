@@ -1159,7 +1159,10 @@ function prepare_coupled_cache(
     elseif bem_backend == :rocm
         build_rocm_singular_correction_cache(singular_cache)
     elseif bem_backend == :metal
-        build_metal_singular_correction_cache(singular_cache)
+        # Metal's host-staged assembly runs the singular correction on the CPU
+        # and rejects a native device cache, so only build one for :native.
+        BeatEngineCore._normalized_metal_assembly_mode(nothing) == :native ?
+        build_metal_singular_correction_cache(singular_cache) : nothing
     else
         nothing
     end
@@ -2087,8 +2090,9 @@ function build_coupled_system(
     )
     if bem_backend == :metal
         # The coupled algebra below runs on the CPU for Metal (no GPU LU), so
-        # present the four operators to the host without copying them. The
-        # host tuple wraps the shared device storage in place and owns it.
+        # present the four operators to the host: shared storage is wrapped in
+        # place, private storage is copied. Either way the host tuple owns the
+        # device buffers, so releasing it releases them.
         operators = metal_host_operators(operators)
     end
     bem_operator_s = (time_ns() - bem_operator_started) / 1.0e9
@@ -2148,6 +2152,10 @@ function build_coupled_system(
             prepared.identity_p1_dp0,
             wavenumber,
         )
+        # `operators` is dead from here on, and the two matrices above are
+        # freshly allocated host arrays. Free the Metal buffers now instead of
+        # leaking an operator set per coupled frequency.
+        bem_backend == :metal && release_operator_storage!(operators)
         (
             bem_lhs=bem_lhs,
             bem_rhs_operator=bem_rhs_operator,

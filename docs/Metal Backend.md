@@ -15,8 +15,8 @@ The backend supports:
   points.
 
 Production solves use `Float32` and `ComplexF32`, which is also the only
-floating-point precision Apple GPUs provide. See [BEAT Engine
-Core](beat-engine-core.md) for the shared boundary-integral formulation.
+floating-point precision Apple GPUs provide. The shared boundary-integral
+formulation is the one used by the CPU and ROCm backends.
 
 ## Execution model
 
@@ -189,13 +189,13 @@ at once.
 To prepare the Julia environment from the repository root:
 
 ```bash
-julia --project=src/blab/solvers/julia_metal -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
+julia --project=src/beat_engine/julia_metal -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
 ```
 
 Verify the runtime:
 
 ```bash
-julia --project=src/blab/solvers/julia_metal -e 'using Metal; Metal.functional() || error("Metal unavailable"); Metal.versioninfo()'
+julia --project=src/beat_engine/julia_metal -e 'using Metal; Metal.functional() || error("Metal unavailable"); Metal.versioninfo()'
 ```
 
 ## Selecting the backend
@@ -223,9 +223,8 @@ Normal application use does not require these environment variables.
 | `BLAB_METAL_ATOMIC_SCATTER` | `1` | Diagnostic for `pair_atomic` only: `0` skips the atomic scatter to time the pair arithmetic (the operators are then wrong). |
 | `BLAB_BEAT_FUSED_BM` | `1` | Set to `0` to assemble the four operators and combine them on the host for exterior solves. Coupled solves, `host_staged` assembly and the `host` singular mode always take the four-operator path. |
 
-The fused system is then solved by the adaptive dense solve described in
-[BEAT Engine Core](beat-engine-core.md#adaptive-dense-solve) — dense LU or
-diagonally preconditioned GMRES, chosen per solve. Metal has no GPU LU, so
+The fused system is then solved by the shared adaptive dense solve — dense LU
+or diagonally preconditioned GMRES, chosen per solve. Metal has no GPU LU, so
 both routes run on the host; shared storage means the host reads the assembled
 matrix in place rather than copying it. Its environment overrides:
 
@@ -259,8 +258,8 @@ CPU-versus-Metal validation scripts:
 For example:
 
 ```bash
-julia -t auto --project=src/blab/solvers/julia_metal \
-  src/blab/solvers/julia_local/scripts/validate_metal_exterior.jl
+julia -t auto --project=src/beat_engine/julia_metal \
+  src/beat_engine/julia_local/scripts/validate_metal_exterior.jl
 ```
 
 `BLAB_VALIDATE_MESH`, `BLAB_VALIDATE_REGULAR_ORDER`,
