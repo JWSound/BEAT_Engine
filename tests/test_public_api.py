@@ -5,7 +5,7 @@ import pytest
 from beat_engine import __version__, engine_paths
 
 
-@pytest.mark.parametrize("backend", ["cpu", "cuda", "rocm"])
+@pytest.mark.parametrize("backend", ["cpu", "cuda", "rocm", "metal"])
 def test_public_paths_resolve_packaged_assets(backend):
     paths = engine_paths(backend)
     assert (paths.project / "Project.toml").is_file()
@@ -17,7 +17,7 @@ def test_public_paths_resolve_packaged_assets(backend):
 
 def test_unsupported_backend_does_not_fall_back():
     with pytest.raises(ValueError, match="Unsupported"):
-        engine_paths("metal")
+        engine_paths("opencl")
 
 
 def test_public_pool_defaults_to_negotiated_engine_workers():

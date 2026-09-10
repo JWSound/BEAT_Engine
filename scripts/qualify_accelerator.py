@@ -9,8 +9,8 @@ from pathlib import Path
 from beat_engine import engine_paths
 
 backend = os.environ["BEAT_BACKEND"]
-if backend not in {"cuda", "rocm"}:
-    raise SystemExit("BEAT_BACKEND must be cuda or rocm")
+if backend not in {"cuda", "rocm", "metal"}:
+    raise SystemExit("BEAT_BACKEND must be cuda, rocm, or metal")
 info = json.loads(subprocess.check_output([sys.executable, "-m", "beat_engine", "doctor", "--backend", backend]))
 Path("doctor.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
 if not info["backends"][backend]["available"]:
@@ -20,6 +20,7 @@ environment = dict(
     os.environ,
     BLAB_RUN_COUPLED_CUDA="1" if backend == "cuda" else "0",
     BLAB_RUN_COUPLED_ROCM="1" if backend == "rocm" else "0",
+    BLAB_RUN_COUPLED_METAL="1" if backend == "metal" else "0",
 )
 subprocess.run(
     [

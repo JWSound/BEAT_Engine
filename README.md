@@ -2,9 +2,9 @@
 
 Numerical BEM, FEM, and lumped electroacoustic solving, extracted from Boundary Lab.
 The `beat-engine` Python distribution supplies a standard-library worker client,
-versioned wire contracts, Julia CPU/CUDA/ROCm environments, and numerical tests.
-Project authoring, mesh compilation, Qt, and application preferences remain with
-the consuming application. Metal is not yet implemented or advertised.
+versioned wire contracts, Julia CPU/CUDA/ROCm/Metal environments, and numerical
+tests. Project authoring, mesh compilation, Qt, and application preferences remain
+with the consuming application.
 
 ## Local installation
 
@@ -19,7 +19,8 @@ python -m beat_engine paths --backend cpu
 ```
 
 For CUDA or ROCm, instantiate the matching backend and configure the platform SDK
-before running `doctor`. Availability is checked by the worker; it is not inferred
+before running `doctor`. For Metal, instantiate the `metal` backend on Apple
+Silicon; no SDK beyond macOS is needed. See [the Metal backend](docs/Metal%20Backend.md). Availability is checked by the worker; it is not inferred
 from the package being installed. Importing the package does not install packages,
 launch Julia, or modify the environment.
 
@@ -64,16 +65,18 @@ The required CPU reference gate has 464 checks including analytical complex
 pressure, independent excitations, symmetry, FEM modes, and coupled transducer
 comparisons. See its [coverage notes](src/beat_engine/julia_local/tests/README.md).
 The manual Accelerator qualification workflow uses self-hosted runners labeled
-`cuda` or `rocm`, with Python, Julia, and the matching SDK preinstalled. It requires
+`cuda`, `rocm`, or `metal`, with Python, Julia, and the matching SDK preinstalled. It requires
 the requested backend to be functional before running the numerical gates.
 GPU qualification remains hardware-specific; CPU success does not qualify GPU
 backends. Some historical research scripts and the optional noncubic-cavity test
 still require Boundary Lab's extended fixtures; they are not installed runtime
 requirements or part of the portable release gate.
 
-Exterior-only compiled-system CUDA solves default to direct Burton–Miller
-assembly, using the same assembler as Deploy. One pivoted LU factorization
-serves all excitation right-hand sides at a frequency. Set the solver option
+Exterior-only compiled-system CUDA and Metal solves default to direct
+Burton–Miller assembly. CUDA uses the same assembler as Deploy; Metal uses its
+fused assembler, which forms the system on the GPU and factorizes once on the
+host because Metal.jl has no GPU LU. One pivoted LU factorization serves all
+excitation right-hand sides at a frequency. Set the solver option
 `burton_miller_assembly` to `operator_matrices` for the previous assembly path;
 CPU and ROCm continue to use that path. The result diagnostics report the
 effective assembly mode and factorization count. Coupled FEM-BEM solves are
@@ -82,7 +85,8 @@ unaffected by this exterior option.
 Coupled CUDA solves without full diagnostics now default to combined A/C
 Burton-Miller assembly, job-cached sparse interface projection, and fused symmetry
 images. The original operator path remains available for comparisons and full
-diagnostics. Register caps are explicit hardware tuning options; the compiler
+diagnostics. Coupled Metal solves assemble the four operators on the GPU and run
+the coupled algebra, including FEM static condensation, on the host. Register caps are explicit hardware tuning options; the compiler
 default is preserved. See [coupled CUDA architecture and controls](docs/Coupled%20CUDA%20Assembly.md).
 
 The stable package release is `0.1.0`. CI builds a wheel after independent

@@ -32,7 +32,9 @@ not comparisons of engine version strings. The announcement also carries
 
 CPU is available in the bundled worker. CUDA is advertised available only when
 its loaded module reports a functional runtime/device. ROCm additionally requires
-functional rocBLAS and rocSOLVER. Probe failures are reported as unavailable with
+functional rocBLAS and rocSOLVER. Metal is advertised available only when Metal.jl
+reports a functional device, which requires the `julia_metal` environment on Apple
+Silicon. Probe failures are reported as unavailable with
 a reason. These are runtime availability checks, not numerical qualification or
 guarantees that a particular problem fits device memory. Availability is sampled
 for each new process; subsequent device failures are normal job errors.

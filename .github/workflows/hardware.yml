@@ -4,7 +4,7 @@ on:
     inputs:
       backend:
         type: choice
-        options: [cuda, rocm]
+        options: [cuda, rocm, metal]
         required: true
 jobs:
   qualify:
