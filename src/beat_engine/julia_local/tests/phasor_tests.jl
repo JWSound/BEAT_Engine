@@ -47,6 +47,32 @@
                 CUDA_MODULE.unsafe_free!(dq)
                 CUDA_MODULE.unsafe_free!(rhs)
             end
+            if metal_available()
+                dc = build_metal_regular_assembly_cache(mesh,p1,dp0,rule; singular_order=3)
+                sc = build_singular_correction_cache(mesh,3)
+                dsc = build_metal_singular_correction_cache(sc)
+                gpu = assemble_regular_galerkin_operators(mesh,p1,dp0,k,rule;
+                    skip_singular=false,singular_order=3,backend=:metal,
+                    device_cache=dc,singular_cache=sc,device_singular_cache=dsc)
+                host = metal_host_operators(gpu)
+                for key in (:single_layer,:double_layer,:adjoint_double_layer,:hypersingular)
+                    @test getproperty(host,key) ≈ getproperty(op,key) rtol=3f-3 atol=3f-4
+                end
+                direct = assemble_burton_miller_neumann_system_metal(mesh,p1,dp0,q,k,rule;
+                    device_cache=dc,singular_cache=sc,device_singular_cache=dsc,
+                    identity_p1_p1=ipp,identity_p1_dp0=ipq,singular_order=3)
+                METAL_MODULE.synchronize()
+                @test Array(direct.matrix) ≈ a rtol=3f-3 atol=3f-4
+                @test vec(Array(direct.rhs)) ≈ b*q rtol=3f-3 atol=3f-4
+                @test vec(solve_metal_burton_miller_system(direct)) ≈ p rtol=5f-3 atol=3f-4
+                gc = build_metal_field_evaluation_cache(cache)
+                @test evaluate_galerkin_field_metal(points,mesh,p,q,k,gc) ≈ field rtol=5f-4 atol=5f-5
+                release_metal_field_evaluation_cache!(gc)
+                release_metal_burton_miller_system!(direct)
+                release_operator_storage!(host)
+                release_metal_singular_correction_cache!(dsc)
+                release_metal_regular_assembly_cache!(dc)
+            end
             (;a,b,p,field)
         end
     end

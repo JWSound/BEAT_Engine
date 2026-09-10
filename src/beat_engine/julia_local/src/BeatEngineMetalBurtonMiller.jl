@@ -994,6 +994,9 @@ function assemble_burton_miller_neumann_system_metal(
     timing=nothing,
 ) where {T<:AbstractFloat}
     _require_metal!()
+    # The kernels combine -D + (i/k) H and -S - (i/k) K' with this k, so the
+    # signed outgoing wavenumber carries the convention into the coupling too.
+    k = outgoing_wavenumber(k)
     device_cache isa MetalRegularAssemblyCache ||
         error("Fused Metal Burton-Miller assembly requires a MetalRegularAssemblyCache.")
     normalized_mode = normalized_symmetry_mode(symmetry_mode)
@@ -1118,7 +1121,7 @@ function assemble_burton_miller_neumann_system_metal(
         # drive, so both stay cheaper on the host than a kernel launch.
         identity_elapsed = @elapsed begin
             scatter_metal_sparse_to_dense!(lhs, identity_cache.p1_p1_scatter; alpha=Complex{T}(0.5), add=true)
-            coupling = Complex{T}(0, 1) / k
+            coupling = burton_miller_coupling(k)
             identity_rhs = (identity_cache.p1_dp0 * Complex{T}.(q_host)) .* (-Complex{T}(0.5) * coupling)
             d_identity_rhs = MtlArray(identity_rhs)
             try

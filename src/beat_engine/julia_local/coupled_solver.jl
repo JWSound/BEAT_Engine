@@ -2209,7 +2209,7 @@ end
 function solve_request(request; event_mode=false)
     convention = get(get(request, "solver_options", Dict()), "phasor_convention", NEGATIVE_TIME_PHASOR)
     convention == POSITIVE_TIME_PHASOR && get(get(request, "solver_options", Dict()), "bem_backend", "cpu") == "rocm" &&
-        error("Positive-time ROCm solves require hardware qualification; use CPU or CUDA.")
+        error("Positive-time ROCm solves require hardware qualification; use CPU, CUDA, or Metal.")
     return with_phasor_convention(convention) do
         solve_request_impl(request; event_mode=event_mode)
     end
@@ -3464,7 +3464,11 @@ end
 
 function worker_backend_availability()
     backends = Dict{String,Any}("cpu" => Dict("available" => true, "reason" => ""))
-    for (name, accelerator) in (("cuda", BeatEngineCore.CUDA_MODULE), ("rocm", BeatEngineCore.AMDGPU_MODULE))
+    for (name, accelerator) in (
+        ("cuda", BeatEngineCore.CUDA_MODULE),
+        ("rocm", BeatEngineCore.AMDGPU_MODULE),
+        ("metal", BeatEngineCore.METAL_MODULE),
+    )
         available, reason = try
             if accelerator === nothing
                 (false, "Package is not loaded in this Julia environment.")

@@ -291,6 +291,7 @@ function assemble_burton_miller_neumann_system_cpu(
     cpu_cache=nothing,
     symmetry_mode::Symbol=:off,
 ) where {T<:AbstractFloat}
+    k = outgoing_wavenumber(k)
     symmetry_mode = normalized_symmetry_mode(symmetry_mode)
     if cpu_cache !== nothing
         cpu_cache.symmetry_mode == symmetry_mode || error("CPU assembly cache symmetry mode does not match the requested mode.")
@@ -307,7 +308,7 @@ function assemble_burton_miller_neumann_system_cpu(
     p1_count = p1_space.global_dof_count
     lhs = zeros(Complex{T}, p1_count, p1_count)
     rhs = zeros(Complex{T}, p1_count, drive_count)
-    coupling = Complex{T}(0, 1) / k
+    coupling = burton_miller_coupling(k)
     elements = cpu_cache === nothing ? _beat_cpu_element_data(mesh, p1_space, dp0_space) : cpu_cache.elements
     regular_quadrature = cpu_cache === nothing ? _beat_cpu_regular_quadrature_data(mesh, rule) : cpu_cache.regular_quadrature
     adjacent_pairs = cpu_cache === nothing ? count_adjacent_pairs(mesh, indices) : cpu_cache.adjacent_pairs
