@@ -764,6 +764,36 @@ function solve_exterior_direct_cuda(
     end
 end
 
+function metal_direct_assembly_available()
+    return BeatEngineCore._normalized_metal_assembly_mode(nothing) != :host_staged &&
+           BeatEngineCore._normalized_metal_singular_mode() == :native &&
+           BeatEngineCore._normalized_metal_regular_kernel_mode() == :pair_gather
+end
+
+function solve_exterior_direct_metal(
+    mesh, p1_space, dp0_space, neumann_values, wavenumber, rule; kwargs...,
+)
+    # The fused Metal assembler is the Metal counterpart of the direct CUDA
+    # assembler: A and every excitation's b are formed on the GPU without
+    # materializing S, D, D' or H. Metal.jl has no GPU LU, so the host reads
+    # the shared buffers in place and one factorization serves every column.
+    system = nothing
+    try
+        assembly_started = time_ns()
+        system = assemble_burton_miller_neumann_system_metal(
+            mesh, p1_space, dp0_space, reduce(hcat, neumann_values), wavenumber, rule; kwargs...,
+        )
+        assembly_s = (time_ns() - assembly_started) / 1.0e9
+        solve_started = time_ns()
+        pressure, report = solve_metal_burton_miller_system_with_report(system)
+        pressures = [copy(column) for column in eachcol(pressure)]
+        solve_s = (time_ns() - solve_started) / 1.0e9
+        return pressures, assembly_s, solve_s, report.method
+    finally
+        system === nothing || release_metal_burton_miller_system!(system)
+    end
+end
+
 function solve_exterior_request(request, system, unbounded_region; event_mode=false)
     meshes = system["meshes"]
     boundaries = system["boundaries"]
@@ -780,7 +810,14 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
         "Exterior burton_miller_assembly must be direct_system or operator_matrices.",
     )
     direct_cuda_assembly = backend == :cuda && requested_assembly == "direct_system"
-    assembly_mode = direct_cuda_assembly ? "direct_system" : "operator_matrices"
+    # Metal's direct assembler is the fused Burton-Miller path: A and every
+    # excitation's b are formed on the GPU without the four operators, and the
+    # host factorizes once. It exists only for the native singular and
+    # pair-gather regular kernels; the diagnostic kernel modes keep the
+    # four-operator path, and the effective mode is reported either way.
+    direct_metal_assembly = backend == :metal && requested_assembly == "direct_system" &&
+        metal_direct_assembly_available()
+    assembly_mode = direct_cuda_assembly || direct_metal_assembly ? "direct_system" : "operator_matrices"
     symmetry_mode = BeatEngineCore.normalized_symmetry_mode(get(options, "symmetry", "off"))
     sound_speed = FloatType(unbounded_region["sound_speed_m_per_s"])
     density = FloatType(unbounded_region["density_kg_per_m3"])
@@ -867,6 +904,9 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     else
         nothing
     end
+    metal_fused_identity_cache = direct_metal_assembly ?
+                                 build_metal_fused_identity_cache(identity_p1_p1, identity_p1_dp0, FloatType) :
+                                 nothing
     cpu_blas_threads = backend == :cpu ?
                        configure_beat_cpu_blas_threads!(p1_space.global_dof_count) :
                        BLAS.get_num_threads()
@@ -915,6 +955,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
             end : nothing
             neumann_values = [exterior_neumann(mesh, excitation, density, omega) for excitation in excitations]
             operators = nothing
+            metal_solve_method = :lu
             if direct_cuda_assembly
                 pressures, assembly_s, solve_s = solve_exterior_direct_cuda(
                     mesh, p1_space, dp0_space, neumann_values, wavenumber, rule;
@@ -922,6 +963,16 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     singular_cache=singular_cache,
                     device_singular_cache=device_singular_cache,
                     device_image_singular_cache=device_image_singular_cache,
+                    symmetry_mode=symmetry_mode,
+                )
+            elseif direct_metal_assembly
+                pressures, assembly_s, solve_s, metal_solve_method = solve_exterior_direct_metal(
+                    mesh, p1_space, dp0_space, neumann_values, wavenumber, rule;
+                    device_cache=device_cache,
+                    singular_cache=singular_cache,
+                    device_singular_cache=device_singular_cache,
+                    identity_cache=metal_fused_identity_cache,
+                    singular_order=singular_order,
                     symmetry_mode=symmetry_mode,
                 )
             else
@@ -1058,11 +1109,12 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 "symmetry" => String(symmetry_mode),
                 "formulation" => "exterior_burton_miller_neumann",
                 "burton_miller_assembly" => assembly_mode,
-                "factorization_count" => direct_cuda_assembly || backend in (:cpu, :metal) ? 1 : length(excitations),
+                "factorization_count" => metal_solve_method == :gmres ? 0 :
+                                         direct_cuda_assembly || backend in (:cpu, :metal) ? 1 : length(excitations),
                 "linear_solver" => backend == :cpu ?
                                    "cpu_dense_lu" :
                                    backend == :cuda ? "cuda_dense_lu" :
-                                   backend == :metal ? "metal_assembly_cpu_dense_lu" :
+                                   backend == :metal ? "metal_assembly_cpu_dense_" * String(metal_solve_method) :
                                    "rocm_rocsolver_dense_lu",
                 "bounded_region_count" => 0,
                 "interface_count" => 0,
@@ -1109,6 +1161,8 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 release_metal_singular_correction_cache!(device_singular_cache)
             field_cache === cpu_field_cache || release_metal_field_evaluation_cache!(field_cache)
             device_cache === nothing || release_metal_regular_assembly_cache!(device_cache)
+            metal_fused_identity_cache === nothing ||
+                release_metal_fused_identity_cache!(metal_fused_identity_cache)
         end
     end
     return (cancelled=cancel_requested(), solved_count=solved_count)
