@@ -223,37 +223,52 @@ tolerances. hornlab-metal-bem's P1 Galerkin kernel, which
 assembles one operator with 18 atomics per pair, takes 0.42 s on the same
 mesh.
 
-A frequency sweep overlaps the GPU assembly of frequency i+1 with the CPU
-factorization of frequency i on a second Julia thread; two operator sets are
-then resident at once.
+A frequency sweep can overlap the GPU assembly of frequency i+1 with the CPU
+solve of frequency i on a second Julia thread, holding two systems at once.
+Both exterior entry points do it: the source-request driver, and compiled
+exterior-only requests, which is how Boundary Lab's GUI solves exterior
+projects. Coupled solves overlap within a frequency instead; see
+[Stage overlap](#stage-overlap).
 
-The overlap is not free, and it does not always pay. What it buys is the CPU
-solve it hides, which grows as O(N^3) against the assembly's O(N^2). What it
-costs is GPU-side: one assembly already saturates the device, so dispatching
-the next one from a spawned task while this frequency's field evaluation is
-still running does not find idle silicon, it interleaves two command queues
-over the same units. Below a mesh size that costs more than the hidden solve is
-worth, so the sweep decides per solve, from the dof count: see
-`METAL_PIPELINE_MIN_DOFS` in `BeatEngineDriver.jl`.
+`metal_sweep_overlap_plan` in `BeatEngineSweepOverlap.jl` decides per solve,
+from a cost model rather than a mesh size. Per frequency a sequential sweep
+costs A + S + F (GPU assembly, CPU solve, GPU field); overlapped it costs
+F + max(A + c, (1 + kappa) S), where c is the time the assembly loses beside
+the solve and kappa the fraction the solve slows beside the assembly. The sweep
+overlaps when the saving, min(S - c, A - kappa S), is positive. S comes from the
+dense-solve cost model below and A = a N^2 + b per symmetry copy. a, b, c and
+kappa are machine constants: the defaults are an M1 Pro's, each has an
+environment override, and `scripts/calibrate_metal_sweep_overlap.jl` measures
+them through the pipeline itself. Like the dense-solve calibration, it is run by
+hand.
 
-Per frequency on the 1,209-dof quarter, overlapping slows the assembly by 30 ms
-and the field evaluation by 105 ms, and costs the CPU solve a further 10 ms for
-the core the spawned task takes; the same GPU work measures 2.82 s sequentially
-against 5.53 s split across two tasks. On the 4,552-dof full model the GPU work
-goes 8.11 s to 10.11 s, which the larger CPU solve more than pays for.
+On the compiled path a Metal sweep leaves the assembly producer a core: BLAS
+runs one thread below the process default. With BLAS on every performance core
+the overlapped solve slowed by more than the assembly it hid. Sequential sweeps
+use the same count, because LU rounds differently on a different number of
+threads and the overlap must not change the answer;
+`validate_metal_exterior_pipeline.jl` gates that it does not. The source-request
+driver keeps its BLAS on the Julia thread count.
 
-**It is not the command-queue construction, despite the obvious suspicion.**
-Metal.jl keeps its queue in task-local storage, so a spawned task does build its
-own each frequency, but measured directly that is a fixed 0.23-0.29 ms per task
-and does not grow with the number of kernels the task dispatches -- two orders
-of magnitude below the penalty above. A persistent assembly task holding one
-queue would therefore recover almost none of it. This is the same result the
-cross-frequency concurrency probes reached from the other direction: concurrent
-assemblies measure slower than sequential ones because one assembly is already
-enough to fill the GPU.
+Compiled exterior requests on an M1 Pro, 4 Julia threads, 12 frequencies from
+20 Hz to 20 kHz, first sweep / later sweeps. Before is sequential with BLAS on
+all 8 performance cores.
 
-Measured on an M1 Max, 20 frequencies from 100 Hz to 20 kHz, minimum of four
-interleaved rounds, as the ratio of sequential to pipelined wall clock:
+| mesh | P1 dofs | symmetry | before | now | model's choice |
+|---|---:|---|---:|---:|---|
+| `sample.msh` | 1,390 | off | 1.72 / 1.33 s | 1.45 / 1.17 s | overlap |
+| `sample_detailed.msh` | 3,502 | off | 7.94 / 7.61 s | 5.75 / 5.41 s | overlap |
+| `sample_half.msh` | 854 | `x` | | 1.50 / 0.76 s | overlap, +0.8 ms a frequency (sequential: 1.54 / 0.82 s) |
+| `sample_quarter.msh` | 441 | `xy` | | 1.19 / 0.53 s | sequential, -2.4 ms (overlapped: 1.18 / 0.51 s) |
+
+Where the model calls the choice marginal, the two measure within noise of each
+other. The cost is memory: the lookahead holds up to four systems, 530 MB more
+at peak on `sample_detailed.msh`, and `sweep_pipeline_depth` caps it by what the
+device has free.
+
+This replaces a fixed threshold of 1,900 dofs, fitted on an M1 Max through the
+source-request driver, 20 frequencies from 100 Hz to 20 kHz, as sequential over
+overlapped wall clock:
 
 | mesh | P1 dofs | symmetry | pipelining |
 |---|---:|---|---:|
@@ -265,22 +280,14 @@ interleaved rounds, as the ratio of sequential to pipelined wall clock:
 | `asro68` quarter, subdivided | 4,692 | `xy` | 1.11x |
 | ATH ladder A5 | 5,107 | off | 1.30x |
 
-The crossover was then pinned with six spheres filling the gap the waveguide
-ladder leaves, in a second run of five rounds: 1,202 dofs 0.82x, 1,514 0.97x,
-1,742 0.96x, 1,986 1.13x, 2,382 1.22x, 3,122 1.19x. The two families agree
-where they overlap -- the 1,986-dof sphere's 1.13x against the 1,974-dof
-waveguide's 1.13x -- so the crossover is between 1,742 and 1,986 dofs and the
-default sits at 1,900.
+and six spheres: 1,202 dofs 0.82x, 1,514 0.97x, 1,742 0.96x, 1,986 1.13x,
+2,382 1.22x, 3,122 1.19x. On the M1 Pro the same threshold kept `sample.msh`
+sequential, where overlapping it is 12-15% faster. The two machines disagree
+below 2,000 dofs, which is the case for calibrating rather than moving the
+constant; an M1 Max should run the calibration script.
 
-Two things that table is evidence for. The threshold can be expressed in dofs
-alone: the subdivided quarter wins at 4,692 dofs with two mirror planes, so a
-symmetry mode that quadruples the assembly does not move the sign, and the rule
-needs to know nothing about images. And the constant is a machine constant, not
-a physical one -- a GPU with a cheaper queue rebuild, or a slower dense solve,
-puts it somewhere else.
-
-`BLAB_METAL_PIPELINE` overrides it in both directions, and each frequency's
-`metal_pipeline` diagnostic reports which way the choice went.
+`BLAB_METAL_PIPELINE` forces the choice either way, and each frequency reports
+`metal_pipeline`, `metal_pipeline_reason` and `metal_overlap_saving_model_s`.
 
 ## FEM static condensation
 
@@ -438,7 +445,12 @@ Normal application use does not require these environment variables.
 | `BLAB_METAL_SINGULAR_PARTS` | `4` | Ranges each singular pair's Duffy rule is split into across threads. |
 | `BLAB_METAL_SINGULAR_WRITEBACK` | `gather` | How the singular blocks reach the operators. `gather` owns one dense cell per thread and is reproducible; `scatter` is the older one-thread-per-pair atomic write-back, kept for comparison. |
 | `BLAB_METAL_OPERATOR_STORAGE` | `shared` | Use `private` to allocate the operator matrices in private storage and copy them to the host, the pre-2026-09-02 behavior. |
-| `BLAB_METAL_PIPELINE` | by dof count | Overlaps the next frequency's GPU assembly with this frequency's CPU factorization. Unset, the sweep decides per solve from the mesh size (`METAL_PIPELINE_MIN_DOFS`); `0` forces sequential, anything else forces the overlap. |
+| `BLAB_METAL_PIPELINE` | by cost model | Overlaps the next frequency's GPU assembly with this frequency's CPU solve. Unset, `metal_sweep_overlap_plan` decides per solve; `0` forces sequential, anything else forces the overlap. |
+| `BLAB_METAL_PIPELINE_DEPTH` | by memory | Frequencies the assembly may run ahead of the solve, for measurement. |
+| `BLAB_METAL_ASSEMBLY_DOF2_SECONDS` | `2.77e-8` | Overlap cost-model constants, calibrated on an Apple M1 Pro: fused assembly seconds per squared dof per symmetry copy, its fixed part, what the assembly loses beside the solve, and the fraction the solve slows beside the assembly. Re-measure with `scripts/calibrate_metal_sweep_overlap.jl` on any other machine. |
+| `BLAB_METAL_ASSEMBLY_FIXED_SECONDS` | `0.016` | |
+| `BLAB_METAL_OVERLAP_COST_SECONDS` | `0.003` | |
+| `BLAB_METAL_OVERLAP_HOST_SLOWDOWN` | `0.1` | |
 | `BLAB_METAL_ATOMIC_SCATTER` | `1` | Diagnostic for `pair_atomic` only: `0` skips the atomic scatter to time the pair arithmetic (the operators are then wrong). |
 | `BLAB_COUPLED_STAGE_OVERLAP` | `auto` | Coupled solves: `auto` runs the FEM condensation on its own thread while the GPU assembles the BEM operators; `off` runs them in sequence; `on` forces the overlap on `beat_cpu` too. Needs more than one Julia thread. |
 | `BLAB_SCHUR_BLOCK` | unset | Coupled solves: pins the Schur complement right-hand-side block width, bypassing the thread-count balancing. For measurement only. |
@@ -478,6 +490,8 @@ CPU-versus-Metal validation scripts:
 | `validate_metal_exterior.jl` | Operators (both singular modes), boundary pressure, residual, and exterior field for an exterior solve. |
 | `validate_metal_symmetry.jl` | X and XY reduced-domain assembly and solve parity, both singular modes. |
 | `validate_metal_coupled.jl` | Coupled FEM-BEM-LEM assembly, condensation, solution, and field for the monolithic and condensed paths, prescribed-velocity and voltage excitations. |
+| `validate_metal_sweep_pipeline.jl` | The sweep assembly pipeline at depths 1-4: steps delivered in order with their own frequency, and pipelined assemblies against sequential ones. |
+| `validate_metal_exterior_pipeline.jl` | A compiled exterior request solved sequentially and overlapped at depths 1-4 through the worker: every output bit-identical and labelled with its own frequency. `BLAB_VALIDATE_SYMMETRY` picks the arm. |
 
 For example:
 
