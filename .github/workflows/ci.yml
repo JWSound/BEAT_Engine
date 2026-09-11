@@ -71,8 +71,13 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - uses: julia-actions/setup-julia@v2
         with:
           version: "1.12"
+      - run: python -m pip install -e .
+      - run: python -m beat_engine instantiate --backend cpu
       - run: julia --threads=2 --startup-file=no --project=src/beat_engine/julia_local src/beat_engine/julia_local/scripts/benchmark_sweep.jl --steps 8 --min-freq 100 --max-freq 20000 --eval-points 74 --warmups 0 --repetitions 1 --json results/ci_sweep.json
       - run: python scripts/compare_solve_speed.py --baseline src/beat_engine/julia_local/results/baseline_sweep_cpu.json --results results/ci_sweep.json --accuracy-tolerance 1e-3
