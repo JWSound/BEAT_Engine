@@ -85,7 +85,7 @@ images. The original operator path remains available for comparisons and full
 diagnostics. Register caps are explicit hardware tuning options; the compiler
 default is preserved. See [coupled CUDA architecture and controls](docs/Coupled%20CUDA%20Assembly.md).
 
-The stable package release is `0.1.0`. CI builds a wheel after independent
+The stable package release is `0.1.2`. CI builds a wheel after independent
 Python and CPU checks on Windows, Linux, and macOS. The manually dispatched release
 workflow requires a successful CI run for the tag's exact commit before attaching
 wheel/sdist artifacts to a stable GitHub release. No PyPI publication is configured.

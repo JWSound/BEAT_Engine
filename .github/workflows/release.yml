@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing validated release tag (for example v0.1.0)
+        description: Existing validated release tag (for example v0.1.2)
         required: true
 permissions:
   contents: write
@@ -42,4 +42,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
-        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --notes-file "docs/releases/${RELEASE_TAG#v}.md"
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --latest --notes-file "docs/releases/${RELEASE_TAG#v}.md"
