@@ -453,16 +453,18 @@ matrix in place rather than copying it. Its environment overrides:
 | Variable | Default | Purpose |
 |---|---|---|
 | `BLAB_BEAT_DENSE_SOLVE` | `auto` | Force `lu` or `gmres` instead of the cost model. |
-| `BLAB_BEAT_GMRES_TOL` | `1e-6` | Tolerance on the true relative residual. |
+| `BLAB_BEAT_GMRES_TOL` | `1e-5` | Tolerance on the true relative residual. |
 | `BLAB_BEAT_GMRES_MAX_ITERATIONS` | `min(N, 1000)` | Iteration cap; reaching it reports non-convergence and falls back to the LU. |
 | `BLAB_BEAT_GMRES_RESTART` | `0` | Restart length; `0` is unrestarted. |
 | `BLAB_BEAT_GMRES_KRYLOV_PRECISION` | `f64` | `f32` reproduces the orthogonality-loss failure on demand. Not for production use. |
 | `BLAB_BEAT_GMRES_REORTHOGONALIZE` | `dgks` | `always` or `never`; `never` is the failing variant, kept so the remedies can be compared. |
-| `BLAB_BEAT_LU_GFLOPS` | `500` | Cost-model constants. Re-measure with `scripts/calibrate_dense_solve.jl` on any other machine. |
-| `BLAB_BEAT_MATVEC_ENTRY_SECONDS` | `9.52e-11` | |
-| `BLAB_BEAT_MATVEC_DOF_SECONDS` | `1.03e-6` | |
-| `BLAB_BEAT_TRIANGULAR_GBPS` | `14` | |
-| `BLAB_BEAT_GMRES_MODEL_ITERATIONS` | `210` | Expected iterations. A property of the operator, not the machine. |
+| `BLAB_BEAT_GMRES_BUDGET` | `1` | Matvecs a model-chosen GMRES may spend, in modelled LUs, before it falls back to the LU. |
+| `BLAB_BEAT_GMRES_TIME_CEILING` | `2` | Wall-clock ceiling for a model-chosen GMRES, in modelled LUs. |
+| `BLAB_BEAT_LU_GFLOPS` | `480` | Cost-model constants, calibrated on an Apple M1 Max. Re-measure with `scripts/calibrate_dense_solve.jl` on any other machine. |
+| `BLAB_BEAT_MATVEC_ENTRY_SECONDS` | `1.071e-10` | |
+| `BLAB_BEAT_MATVEC_DOF_SECONDS` | `4.236e-7` | |
+| `BLAB_BEAT_TRIANGULAR_GBPS` | `17` | |
+| `BLAB_BEAT_GMRES_MODEL_ITERATIONS` | `70` | Expected iterations. A property of the operator, not the machine. |
 
 ## Verification
 
