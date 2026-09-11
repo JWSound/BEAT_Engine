@@ -12,11 +12,15 @@ Use real projects on each solve path the change touches, and say which path:
 | Path | Entry point | Workloads |
 |---|---|---|
 | Exterior radiator (source request) | `solver.jl` | `test_meshes/sample.msh` (1,390 dofs), `sample_detailed.msh` (3,502 dofs) |
-| System solve (compiled request) | `coupled_solver.jl` | a Boundary Lab project, e.g. `examples/Multi_region_SAWMOD` (coupled FEM-BEM-LEM) |
+| Exterior-only system solve (compiled request) | `coupled_solver.jl` | the same meshes, seeded as an exterior-only system |
+| Coupled system solve (compiled request) | `coupled_solver.jl` | a Boundary Lab project, e.g. `examples/Multi_region_SAWMOD` (coupled FEM-BEM-LEM) |
 
-Capture a Boundary Lab request with `scripts/capture_boundary_lab_request.py`
-from a Boundary Lab checkout. The request references that checkout's meshes, so
-it is not committed here.
+Boundary Lab's GUI sends exterior projects as exterior-only system solves, not
+source requests. Capture a Boundary Lab request with
+`scripts/capture_boundary_lab_request.py` from a Boundary Lab checkout: pass a
+project, or `--exterior-mesh` with a mesh and its radiator tag to seed an
+exterior-only system the way the GUI does. The request references that
+checkout's meshes, so it is not committed here.
 
 ## Runs
 
