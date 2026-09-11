@@ -14,7 +14,8 @@ Low-level Julia callers must keep assembly, solve and evaluation inside the
 same convention scope. Geometry-only caches are reusable. Retained Deploy
 solution traces reject evaluation under another convention.
 
-Positive time uses outgoing `exp(-i k r)`, `q=-i rho omega v`, BM `-i/k`, passive
+Positive time uses outgoing `exp(-i k r)`, `q=-i rho omega v`, BM `-i/k`
+(capped below `kR = 1`, see `Burton-Miller Coupling Cap.md`), passive
 FEM loss `+i eta k^2 M`, and electrical `s=+i omega`. Physical frequency and
 wavenumber remain positive. CUDA/ROCm kernels receive signed propagation
 parameters at host entry, without allocating conjugated dense operators.
