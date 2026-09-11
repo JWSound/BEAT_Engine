@@ -52,6 +52,7 @@ function _cuda_regular_kernel!(
     rhs_re,
     rhs_im,
     q_neumann,
+    coupling_scale,
 )
     pair = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     stride = blockDim().x * gridDim().x
@@ -301,7 +302,10 @@ function _cuda_regular_kernel!(
             row3 = t3
 
             if direct_system
-                inverse_k = one(k) / k
+                # Burton-Miller coupling magnitude, signed like k: inv(k)
+                # uncapped, burton_miller_coupling_scale(k, cap) with k's sign
+                # capped. Chosen on the host so the kernel never sees the cap.
+                inverse_k = coupling_scale
                 q = q_neumann[trial_index]
                 _cuda_bm_add_rhs!(rhs_re, rhs_im, row1, slp1_re, slp1_im, adj1_re, adj1_im, q, inverse_k)
                 _cuda_bm_add_rhs!(rhs_re, rhs_im, row2, slp2_re, slp2_im, adj2_re, adj2_im, q, inverse_k)

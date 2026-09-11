@@ -2047,6 +2047,7 @@ function build_coupled_system(
     image_max_registers = fuse_images ? coupled_bem_max_registers : 0
     operators = assembly_mode == :combined ? BeatEngineCore.assemble_coupled_burton_miller_cuda(
         bem_mesh, prepared, wavenumber; fused=fuse_images, max_registers=image_max_registers,
+        coupling_cap=coupling_cap,
     ) : assemble_regular_galerkin_operators(
         bem_mesh,
         prepared.p1,

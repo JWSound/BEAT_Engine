@@ -910,6 +910,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     device_singular_cache=device_singular_cache,
                     device_image_singular_cache=device_image_singular_cache,
                     symmetry_mode=symmetry_mode,
+                    coupling_cap=coupling_cap,
                 )
             else
                 assembly_started = time_ns()

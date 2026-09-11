@@ -16,6 +16,7 @@ function _cuda_combined_kernel!(
     rule_count,
     total_pairs,
     skip_adjacent,
+    coupling_scale,
     trial_sign_x,
     trial_sign_y,
     trial_sign_z,
@@ -119,7 +120,7 @@ function _cuda_combined_kernel!(
             a32_im = zero(k)
             a33_re = zero(k)
             a33_im = zero(k)
-            inverse_k = inv(k)
+            inverse_k = coupling_scale
             for tq in 1:rule_count
                 txi = rule_points[tq]
                 teta = rule_points[tq + rule_count]
@@ -257,6 +258,7 @@ function _cuda_combined_fused_kernel!(
     rule_count,
     total_pairs,
     skip_adjacent,
+    coupling_scale,
     transforms,
 )
     pair = (blockIdx().x - 1) * blockDim().x + threadIdx().x
@@ -305,7 +307,7 @@ function _cuda_combined_fused_kernel!(
             a32_im = zero(k)
             a33_re = zero(k)
             a33_im = zero(k)
-            inverse_k = inv(k)
+            inverse_k = coupling_scale
             for transform in transforms
             trial_sign_x = transform[1]
             trial_sign_y = transform[2]
@@ -484,12 +486,13 @@ function _cuda_combined_fused_kernel!(
 end
 
 # Coupled Burton-Miller A=-D+alpha*H, C=S+alpha*adjD before weighted identities.
-function _launch_combined!(ar, ai, cr, ci, cache, k, transforms; skip_adjacent, fused=false, max_registers=0)
+function _launch_combined!(ar, ai, cr, ci, cache, k, transforms; skip_adjacent, fused=false, max_registers=0,
+                          coupling_scale=inv(k))
     count = length(cache.element_indices)^2
     args = (ar, ai, cr, ci, cache.face_vertices, cache.normals, cache.areas,
         cache.faces, cache.curls, cache.test_indices, cache.trial_indices,
         cache.rule_points, cache.rule_weights, k, size(ar, 1), size(cr, 2),
-        cache.face_count, cache.rule_count, count, skip_adjacent)
+        cache.face_count, cache.rule_count, count, skip_adjacent, coupling_scale)
     signs = Tuple((T = typeof(k); (T.(t.signs)..., T.(t.determinant .* t.signs)...)) for t in transforms)
     if fused && max_registers > 0
         CUDA.@cuda maxregs=max_registers threads=128 blocks=min(cld(count,128),65535) _cuda_combined_fused_kernel!(args..., signs)
@@ -524,18 +527,21 @@ function _cuda_combined_correction_kernel!(ar, ai, cr, ci, rows, cols, dpcols, s
     return nothing
 end
 
-function _scatter_cuda_bm_blocks!(ar, ai, cr, ci, ::Val{:combined}, blocks, cache, k; rhs_only=false)
+function _scatter_cuda_bm_blocks!(ar, ai, cr, ci, ::Val{:combined}, blocks, cache, k; rhs_only=false, coupling_scale=inv(k))
     count = cache.pair_count
     count == 0 && return 0
     CUDA.@cuda threads=128 blocks=min(cld(count,128),65535) _cuda_combined_correction_kernel!(
         ar, ai, cr, ci, cache.p1_rows, cache.p1_cols, cache.dp0_cols,
-        blocks.slp, blocks.adjoint, blocks.dlp, blocks.hypersingular, inv(k), size(ar,1), count)
+        blocks.slp, blocks.adjoint, blocks.dlp, blocks.hypersingular, coupling_scale, size(ar,1), count)
     CUDA.synchronize()
     return count
 end
 
-function assemble_coupled_burton_miller_cuda(mesh::BoundaryMesh{T}, prepared, k; fused=true, max_registers=0) where T
+function assemble_coupled_burton_miller_cuda(mesh::BoundaryMesh{T}, prepared, k; fused=true, max_registers=0,
+                                             coupling_cap::Real=zero(T)) where T
     k = outgoing_wavenumber(k)
+    # Signed like k, as inv(k) was; cap = 0 reproduces inv(k) exactly.
+    coupling_scale = copysign(burton_miller_coupling_scale(k, coupling_cap), k)
     n = prepared.p1.global_dof_count
     m = prepared.dp0.global_dof_count
     astorage = CUDA.zeros(T, 2, n, n)
@@ -546,13 +552,16 @@ function assemble_coupled_burton_miller_cuda(mesh::BoundaryMesh{T}, prepared, k;
         ar, ai = view(astorage,1,:,:), view(astorage,2,:,:)
         cr, ci = view(cstorage,1,:,:), view(cstorage,2,:,:)
         _launch_combined!(ar,ai,cr,ci,prepared.device_cache,k,
-            symmetry_transforms(:off; include_identity=true); skip_adjacent=true)
+            symmetry_transforms(:off; include_identity=true); skip_adjacent=true, coupling_scale=coupling_scale)
         images = symmetry_image_transforms(prepared.symmetry_mode)
-        isempty(images) || _launch_combined!(ar,ai,cr,ci,prepared.device_cache,k,images; skip_adjacent=false,fused=fused,max_registers=max_registers)
+        isempty(images) || _launch_combined!(ar,ai,cr,ci,prepared.device_cache,k,images; skip_adjacent=false,fused=fused,max_registers=max_registers,
+            coupling_scale=coupling_scale)
         add_cuda_bm_singular_corrections!(ar,ai,cr,ci,Val(:combined),mesh,k,
-            prepared.singular_cache,prepared.device_singular_cache,prepared.device_cache)
+            prepared.singular_cache,prepared.device_singular_cache,prepared.device_cache;
+            coupling_scale=coupling_scale)
         add_cuda_bm_image_corrections!(ar,ai,cr,ci,Val(:combined),mesh,k,prepared.rule,
-            prepared.device_image_singular_cache,prepared.device_cache)
+            prepared.device_image_singular_cache,prepared.device_cache;
+            coupling_scale=coupling_scale)
         a = reshape(reinterpret(Complex{T}, astorage),n,n)
         c = reshape(reinterpret(Complex{T}, cstorage),n,m)
         weights = CUDA.CuArray(p1_symmetry_orbit_weights(mesh, prepared.symmetry_mode))
@@ -560,7 +569,7 @@ function assemble_coupled_burton_miller_cuda(mesh::BoundaryMesh{T}, prepared, k;
             a .*= weights
             c .*= weights
             a .+= T(0.5) .* prepared.device_identity_cache.identity_p1_p1
-            c .+= Complex{T}(0,T(0.5)/k) .* prepared.device_identity_cache.identity_p1_dp0
+            c .+= Complex{T}(0,T(0.5)*coupling_scale) .* prepared.device_identity_cache.identity_p1_dp0
             CUDA.synchronize()
         finally
             CUDA.unsafe_free!(weights)

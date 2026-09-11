@@ -267,6 +267,7 @@ function _launch_regular_symmetry_image_kernel!(
         adj_re,
         adj_im,
         slp_re,
+        one(k) / k,  # coupling_scale: unread, direct_system is false
     )
     return nothing
 end

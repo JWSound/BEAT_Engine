@@ -148,6 +148,7 @@ function _launch_cuda_bm_regular_transform!(
     transform::SymmetryTransform;
     skip_adjacent::Bool,
     rhs_only::Bool=false,
+    coupling_scale::T=inv(k),
 ) where {T<:AbstractFloat}
     total_pairs = length(cache.element_indices) * length(cache.element_indices)
     threads = 128
@@ -194,6 +195,7 @@ function _launch_cuda_bm_regular_transform!(
             rhs_re,
             rhs_im,
             q_neumann,
+            coupling_scale,
         )
         CUDA.synchronize()
     finally
@@ -219,7 +221,8 @@ function _release_cuda_bm_block_arrays!(blocks)
     return nothing
 end
 
-function _scatter_cuda_bm_blocks!(matrix_re, matrix_im, rhs_re, rhs_im, q_neumann, blocks, cache, k; rhs_only::Bool=false)
+function _scatter_cuda_bm_blocks!(matrix_re, matrix_im, rhs_re, rhs_im, q_neumann, blocks, cache, k;
+                                  rhs_only::Bool=false, coupling_scale=inv(k))
     cache.pair_count == 0 && return 0
     threads = 128
     blocks_per_grid = min(cld(cache.pair_count, threads), 65_535)
@@ -236,7 +239,7 @@ function _scatter_cuda_bm_blocks!(matrix_re, matrix_im, rhs_re, rhs_im, q_neuman
         blocks.adjoint,
         blocks.dlp,
         blocks.hypersingular,
-        inv(k),
+        coupling_scale,
         size(matrix_re, 1),
         cache.pair_count,
         rhs_only,
@@ -258,6 +261,7 @@ function add_cuda_bm_singular_corrections!(
     regular_cache;
     timing=nothing,
     rhs_only::Bool=false,
+    coupling_scale::T=inv(k),
 ) where {T<:AbstractFloat}
     host_cache.pair_count == 0 && return 0
     blocks = _cuda_bm_block_arrays(T, host_cache.pair_count)
@@ -289,7 +293,8 @@ function add_cuda_bm_singular_corrections!(
             CUDA.synchronize()
         end
         return _cuda_timed_stage!(timing, "direct_system_singular_scatter") do
-            _scatter_cuda_bm_blocks!(matrix_re, matrix_im, rhs_re, rhs_im, q_neumann, blocks, cuda_cache, k; rhs_only=rhs_only)
+            _scatter_cuda_bm_blocks!(matrix_re, matrix_im, rhs_re, rhs_im, q_neumann, blocks, cuda_cache, k;
+                                    rhs_only=rhs_only, coupling_scale=coupling_scale)
         end
     finally
         _release_cuda_bm_block_arrays!(blocks)
@@ -310,6 +315,7 @@ function add_cuda_bm_image_corrections!(
     timing=nothing,
     timing_prefix="direct_system_image",
     rhs_only::Bool=false,
+    coupling_scale::T=inv(k),
 ) where {T<:AbstractFloat}
     cuda_cache === nothing && return 0
     cuda_cache.pair_count == 0 && return 0
@@ -347,7 +353,8 @@ function add_cuda_bm_image_corrections!(
             CUDA.synchronize()
         end
         return _cuda_timed_stage!(timing, "$(timing_prefix)_scatter") do
-            _scatter_cuda_bm_blocks!(matrix_re, matrix_im, rhs_re, rhs_im, q_neumann, blocks, cuda_cache, k; rhs_only=rhs_only)
+            _scatter_cuda_bm_blocks!(matrix_re, matrix_im, rhs_re, rhs_im, q_neumann, blocks, cuda_cache, k;
+                                    rhs_only=rhs_only, coupling_scale=coupling_scale)
         end
     finally
         _release_cuda_bm_block_arrays!(blocks)
@@ -372,8 +379,12 @@ function assemble_burton_miller_neumann_system_cuda(
     symmetry_mode::Symbol=:off,
     timing=nothing,
     identity_p1_p1_block=nothing,
+    coupling_cap::Real=zero(T),
 ) where {T<:AbstractFloat}
     k = outgoing_wavenumber(k)
+    # The kernels form eta = i * coupling_scale with this signed k, as they
+    # did with inv(k); copysign keeps the convention and cap = 0 is inv(k).
+    coupling_scale = copysign(burton_miller_coupling_scale(k, coupling_cap), k)
     CUDA.functional() || error("Direct Burton-Miller CUDA assembly requested, but CUDA.functional() is false.")
     length(q_neumann) == dp0_space.global_dof_count || error("Direct Burton-Miller Neumann vector size mismatch.")
     device_cache === nothing && error("Direct Burton-Miller CUDA assembly requires a regular device cache.")
@@ -410,6 +421,7 @@ function assemble_burton_miller_neumann_system_cuda(
             _launch_cuda_bm_regular_transform!(
                 matrix_re, matrix_im, rhs_re, rhs_im, q_neumann, device_cache, k, identity_transform;
                 skip_adjacent=true,
+                coupling_scale=coupling_scale,
             )
         end
         for transform in symmetry_image_transforms(symmetry_mode)
@@ -417,6 +429,7 @@ function assemble_burton_miller_neumann_system_cuda(
                 _launch_cuda_bm_regular_transform!(
                     matrix_re, matrix_im, rhs_re, rhs_im, q_neumann, device_cache, k, transform;
                     skip_adjacent=false,
+                    coupling_scale=coupling_scale,
                 )
             end
         end
@@ -425,11 +438,13 @@ function assemble_burton_miller_neumann_system_cuda(
             matrix_re, matrix_im, rhs_re, rhs_im, q_neumann,
             mesh, k, singular_cache, device_singular_cache, device_cache;
             timing=timing,
+            coupling_scale=coupling_scale,
         )
         image_singular_pairs = add_cuda_bm_image_corrections!(
             matrix_re, matrix_im, rhs_re, rhs_im, q_neumann,
             mesh, k, rule, device_image_singular_cache, device_cache;
             timing=timing,
+            coupling_scale=coupling_scale,
         )
         near_pair_count = 0
         if near_correction_cache !== nothing && near_correction_cache.pair_count > 0
@@ -437,6 +452,7 @@ function assemble_burton_miller_neumann_system_cuda(
                 matrix_re, matrix_im, rhs_re, rhs_im, q_neumann,
                 mesh, k, rule, device_near_correction_cache, device_cache;
                 timing=timing,
+                coupling_scale=coupling_scale,
                 timing_prefix="direct_system_near",
             )
         end
@@ -445,6 +461,7 @@ function assemble_burton_miller_neumann_system_cuda(
                 matrix_re, matrix_im, rhs_re, rhs_im, q_neumann,
                 mesh, k, rule, device_image_near_correction_cache, device_cache;
                 timing=timing,
+                coupling_scale=coupling_scale,
                 timing_prefix="direct_system_ground_near",
             )
         end
@@ -460,7 +477,7 @@ function assemble_burton_miller_neumann_system_cuda(
                 device_cache.areas,
                 device_cache.faces,
                 q_neumann,
-                inv(k),
+                coupling_scale,
                 p1_count,
                 length(mesh.faces),
                 false,
@@ -526,8 +543,10 @@ function assemble_burton_miller_rhs_cuda(
     device_image_near_correction_cache=nothing,
     symmetry_mode::Symbol=:off,
     timing=nothing,
+    coupling_cap::Real=zero(T),
 ) where {T<:AbstractFloat}
     k = outgoing_wavenumber(k)
+    coupling_scale = copysign(burton_miller_coupling_scale(k, coupling_cap), k)
     CUDA.functional() || error("Burton-Miller CUDA RHS assembly requested, but CUDA.functional() is false.")
     length(q_neumann) == dp0_space.global_dof_count || error("Burton-Miller Neumann vector size mismatch.")
     device_cache === nothing && error("Burton-Miller CUDA RHS assembly requires a regular device cache.")
@@ -558,6 +577,7 @@ function assemble_burton_miller_rhs_cuda(
             _launch_cuda_bm_regular_transform!(
                 matrix_re, matrix_im, rhs_re, rhs_im, q_neumann, device_cache, k, identity_transform;
                 skip_adjacent=true,
+                coupling_scale=coupling_scale,
                 rhs_only=true,
             )
         end
@@ -566,6 +586,7 @@ function assemble_burton_miller_rhs_cuda(
                 _launch_cuda_bm_regular_transform!(
                     matrix_re, matrix_im, rhs_re, rhs_im, q_neumann, device_cache, k, transform;
                     skip_adjacent=false,
+                    coupling_scale=coupling_scale,
                     rhs_only=true,
                 )
             end
@@ -575,12 +596,14 @@ function assemble_burton_miller_rhs_cuda(
             matrix_re, matrix_im, rhs_re, rhs_im, q_neumann,
             mesh, k, singular_cache, device_singular_cache, device_cache;
             timing=timing,
+            coupling_scale=coupling_scale,
             rhs_only=true,
         )
         add_cuda_bm_image_corrections!(
             matrix_re, matrix_im, rhs_re, rhs_im, q_neumann,
             mesh, k, rule, device_image_singular_cache, device_cache;
             timing=timing,
+            coupling_scale=coupling_scale,
             rhs_only=true,
         )
         if near_correction_cache !== nothing && near_correction_cache.pair_count > 0
@@ -588,6 +611,7 @@ function assemble_burton_miller_rhs_cuda(
                 matrix_re, matrix_im, rhs_re, rhs_im, q_neumann,
                 mesh, k, rule, device_near_correction_cache, device_cache;
                 timing=timing,
+                coupling_scale=coupling_scale,
                 timing_prefix="rhs_near",
                 rhs_only=true,
             )
@@ -597,6 +621,7 @@ function assemble_burton_miller_rhs_cuda(
                 matrix_re, matrix_im, rhs_re, rhs_im, q_neumann,
                 mesh, k, rule, device_image_near_correction_cache, device_cache;
                 timing=timing,
+                coupling_scale=coupling_scale,
                 timing_prefix="rhs_ground_near",
                 rhs_only=true,
             )
@@ -613,7 +638,7 @@ function assemble_burton_miller_rhs_cuda(
                 device_cache.areas,
                 device_cache.faces,
                 q_neumann,
-                inv(k),
+                coupling_scale,
                 p1_count,
                 length(mesh.faces),
                 true,

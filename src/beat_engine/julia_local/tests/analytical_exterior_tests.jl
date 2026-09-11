@@ -78,6 +78,62 @@ end
     @test norm(second_field - field) / norm(field) > 0.01
 end
 
+@testset "capped Burton-Miller coupling against the exact exterior field" begin
+    # The cap changes the discrete system below kR = 1, so it is judged against
+    # an exact solution, not against the uncapped answer: an off-centre point
+    # source inside the unit sphere, in Float64 so the comparison is
+    # discretisation error and not float noise. Run under both phasor
+    # conventions, because a coupling whose sign disagrees with the Green's
+    # function still solves -- it is only wrong.
+    mesh = reference_sphere(2)
+    p1, dp0 = build_p1_space(mesh), build_dp0_space(mesh)
+    rule = triangle_rule(Float64, 4)
+    identity_pp = assemble_l2_identity_matrix(mesh, p1, dp0, rule, :p1, :p1)
+    identity_pq = assemble_l2_identity_matrix(mesh, p1, dp0, rule, :p1, :dp0)
+    cache = build_field_evaluation_cache(mesh, rule)
+    cap = burton_miller_coupling_cap(mesh; override="auto")
+    k_engage = sqrt(cap)
+    # Half the bounding-box diagonal of a unit sphere is sqrt(3), not 1.
+    @test k_engage ≈ 1 / sqrt(3) rtol=1e-12
+    source = SVector(0.2, -0.1, 0.3)
+    points = [SVector(2., 0., 0.), SVector(0., 0., 3.), SVector(-2., 1., 2.), SVector(0., -4., 1.)]
+    for convention in (NEGATIVE_TIME_PHASOR, POSITIVE_TIME_PHASOR)
+        with_phasor_convention(convention) do
+            sign = propagation_sign()
+            for k in (0.05, 0.2, 0.45, 0.7)
+                exact(x) = exp(im * sign * k * norm(x - source)) / norm(x - source)
+                q = ComplexF64[]
+                for (a, b, c) in mesh.faces
+                    x = (mesh.vertices[a] + mesh.vertices[b] + mesh.vertices[c]) / 3
+                    normal = normalize(cross(mesh.vertices[b] - mesh.vertices[a], mesh.vertices[c] - mesh.vertices[a]))
+                    delta = x - source
+                    push!(q, (im * sign * k - 1 / norm(delta)) * exact(x) * dot(normal, normalize(delta)))
+                end
+                operators = assemble_regular_galerkin_operators(mesh, p1, dp0, k, rule;
+                    skip_singular=false, singular_order=4, backend=:cpu)
+                errors = map((0.0, cap)) do coupling_cap
+                    pressure = solve_burton_miller_neumann(operators, identity_pp, identity_pq, q, k;
+                                                           coupling_cap=coupling_cap)
+                    field = evaluate_galerkin_field_cpu(points, mesh, pressure, q, k, cache)
+                    norm(field - exact.(points)) / norm(exact.(points))
+                end
+                @test errors[2] < 0.05                     # the capped solve is right
+                if k >= k_engage
+                    @test errors[2] == errors[1]           # and inert above the engagement point
+                else
+                    # Measured slightly better at every k below it (3.2307e-2 ->
+                    # 3.2218e-2 at k = 0.02). One-sided: the gate is that the
+                    # cap never costs accuracy, not that it buys a fixed amount.
+                    @test errors[2] <= errors[1] * (1 + 1e-3)
+                    lhs(c) = Matrix(BeatEngineCore.burton_miller_neumann_matrices(
+                        operators, identity_pp, identity_pq, k; coupling_cap=c)[1])
+                    @test cond(lhs(cap)) < cond(lhs(0.0))  # and it conditions the system better
+                end
+            end
+        end
+    end
+end
+
 @testset "retained complex fields match explicit symmetry images" begin
     T = Float64
     vertices = [SVector{3,T}(0.2,0.3,0.0), SVector{3,T}(0.4,0.3,0.0), SVector{3,T}(0.2,0.5,0.1)]

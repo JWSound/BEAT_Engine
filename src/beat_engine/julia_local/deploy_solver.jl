@@ -807,6 +807,9 @@ function solve_deploy_request_impl(
             )
         end
 
+        # Burton-Miller coupling cap for this body and its ground image, the
+        # same c = 1/R^2 the exterior and coupled solvers derive.
+        coupling_cap = burton_miller_coupling_cap(mesh; symmetry_mode=:ground)
         assembly_message = rom_request ?
             "Assembling Level 3 Schur exterior preconditioner" : direct_cuda_assembly ?
             "Assembling Level 2 rigid half-space Burton-Miller system" :
@@ -831,6 +834,7 @@ function solve_deploy_request_impl(
                     device_image_near_correction_cache=device_ground_near_correction_cache,
                     symmetry_mode=:ground,
                     timing=direct_assembly_timings,
+                    coupling_cap=coupling_cap,
                 )
             else
                 operators = assemble_regular_galerkin_operators(
@@ -916,6 +920,7 @@ function solve_deploy_request_impl(
                                     device_image_near_correction_cache=device_ground_near_correction_cache,
                                     symmetry_mode=:ground,
                                     timing=rhs_stage_timings,
+                                    coupling_cap=coupling_cap,
                                 )
                             end
                             for (name, seconds) in rhs_stage_timings
@@ -995,10 +1000,12 @@ function solve_deploy_request_impl(
                     cached_q_neumann,
                     k;
                     return_gpu=true,
+                    coupling_cap=coupling_cap,
                 )
             else
                 cached_q_neumann = copy(q_neumann)
-                solve_burton_miller_neumann(operators, identity_p1_p1, identity_p1_dp0, q_neumann, k)
+                solve_burton_miller_neumann(operators, identity_p1_p1, identity_p1_dp0, q_neumann, k;
+                                            coupling_cap=coupling_cap)
             end
         end
 
