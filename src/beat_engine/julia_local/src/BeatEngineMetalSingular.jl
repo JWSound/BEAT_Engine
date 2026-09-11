@@ -116,40 +116,44 @@ end
 function _metal_build_singular_gather_map(
     entries::Vector{Int32},
     values::Vector{Int32},
-    columns::Union{Nothing,Vector{Int32}},
-)
+    column_of_value::F,
+) where {F}
     if isempty(entries)
         return MetalSingularGatherMap(
             MtlArray(Int32[]),
             MtlArray(Int32[1]),
             MtlArray(Int32[]),
-            columns === nothing ? nothing : MtlArray(Int32[]),
+            column_of_value === nothing ? nothing : MtlArray(Int32[]),
             0,
         )
     end
-    # (entry, value) is unique across contributions, so sorting on the pair gives
-    # one fixed order whatever algorithm Base picks. Packing both into a single
-    # key keeps that guarantee without depending on `sortperm` being stable.
-    order = sortperm(
-        [(UInt64(reinterpret(UInt32, entries[i])) << 32) |
-         UInt64(reinterpret(UInt32, values[i])) for i in eachindex(entries)],
-    )
+    # (entry, value) is unique across contributions, so sorting the pair gives
+    # one fixed order whatever algorithm Base picks. Both halves live in the
+    # packed key, so the keys are sorted directly (radix sort for UInt64) and
+    # split back apart: no permutation, no gathers through it. This is the
+    # order the map has always had, so the device summation order is unchanged.
+    keys = Vector{UInt64}(undef, length(entries))
+    @inbounds for i in eachindex(entries)
+        keys[i] = (UInt64(reinterpret(UInt32, entries[i])) << 32) | UInt64(reinterpret(UInt32, values[i]))
+    end
+    sort!(keys)
     entry_indices = Int32[]
     contrib_offsets = Int32[]
-    contrib_values = Vector{Int32}(undef, length(order))
-    contrib_columns = columns === nothing ? nothing : Vector{Int32}(undef, length(order))
+    contrib_values = Vector{Int32}(undef, length(keys))
+    contrib_columns = column_of_value === nothing ? nothing : Vector{Int32}(undef, length(keys))
     previous = zero(Int32)
-    for (position, source) in enumerate(order)
-        entry = entries[source]
-        if isempty(entry_indices) || entry != previous
+    @inbounds for (position, key) in enumerate(keys)
+        entry = reinterpret(Int32, UInt32(key >> 32))
+        value = reinterpret(Int32, UInt32(key & 0xffffffff))
+        if position == 1 || entry != previous
             push!(entry_indices, entry)
             push!(contrib_offsets, Int32(position))
             previous = entry
         end
-        contrib_values[position] = values[source]
-        contrib_columns === nothing || (contrib_columns[position] = columns[source])
+        contrib_values[position] = value
+        contrib_columns === nothing || (contrib_columns[position] = column_of_value(value))
     end
-    push!(contrib_offsets, Int32(length(order) + 1))
+    push!(contrib_offsets, Int32(length(keys) + 1))
     return MetalSingularGatherMap(
         MtlArray(entry_indices),
         MtlArray(contrib_offsets),
@@ -199,6 +203,36 @@ function _metal_build_singular_gather_tables(
         "and part_count=$(part_count) reach $(largest_value).",
     )
 
+    # The pair loop runs behind a function barrier: the cache fields it reads are
+    # untyped, and inline every index into them was a dynamic dispatch, about a
+    # million per build at sample_detailed.msh -- most of the build's time.
+    _metal_fill_singular_gather_inputs!(
+        row_entries, row_values, rhs_entries, rhs_columns, block_entries, block_values,
+        test_indices, trial_indices, p1_dofs, element_dp0_dofs,
+        pair_count, face_count, p1_dof_count, value_stride,
+    )
+
+    # A right-hand-side value's column is its pair's trial DP0 dof, and the pair
+    # is recoverable from the value index (`pair + (local_row - 1) * stride`), so
+    # the column is looked up after sorting instead of being carried through it.
+    rhs_column_of_value = value -> rhs_columns[3 * ((Int(value) - 1) % value_stride) + 1]
+    return MetalSingularGatherTables(
+        _metal_build_singular_gather_map(row_entries, row_values, nothing),
+        _metal_build_singular_gather_map(block_entries, block_values, nothing),
+        _metal_build_singular_gather_map(rhs_entries, row_values, rhs_column_of_value),
+        part_count,
+        objectid(regular_cache),
+    )
+end
+
+# The host pass of `_metal_build_singular_gather_tables`, over concretely typed
+# arrays. Fills the (entry, value) contributions of all three maps in pair order.
+function _metal_fill_singular_gather_inputs!(
+    row_entries, row_values, rhs_entries, rhs_columns, block_entries, block_values,
+    test_indices::AbstractArray{<:Integer}, trial_indices::AbstractArray{<:Integer},
+    p1_dofs::AbstractArray{<:Integer}, element_dp0_dofs::AbstractArray{<:Integer},
+    pair_count::Int, face_count::Int, p1_dof_count::Int, value_stride::Int,
+)
     at_row = 0
     at_block = 0
     for pair_position in 1:pair_count
@@ -244,14 +278,7 @@ function _metal_build_singular_gather_tables(
             end
         end
     end
-
-    return MetalSingularGatherTables(
-        _metal_build_singular_gather_map(row_entries, row_values, nothing),
-        _metal_build_singular_gather_map(block_entries, block_values, nothing),
-        _metal_build_singular_gather_map(rhs_entries, row_values, rhs_columns),
-        part_count,
-        objectid(regular_cache),
-    )
+    return nothing
 end
 
 # Lazily builds and caches the maps, following the Ref{Any} idiom the regular

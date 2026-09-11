@@ -198,19 +198,21 @@ the summation order is fixed. `BLAB_METAL_SINGULAR_WRITEBACK=scatter` selects
 the older write-back instead, one thread per pair adding about 48 atomics, which
 is not reproducible.
 
-The map costs one host pass per mesh and is then reused for the worker's
-lifetime, like the caches it hangs off. On an M1 Pro at `sample.msh` (2,776
-faces, 37,198 singular pairs) it takes 269 ms to build and 3.0 MB of device
-memory; at `sample_detailed.msh` (7,000 faces, 93,740 pairs) 637 ms and 7.7 MB.
-In exchange the four-operator write-back drops from 2,249,760 atomic adds to
-311,964 plain ones at the larger mesh, because a corrected cell is written once
-instead of once per pair that touches it (3.2 pairs per cell for the single
-layer and adjoint, 12.2 for the double layer and hypersingular).
+The map is built by one host pass and cached on the singular correction cache.
+That cache lives as long as the request that built it: the exterior driver
+builds its caches per request, so every sweep pays for the map once, in its
+first frequency. On an M1 Pro the whole build (host pass, sort, upload) takes
+16 ms at `sample.msh` (2,776 faces, 37,198 singular pairs) and 38 ms at
+`sample_detailed.msh` (7,000 faces, 93,740 pairs), with 3.0 and 7.7 MB of device
+memory. It took 195 and 489 ms until the host pass was moved behind a function
+barrier: the cache fields it indexes are untyped, so every index was a dynamic
+dispatch. In exchange the four-operator write-back drops from 2,249,760 atomic
+adds to 311,964 plain ones at the larger mesh, because a corrected cell is
+written once instead of once per pair that touches it (3.2 pairs per cell for
+the single layer and adjoint, 12.2 for the double layer and hypersingular).
 
-Warm, the two write-backs are within a few percent of each other and the
-singular stage is under a tenth of assembly, so this is not a speed change. A
-single-frequency run on a fresh mesh is slightly slower for the map build; a
-sweep amortizes it away.
+Per frequency, the two write-backs are within a few percent of each other and
+the singular stage is under a tenth of assembly, so this is not a speed change.
 
 On an M1 Max at 5,041 P1 dofs (10,078 faces), quadrature order 4, singular
 order 4, one frequency: `pair_gather` assembles in about 1.06 s (pair
