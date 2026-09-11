@@ -849,6 +849,55 @@ end
         @test_throws Exception take_sweep_assembly!(pipeline, 2)
         shutdown_sweep_assembly_pipeline!(pipeline, _ -> nothing)
     end
+
+    @testset "overlap is chosen from modelled times, not a dof count" begin
+        saving(a, s) = sweep_overlap_saving_seconds(a, s; overlap_cost_s=0.005, host_slowdown=0.15)
+        # sample_detailed on an M1 Pro: a 353 ms assembly hides a 150 ms GMRES
+        # solve, less what sharing the machine costs the assembly.
+        @test saving(0.353, 0.150) ≈ 0.145
+        # A 620 ms LU outlasts the assembly, so the assembly is what is hidden,
+        # less the solve's own slowdown.
+        @test saving(0.353, 0.620) ≈ 0.353 - 0.15 * 0.620
+        # Nothing worth hiding.
+        @test saving(0.020, 0.002) < 0
+        # A fast GPU against a long LU: the solve slows by more than the whole
+        # assembly it would hide, so the overlap loses although both are large.
+        @test saving(0.090, 0.800) < 0
+
+        model_constants = (
+            "BLAB_METAL_ASSEMBLY_DOF2_SECONDS" => nothing,
+            "BLAB_METAL_ASSEMBLY_FIXED_SECONDS" => nothing,
+            "BLAB_METAL_OVERLAP_COST_SECONDS" => nothing,
+            "BLAB_METAL_OVERLAP_HOST_SLOWDOWN" => nothing,
+        )
+        plan(n; threads=4, setting="") =
+            metal_sweep_overlap_plan(n, 1, :off; frequency_count=12, threads=threads, setting=setting)
+        withenv(model_constants...) do
+            @test plan(3502).enabled && plan(3502).reason == :model
+            # The mesh the 1,900-dof threshold kept sequential, and lost 0.3 s on.
+            @test plan(1390).enabled
+            @test plan(3502).saving_model_s > plan(1390).saving_model_s
+            @test !plan(200).enabled
+            # Every symmetry copy is another pass over the element pairs.
+            @test metal_fused_assembly_seconds(1000, 4) > metal_fused_assembly_seconds(1000, 1)
+            # Overlap needs a second thread and a second frequency, whatever is set.
+            @test plan(3502; threads=1).reason == :single_thread
+            @test !plan(3502; threads=1, setting="1").enabled
+            @test metal_sweep_overlap_plan(3502, 1, :off; frequency_count=1, threads=4, setting="").reason ==
+                  :single_frequency
+            # BLAB_METAL_PIPELINE decides in both directions when set.
+            @test !plan(3502; setting="0").enabled
+            @test plan(200; setting="1").enabled && plan(200; setting="1").reason == :override
+        end
+        # The constants describe the machine: one where overlapping costs more
+        # than the solve it hides keeps the same mesh sequential.
+        withenv(model_constants..., "BLAB_METAL_OVERLAP_COST_SECONDS" => "10") do
+            @test !plan(3502).enabled
+        end
+        withenv(model_constants..., "BLAB_METAL_OVERLAP_COST_SECONDS" => "-1") do
+            @test_throws ErrorException plan(3502)
+        end
+    end
 end
 
 @testset "rigid y0 half-space Green function" begin

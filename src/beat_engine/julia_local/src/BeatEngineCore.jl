@@ -163,6 +163,10 @@ export BoundaryMesh,
     take_sweep_assembly!,
     shutdown_sweep_assembly_pipeline!,
     metal_sweep_memory_available,
+    metal_sweep_assembly_lookahead,
+    metal_sweep_overlap_plan,
+    metal_fused_assembly_seconds,
+    sweep_overlap_saving_seconds,
     surface_curls,
     scatter_element_block!,
     burton_miller_neumann_matrices,
@@ -1767,6 +1771,7 @@ function build_field_evaluation_cache(mesh::BoundaryMesh{T}, rule::TriangleRule{
 end
 
 include(joinpath(@__DIR__, "BeatEngineDenseSolve.jl"))
+include(joinpath(@__DIR__, "BeatEngineSweepOverlap.jl"))
 include(joinpath(@__DIR__, "BeatEngineCpu.jl"))
 
 if CUDA_MODULE !== nothing

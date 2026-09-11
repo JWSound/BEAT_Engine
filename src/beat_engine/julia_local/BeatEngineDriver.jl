@@ -516,78 +516,6 @@ function channel_neumann_columns(mesh, element_mesh_ids, radiators, channel_name
     return columns
 end
 
-"""
-    metal_sweep_assembly_lookahead(dof_count, drive_count, frequency_count, FloatType)
-
-How many frequencies the Metal assembly producer may run ahead of the solve.
-
-Derived from memory, never fixed: one in-flight frequency costs a dense
-`dofs x dofs` system plus its right-hand sides, which is 12 MB at 1,200 dofs and
-3.2 GB at 20,000, so the same constant cannot be right at both ends.
-`BLAB_METAL_PIPELINE_DEPTH` overrides it for measurement; `BLAB_METAL_PIPELINE=0`
-disables pipelining entirely.
-"""
-function metal_sweep_assembly_lookahead(
-    dof_count::Integer,
-    drive_count::Integer,
-    frequency_count::Integer,
-    ::Type{T},
-) where {T<:AbstractFloat}
-    entry_bytes = sizeof(Complex{T})
-    system_bytes = entry_bytes * (Int(dof_count)^2 + Int(dof_count) * max(1, Int(drive_count)))
-    override = strip(get(ENV, "BLAB_METAL_PIPELINE_DEPTH", ""))
-    if !isempty(override)
-        requested = tryparse(Int, override)
-        requested === nothing &&
-            error("BLAB_METAL_PIPELINE_DEPTH must be a positive integer; got $(repr(override)).")
-        return clamp(requested, 1, max(1, Int(frequency_count)))
-    end
-    return sweep_pipeline_depth(system_bytes, metal_sweep_memory_available(), frequency_count)
-end
-
-#: Smallest P1 dof count at which overlapping the sweep pays by default.
-#:
-#: The overlap buys the CPU solve it hides behind the next frequency's GPU
-#: assembly, and that grows as O(N^3) against the assembly's O(N^2). What it
-#: costs is GPU-side: one assembly already saturates the device, so dispatching
-#: the next one from a spawned task while this frequency's field evaluation is
-#: still running does not find idle silicon, it interleaves two command queues
-#: over the same units. Measured per frequency on a 1,209-dof quarter, the
-#: assembly slows by 30 ms and the field evaluation by 105 ms; the CPU solve
-#: pays a further 10 ms for the core the task takes. Since the purchase grows
-#: with the mesh and the cost does not, the trade changes sign at a size rather
-#: than being good or bad everywhere.
-#:
-#: Note what the cost is *not*. Metal.jl keeps its command queue in task-local
-#: storage, so a spawned task builds its own, and that has been the standing
-#: explanation for the small-mesh loss. Measured directly it is a fixed
-#: 0.23-0.29 ms per task, unchanged whether the task dispatches 1 kernel or 100
-#: -- two orders of magnitude below the penalty above. So holding one queue in a
-#: persistent assembly task would recover almost none of this; the cost is
-#: having two queues busy at once, not building one.
-#:
-#: This is a machine constant, not a physical one: it is where a measured
-#: crossover fell on one GPU, and a device with spare capacity during an
-#: assembly, or a slower dense solve, would put it elsewhere.
-#: `BLAB_METAL_PIPELINE` overrides it in both directions, and the per-frequency
-#: `metal_pipeline` diagnostic reports which way the choice went.
-const METAL_PIPELINE_MIN_DOFS = 1900
-
-"""
-    metal_pipeline_requested(dof_count) -> Bool
-
-Whether to overlap the next frequency's GPU assembly with this frequency's CPU
-solve, absent any other reason not to.
-
-`BLAB_METAL_PIPELINE` decides when it is set -- `0` off, anything else on, as
-it has always read -- and the size heuristic decides when it is not.
-"""
-function metal_pipeline_requested(dof_count::Integer)
-    setting = get(ENV, "BLAB_METAL_PIPELINE", "")
-    isempty(setting) || return setting != "0"
-    return dof_count >= METAL_PIPELINE_MIN_DOFS
-end
-
 function release_assembly_payload!(payload)
     payload === nothing && return nothing
     if get(payload, :kind, :operators) === :fused
@@ -1005,11 +933,13 @@ function solve_request_impl(request)
     # relies on. Two operator sets are then resident at once. Requires a
     # second Julia thread; with one thread the sweep stays sequential.
     #
-    # Whether it pays depends on the mesh, so the default is chosen here, where
-    # the dof count is known, rather than by the caller who starts the worker
-    # before any mesh has been read. See `metal_pipeline_requested`.
-    metal_pipeline = beat_backend == :metal && Threads.nthreads() > 1 &&
-        metal_pipeline_requested(p1_space.global_dof_count)
+    # Whether it pays depends on the mesh and the machine, so it is chosen here,
+    # where the dof count is known. See `metal_sweep_overlap_plan`.
+    overlap_plan = beat_backend == :metal ? metal_sweep_overlap_plan(
+        p1_space.global_dof_count, length(channel_names), Symbol(symmetry_mode);
+        frequency_count=length(frequencies),
+    ) : nothing
+    metal_pipeline = overlap_plan !== nothing && overlap_plan.enabled
     assemble_for_frequency = function (k_value)
         started = time()
         if fused_burton_miller
@@ -1361,10 +1291,11 @@ function solve_request_impl(request)
                         get(operators, :regular_assembly_mode, beat_backend == :cuda ? :serial_pair_batched : Symbol("$(beat_backend)_default"))),
                     "blas_threads" => cpu_blas_threads,
                     "sweep_assembly_lookahead" => assembly_lookahead,
-                    # The sweep's scheduling is now a per-solve decision, so
-                    # say which way it went: a size-aware default that reports
-                    # nothing is one whose regressions are invisible.
+                    # The sweep's scheduling is a per-solve decision, so say
+                    # which way it went and what the model expected it to save.
                     "metal_pipeline" => metal_pipeline,
+                    "metal_pipeline_reason" => overlap_plan === nothing ? "not_metal" : String(overlap_plan.reason),
+                    "metal_overlap_saving_model_s" => overlap_plan === nothing ? 0.0 : overlap_plan.saving_model_s,
                     "p1_dof_count" => p1_space.global_dof_count,
                     "regular_quadrature_mode" => regular_quadrature_mode,
                     "regular_quadrature_order" => quadrature_selection.order,
