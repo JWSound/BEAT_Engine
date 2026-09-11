@@ -150,6 +150,78 @@ end
 
 end
 
+@testset "burton-miller coupling parameter" begin
+    # The sign follows the phasor convention, not a hardcoded +i. Under this
+    # engine's default e^{-i omega t} the coupling is +i * (positive real); under
+    # e^{+i omega t} it is -i * (positive real). A sign error passes every
+    # operator-equivalence test -- both signs give a consistent, solvable,
+    # wrong-conditioned system -- and Marburg measured ~900 GMRES iterations
+    # against under 50 for it, so it is gated directly rather than inferred from
+    # a solve.
+    for convention in (NEGATIVE_TIME_PHASOR, POSITIVE_TIME_PHASOR)
+        with_phasor_convention(convention) do
+            expected_sign = propagation_sign()
+            for k in (0.5f0, 1.0f0, 12.7f0, 183.0f0)
+                @test real(burton_miller_coupling(k, 0)) == 0
+                @test imag(burton_miller_coupling(k, 0)) * expected_sign > 0
+            end
+        end
+    end
+
+    # Uncapped is the old expression, bit for bit, not merely to a tolerance,
+    # and it flips sign with the convention.
+    for k in (0.1f0, 1.0f0, 9.16f0, 109.9f0, 1000.0f0)
+        with_phasor_convention(NEGATIVE_TIME_PHASOR) do
+            @test burton_miller_coupling(k, 0) === ComplexF32(0, 1) / k
+            @test burton_miller_coupling(Float64(k), 0) === ComplexF64(0, 1) / Float64(k)
+        end
+        with_phasor_convention(POSITIVE_TIME_PHASOR) do
+            @test burton_miller_coupling(k, 0) === ComplexF32(0, -1) / k
+            @test burton_miller_coupling(Float64(k), 0) === ComplexF64(0, -1) / Float64(k)
+        end
+    end
+
+    # Capped: inert above the engagement wavenumber, bounded below it.
+    radius = 0.25
+    cap = inv(radius * radius)
+    k_engage = sqrt(cap)
+    for k in (k_engage, 2 * k_engage, 37.0, 300.0)
+        @test burton_miller_coupling(k, cap) === burton_miller_coupling(k, 0)
+    end
+    for k in (1e-6, 1e-3, 0.5 * k_engage, 0.999 * k_engage)
+        scale = burton_miller_coupling_scale(k, cap)
+        @test scale < inv(k)                      # the cap is doing something
+        @test scale <= radius + 1e-12             # and it bounds |eta| by R
+        @test scale ≈ k * radius * radius
+    end
+    # Continuous at the transition, and |eta| peaks there.
+    @test burton_miller_coupling_scale(prevfloat(k_engage), cap) ≈
+        burton_miller_coupling_scale(k_engage, cap)
+    @test burton_miller_coupling_scale(k_engage, cap) ≈ radius
+    @test all(burton_miller_coupling_scale(k, cap) <= radius + 1e-12
+              for k in exp10.(range(-6, 3; length=200)))
+    # k -> 0 is finite, which is the entire point.
+    @test burton_miller_coupling_scale(0.0, cap) == 0.0
+    @test isfinite(burton_miller_coupling(1e-12, cap))
+
+    # The cap radius is the body's, not the reduced mesh's. A square plate in
+    # the x > 0 half space under :x symmetry stands for a body twice as wide.
+    vertices = [SVector(0.0f0, 0.0f0, 0.0f0), SVector(1.0f0, 0.0f0, 0.0f0),
+                SVector(1.0f0, 2.0f0, 0.0f0), SVector(0.0f0, 2.0f0, 0.0f0)]
+    faces = [(1, 2, 3), (1, 3, 4)]
+    plate = BoundaryMesh(vertices, faces, [1, 1])
+    @test burton_miller_body_radius(plate) ≈ 0.5f0 * sqrt(1.0f0^2 + 2.0f0^2)
+    @test burton_miller_body_radius(plate; symmetry_mode=:x) ≈ 0.5f0 * sqrt(2.0f0^2 + 2.0f0^2)
+    @test burton_miller_coupling_cap(plate; override="auto") ≈ inv(burton_miller_body_radius(plate)^2)
+
+    # And the override, which is what an A/B measurement drives.
+    @test burton_miller_coupling_cap(plate; override="off") == 0
+    @test burton_miller_coupling_cap(plate; override="0") == 0
+    @test burton_miller_coupling_cap(plate; override="12.5") ≈ 12.5f0
+    @test_throws ErrorException burton_miller_coupling_cap(plate; override="loud")
+    @test_throws ErrorException burton_miller_coupling_cap(plate; override="-1")
+end
+
 @testset "cpu x symmetry assembly" begin
     mesh = load_gmsh22_with_tags(joinpath(@__DIR__, "..", "test_meshes", "sample_half.msh"), Float32(0.001))
     validate_symmetry_fundamental_domain!(mesh, :x)

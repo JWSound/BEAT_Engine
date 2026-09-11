@@ -452,6 +452,7 @@ function pressure_for_drives(
     cpu_solve_system=nothing,
     cuda_solve_identity_cache=nothing,
     rocm_solve_identity_cache=nothing,
+    coupling_cap=zero(k),
 )
     ComplexType = eltype(drives)
     q_neumann = zeros(ComplexType, length(mesh.faces))
@@ -467,9 +468,9 @@ function pressure_for_drives(
     pressure = if cpu_solve_system !== nothing
         solve_burton_miller_neumann_cpu_system(cpu_solve_system, q_neumann, typeof(k))
     elseif cuda_solve_identity_cache !== nothing
-        solve_burton_miller_neumann(operators, cuda_solve_identity_cache, q_neumann, k)
+        solve_burton_miller_neumann(operators, cuda_solve_identity_cache, q_neumann, k; coupling_cap=coupling_cap)
     elseif rocm_solve_identity_cache !== nothing
-        solve_burton_miller_neumann(operators, rocm_solve_identity_cache, q_neumann, k)
+        solve_burton_miller_neumann(operators, rocm_solve_identity_cache, q_neumann, k; coupling_cap=coupling_cap)
     else
         solve_burton_miller_neumann(operators, identity_p1_p1, identity_p1_dp0, q_neumann, k)
     end
@@ -760,6 +761,11 @@ function solve_request_impl(request)
     singular_order = Int(get_value(config, "singular_order", 4))
     identity_p1_p1 = assemble_l2_identity_matrix(mesh, p1_space, dp0_space, rule, :p1, :p1; symmetry_mode=Symbol(symmetry_mode))
     identity_p1_dp0 = assemble_l2_identity_matrix(mesh, p1_space, dp0_space, rule, :p1, :dp0; symmetry_mode=Symbol(symmetry_mode))
+    # Burton-Miller coupling cap, derived from this body once for the whole
+    # sweep: eta = i|k|/max(k^2, c) with c = 1/R^2. Above kR = 1 it is bit for
+    # bit the bare i/k; below it, it stops |eta| growing without bound as k goes
+    # to zero. BLAB_BEAT_BM_COUPLING_CAP=off restores the uncapped coupling.
+    coupling_cap = burton_miller_coupling_cap(mesh; symmetry_mode=Symbol(symmetry_mode))
     rho = FloatType(get_value(config, "rho", 1.21))
     sound_speed = FloatType(get_value(config, "sound_speed", 343.0))
     flat_target = Bool(get_value(config, "flat_target_normalization_enabled", true))
@@ -901,7 +907,7 @@ function solve_request_impl(request)
         cpu_solve_system = nothing
         if beat_backend == :cpu
             t_solve += @elapsed begin
-                cpu_solve_system = build_burton_miller_neumann_cpu_system(operators, selected_identity_p1_p1, selected_identity_p1_dp0, k)
+                cpu_solve_system = build_burton_miller_neumann_cpu_system(operators, selected_identity_p1_p1, selected_identity_p1_dp0, k; coupling_cap=coupling_cap)
             end
         end
         channel_boundary_pressures = Vector{Vector{Complex{FloatType}}}()
@@ -932,6 +938,7 @@ function solve_request_impl(request)
                     cpu_solve_system=cpu_solve_system,
                     cuda_solve_identity_cache=cuda_solve_identity_cache,
                     rocm_solve_identity_cache=rocm_solve_identity_cache,
+                    coupling_cap=coupling_cap,
                 )
             end
             t_field += @elapsed begin

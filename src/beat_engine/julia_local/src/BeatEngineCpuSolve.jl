@@ -42,8 +42,8 @@ function configure_beat_cpu_blas_threads!(
     return BLAS.get_num_threads()
 end
 
-function burton_miller_neumann_matrices(operators, identity_p1_p1, identity_p1_dp0, k::T) where {T<:AbstractFloat}
-    coupling = burton_miller_coupling(k)
+function burton_miller_neumann_matrices(operators, identity_p1_p1, identity_p1_dp0, k::T; coupling_cap::Real=zero(T)) where {T<:AbstractFloat}
+    coupling = burton_miller_coupling(k, coupling_cap)
     identity_p1_p1_complex = Complex{T}.(identity_p1_p1)
     identity_p1_dp0_complex = Complex{T}.(identity_p1_dp0)
 
@@ -52,12 +52,13 @@ function burton_miller_neumann_matrices(operators, identity_p1_p1, identity_p1_d
     return lhs, rhs_operator
 end
 
-function build_burton_miller_neumann_cpu_system(operators, identity_p1_p1, identity_p1_dp0, k::T) where {T<:AbstractFloat}
+function build_burton_miller_neumann_cpu_system(operators, identity_p1_p1, identity_p1_dp0, k::T; coupling_cap::Real=zero(T)) where {T<:AbstractFloat}
     lhs, rhs_operator = burton_miller_neumann_matrices(
         operators,
         identity_p1_p1,
         identity_p1_dp0,
-        k,
+        k;
+        coupling_cap=coupling_cap,
     )
     return (
         factorization=lu!(lhs),
@@ -70,7 +71,7 @@ function solve_burton_miller_neumann_cpu_system(system, q_neumann, ::Type{T}) wh
     return Complex{T}.(system.factorization \ rhs)
 end
 
-function solve_burton_miller_neumann_cpu(operators, identity_p1_p1, identity_p1_dp0, q_neumann, k::T) where {T<:AbstractFloat}
-    system = build_burton_miller_neumann_cpu_system(operators, identity_p1_p1, identity_p1_dp0, k)
+function solve_burton_miller_neumann_cpu(operators, identity_p1_p1, identity_p1_dp0, q_neumann, k::T; coupling_cap::Real=zero(T)) where {T<:AbstractFloat}
+    system = build_burton_miller_neumann_cpu_system(operators, identity_p1_p1, identity_p1_dp0, k; coupling_cap=coupling_cap)
     return solve_burton_miller_neumann_cpu_system(system, q_neumann, T)
 end
