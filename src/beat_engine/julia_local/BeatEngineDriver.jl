@@ -511,6 +511,35 @@ function channel_neumann_columns(mesh, element_mesh_ids, radiators, channel_name
     return columns
 end
 
+"""
+    metal_sweep_assembly_lookahead(dof_count, drive_count, frequency_count, FloatType)
+
+How many frequencies the Metal assembly producer may run ahead of the solve.
+
+Derived from memory, never fixed: one in-flight frequency costs a dense
+`dofs x dofs` system plus its right-hand sides, which is 12 MB at 1,200 dofs and
+3.2 GB at 20,000, so the same constant cannot be right at both ends.
+`BLAB_METAL_PIPELINE_DEPTH` overrides it for measurement; `BLAB_METAL_PIPELINE=0`
+disables pipelining entirely.
+"""
+function metal_sweep_assembly_lookahead(
+    dof_count::Integer,
+    drive_count::Integer,
+    frequency_count::Integer,
+    ::Type{T},
+) where {T<:AbstractFloat}
+    entry_bytes = sizeof(Complex{T})
+    system_bytes = entry_bytes * (Int(dof_count)^2 + Int(dof_count) * max(1, Int(drive_count)))
+    override = strip(get(ENV, "BLAB_METAL_PIPELINE_DEPTH", ""))
+    if !isempty(override)
+        requested = tryparse(Int, override)
+        requested === nothing &&
+            error("BLAB_METAL_PIPELINE_DEPTH must be a positive integer; got $(repr(override)).")
+        return clamp(requested, 1, max(1, Int(frequency_count)))
+    end
+    return sweep_pipeline_depth(system_bytes, metal_sweep_memory_available(), frequency_count)
+end
+
 #: Smallest P1 dof count at which overlapping the sweep pays by default.
 #:
 #: The overlap buys the CPU solve it hides behind the next frequency's GPU
@@ -987,7 +1016,11 @@ function solve_request_impl(request)
                 singular_order=singular_order,
                 symmetry_mode=Symbol(symmetry_mode),
             )
-            return ((kind=:fused, system=system, q_columns=q_columns), time() - started)
+            return (
+                payload=(kind=:fused, system=system, q_columns=q_columns),
+                seconds=time() - started,
+                k=k_value,
+            )
         end
         assembled = assemble_regular_galerkin_operators(
             mesh,
@@ -1006,27 +1039,43 @@ function solve_request_impl(request)
             metal_assembly_mode=metal_assembly_mode,
             symmetry_mode=Symbol(symmetry_mode),
         )
-        return ((kind=:operators, operators=assembled), time() - started)
+        return (
+            payload=(kind=:operators, operators=assembled),
+            seconds=time() - started,
+            k=k_value,
+        )
     end
-    pending_assembly = nothing
+    release_produced_assembly! = produced -> release_assembly_payload!(produced.payload)
+    assembly_pipeline = nothing
+    assembly_lookahead = 0
     # The payload fetched for the frequency currently being solved. Held out
     # here so the outer `finally` can free its device buffers when the solve,
     # field evaluation, synthesis, or diagnostics throw.
     current_assembly_payload = nothing
     if metal_pipeline && !isempty(frequencies)
-        first_k = FloatType(2pi) * FloatType(frequencies[1]) / sound_speed
-        pending_assembly = Threads.@spawn assemble_for_frequency(first_k)
+        assembly_lookahead = metal_sweep_assembly_lookahead(
+            p1_space.global_dof_count,
+            length(channel_names),
+            length(frequencies),
+            FloatType,
+        )
+        emit_event("status"; message=@sprintf(
+            "BEAT Engine assembling %d frequenc%s ahead of the solve",
+            assembly_lookahead,
+            assembly_lookahead == 1 ? "y" : "ies",
+        ))
+        assembly_pipeline = start_sweep_assembly_pipeline(
+            index -> assemble_for_frequency(FloatType(2pi) * FloatType(frequencies[index]) / sound_speed),
+            length(frequencies),
+            assembly_lookahead,
+            release_produced_assembly!,
+        )
     end
 
     try
         for (index, freq_raw) in enumerate(frequencies)
             if cancel_path !== nothing && isfile(String(cancel_path))
-                if pending_assembly !== nothing
-                    release_assembly_payload!(fetch(pending_assembly)[1])
-                    # Cleared so the outer `finally` does not fetch and release
-                    # the same payload a second time on the way out.
-                    pending_assembly = nothing
-                end
+                shutdown_sweep_assembly_pipeline!(assembly_pipeline, release_produced_assembly!)
                 emit_event("cancelled"; solved_count=index - 1)
                 return
             end
@@ -1073,16 +1122,19 @@ function solve_request_impl(request)
         pipelined_assembly_seconds = 0.0
         t_assembly = @elapsed begin
             if metal_pipeline
-                # Collect this frequency's operators from the worker task and
-                # immediately queue the next frequency's assembly behind it.
-                # The reported assembly time is the worker's own, even though
-                # it overlapped the previous frequency's solve.
-                assembly_payload, pipelined_assembly_seconds = fetch(pending_assembly)
-                pending_assembly = nothing
-                if index < length(frequencies)
-                    next_k = FloatType(2pi) * FloatType(frequencies[index + 1]) / sound_speed
-                    pending_assembly = Threads.@spawn assemble_for_frequency(next_k)
-                end
+                # Collect this frequency's operators from the producer, which
+                # has already moved on to the next ones. The reported assembly
+                # time is the producer's own, even though it overlapped the
+                # previous frequency's solve. The wavenumber is checked against
+                # the one this iteration derived independently, so a payload can
+                # never be reported under the wrong frequency.
+                produced = take_sweep_assembly!(assembly_pipeline, index)
+                produced.k == k || error(
+                    "BEAT sweep pipeline assembled k=$(produced.k) for frequency index $(index), " *
+                    "which needs k=$(k)."
+                )
+                assembly_payload = produced.payload
+                pipelined_assembly_seconds = produced.seconds
             elseif fused_burton_miller
                 fused_q_columns = channel_neumann_columns(
                     mesh, element_mesh_ids, radiators, channel_names, rho, omega, FloatType,
@@ -1294,6 +1346,7 @@ function solve_request_impl(request)
                         assembly_payload.system.assembly_mode :
                         get(operators, :regular_assembly_mode, beat_backend == :cuda ? :serial_pair_batched : Symbol("$(beat_backend)_default"))),
                     "blas_threads" => cpu_blas_threads,
+                    "sweep_assembly_lookahead" => assembly_lookahead,
                     # The sweep's scheduling is now a per-solve decision, so
                     # say which way it went: a size-aware default that reports
                     # nothing is one whose regressions are invisible.
@@ -1319,12 +1372,7 @@ function solve_request_impl(request)
             catch
             end
         end
-        if pending_assembly !== nothing
-            try
-                release_assembly_payload!(fetch(pending_assembly)[1])
-            catch
-            end
-        end
+        shutdown_sweep_assembly_pipeline!(assembly_pipeline, release_produced_assembly!)
         if cuda_solve_identity_cache !== nothing
             release_cuda_burton_miller_identity_cache!(cuda_solve_identity_cache)
         end
