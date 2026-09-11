@@ -12,11 +12,15 @@ Use real projects on each solve path the change touches, and say which path:
 | Path | Entry point | Workloads |
 |---|---|---|
 | Exterior radiator (source request) | `solver.jl` | `test_meshes/sample.msh` (1,390 dofs), `sample_detailed.msh` (3,502 dofs) |
-| System solve (compiled request) | `coupled_solver.jl` | a Boundary Lab project, e.g. `examples/Multi_region_SAWMOD` (coupled FEM-BEM-LEM) |
+| Exterior-only system solve (compiled request) | `coupled_solver.jl` | the same meshes, seeded as an exterior-only system |
+| Coupled system solve (compiled request) | `coupled_solver.jl` | a Boundary Lab project, e.g. `examples/Multi_region_SAWMOD` (coupled FEM-BEM-LEM) |
 
-Capture a Boundary Lab request with `scripts/capture_boundary_lab_request.py`
-from a Boundary Lab checkout. The request references that checkout's meshes, so
-it is not committed here.
+Boundary Lab's GUI sends exterior projects as exterior-only system solves, not
+source requests. Capture a Boundary Lab request with
+`scripts/capture_boundary_lab_request.py` from a Boundary Lab checkout: pass a
+project, or `--exterior-mesh` with a mesh and its radiator tag to seed an
+exterior-only system the way the GUI does. The request references that
+checkout's meshes, so it is not committed here.
 
 ## Runs
 
@@ -34,9 +38,11 @@ it is not committed here.
 - Skip a configuration when the diff does not touch the logic on its code path
   and a measurement has confirmed it unchanged. Plumbing for another backend
   passing through the same files does not count as a change.
-- Use an otherwise idle machine that does not sleep. Keep the Julia thread count
-  fixed across configurations and record it with the chip (CPU and GPU core
-  counts).
+- Use an otherwise idle machine that does not sleep. Keep the Julia and BLAS
+  thread counts fixed across configurations and record them with the chip (CPU
+  and GPU core counts). The BLAS count also changes the answer: LU rounds
+  differently when its work is split across a different number of threads, so
+  a change that alters the count is not bit-identical to one that does not.
 - Wall time includes the per-request setup the worker repeats for every sweep
   (mesh caches, maps), because an application pays it once per solve. Before
   calling a change a per-frequency slowdown, compare the first frequency with
