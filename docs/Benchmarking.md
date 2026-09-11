@@ -38,9 +38,11 @@ checkout's meshes, so it is not committed here.
 - Skip a configuration when the diff does not touch the logic on its code path
   and a measurement has confirmed it unchanged. Plumbing for another backend
   passing through the same files does not count as a change.
-- Use an otherwise idle machine that does not sleep. Keep the Julia thread count
-  fixed across configurations and record it with the chip (CPU and GPU core
-  counts).
+- Use an otherwise idle machine that does not sleep. Keep the Julia and BLAS
+  thread counts fixed across configurations and record them with the chip (CPU
+  and GPU core counts). The BLAS count also changes the answer: LU rounds
+  differently when its work is split across a different number of threads, so
+  a change that alters the count is not bit-identical to one that does not.
 - Wall time includes the per-request setup the worker repeats for every sweep
   (mesh caches, maps), because an application pays it once per solve. Before
   calling a change a per-frequency slowdown, compare the first frequency with
