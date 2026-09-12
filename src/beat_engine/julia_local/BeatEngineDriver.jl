@@ -300,9 +300,8 @@ function butterworth_response(crossover_type::String, order::Int, cutoff_hz, fre
     cutoff = T(cutoff_hz)
     omega = T(2pi) * freq
     omega_c = T(2pi) * cutoff
-    # Channel DSP is applied directly to BEAT's exp(-i omega t) solver
-    # phasors, so evaluate the causal analog response at s = -i*omega.
-    s = Complex{T}(0, -omega)
+    # Evaluate channel DSP at the time derivative selected for this request.
+    s = time_derivative(omega)
     response = one(Complex{T})
 
     for pole in butterworth_poles(order, T)
@@ -334,7 +333,7 @@ end
 function channel_drive(channel, freq::T) where {T<:AbstractFloat}
     omega = T(2pi) * freq
     level = T(10.0) ^ (T(channel["level_db"]) / T(20.0))
-    delay = exp(Complex{T}(0, omega * T(channel["delay_ms"]) / T(1000.0)))
+    delay = exp(Complex{T}(0, propagation_sign() * omega * T(channel["delay_ms"]) / T(1000.0)))
     crossover = crossover_response(get_value(channel, "hpf", nothing), freq) *
         crossover_response(get_value(channel, "lpf", nothing), freq)
     return Complex{T}(T(channel["polarity"]) * level) * delay * crossover
@@ -422,7 +421,7 @@ function drive_for_radiator(radiator, channels, freq::T) where {T<:AbstractFloat
     polarity = T(radiator["polarity"])
     delay_ms = T(radiator["delay_ms"])
     level = T(10.0) ^ (level_db / T(20.0))
-    delay = exp(Complex{T}(0, omega * delay_ms / T(1000.0)))
+    delay = exp(Complex{T}(0, propagation_sign() * omega * delay_ms / T(1000.0)))
     crossover = crossover_response(get_value(radiator, "hpf", nothing), freq) *
         crossover_response(get_value(radiator, "lpf", nothing), freq)
     return Complex{T}(polarity * level) * delay * crossover
@@ -476,7 +475,7 @@ function pressure_for_drives(
         drive = drives[radiator_index]
         for element_index in eachindex(mesh.physical_tags)
             if mesh.physical_tags[element_index] == tag && radiator_owns_element(radiator, element_mesh_ids, element_index)
-                q_neumann[element_index] = ComplexType(0, rho * omega) * drive
+                q_neumann[element_index] = neumann_scale(rho, omega) * drive
             end
         end
     end
@@ -509,7 +508,7 @@ function channel_neumann_columns(mesh, element_mesh_ids, radiators, channel_name
             tag = Int(radiator["tag"])
             for element_index in eachindex(mesh.physical_tags)
                 if mesh.physical_tags[element_index] == tag && radiator_owns_element(radiator, element_mesh_ids, element_index)
-                    columns[element_index, channel_index] = Complex{T}(0, rho * omega) * drive
+                    columns[element_index, channel_index] = neumann_scale(rho, omega) * drive
                 end
             end
         end
@@ -757,7 +756,7 @@ function impedance_for_radiators(mesh, element_mesh_ids, pressure, radiators, dr
         end
         total_force *= eltype(pressure)(10.0)
         z_complex = total_force / drive
-        push!(impedance, [Float32(real(z_complex) / 2), Float32(-imag(z_complex) / 2)])
+        push!(impedance, [Float32(real(z_complex) / 2), Float32(-propagation_sign() * imag(z_complex) / 2)])
     end
     return impedance
 end
