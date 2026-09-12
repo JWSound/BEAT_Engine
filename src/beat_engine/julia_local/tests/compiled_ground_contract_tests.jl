@@ -1,0 +1,38 @@
+include(joinpath(@__DIR__, "..", "compiled_ground_contract.jl"))
+
+@testset "compiled rigid-ground physical radiator contract" begin
+    T = Float32
+    raised = BoundaryMesh(
+        SVector{3,T}[(0, 1, 0), (1, 1, 0), (0, 1, 1)],
+        [(1, 2, 3)], [2],
+    )
+    pressure = ones(Complex{T}, length(raised.vertices))
+    excitation = (tags=[2], amplitudes=Complex{T}[1])
+
+    @test validate_compiled_ground_domain!(raised, :ground) === nothing
+    @test validate_compiled_ground_domain!(raised, :off) === nothing
+    local_impedance = exterior_component_impedance(raised, pressure, excitation, :off, T)
+    @test local_impedance ≈ Complex{T}(raised.areas[1])
+    @test exterior_component_impedance(raised, pressure, excitation, :ground, T) ≈ local_impedance
+    @test exterior_component_impedance(raised, pressure, excitation, :x, T) ≈ 2local_impedance
+    @test exterior_component_impedance(raised, pressure, excitation, :xy, T) ≈ 4local_impedance
+
+    straddling = BoundaryMesh(
+        SVector{3,T}[(0, -0.1, 0), (1, 0.1, 0), (0, 0.1, 1)],
+        [(1, 2, 3)], [2],
+    )
+    @test_throws ErrorException validate_compiled_ground_domain!(straddling, :ground)
+    @test validate_compiled_ground_domain!(straddling, :off) === nothing
+
+    coplanar = BoundaryMesh(
+        SVector{3,T}[(0, 0, 0), (1, 0, 0), (0, 0, 1)],
+        [(1, 2, 3)], [2],
+    )
+    @test_throws ErrorException validate_compiled_ground_domain!(coplanar, :ground)
+
+    contact_edge = BoundaryMesh(
+        SVector{3,T}[(0, 0, 0), (1, 0, 0), (0, 0.1, 1)],
+        [(1, 2, 3)], [2],
+    )
+    @test validate_compiled_ground_domain!(contact_edge, :ground) === nothing
+end

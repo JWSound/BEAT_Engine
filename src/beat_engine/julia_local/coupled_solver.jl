@@ -7,6 +7,7 @@ using .BeatEngineContract
 
 include(joinpath(@__DIR__, "src", "BeatEngineCore.jl"))
 using .BeatEngineCore
+include(joinpath(@__DIR__, "compiled_ground_contract.jl"))
 include(joinpath(@__DIR__, "src", "BeatEngineCoupled.jl"))
 using .BeatEngineCoupled
 include(joinpath(@__DIR__, "src", "BeatEngineCoupledCondensed.jl"))
@@ -708,19 +709,6 @@ function exterior_field(points, mesh, pressure, neumann, wavenumber, cache, back
     return evaluate_galerkin_field_cpu(points, mesh, pressure, neumann, wavenumber, cache)
 end
 
-function exterior_component_impedance(mesh, pressure, excitation, symmetry_mode, ::Type{T}) where {T<:AbstractFloat}
-    force = zero(Complex{T})
-    amplitude_by_tag = Dict(zip(excitation.tags, excitation.amplitudes))
-    for face_index in eachindex(mesh.faces)
-        tag = mesh.physical_tags[face_index]
-        haskey(amplitude_by_tag, tag) || continue
-        face = mesh.faces[face_index]
-        average_pressure = (pressure[face[1]] + pressure[face[2]] + pressure[face[3]]) / T(3)
-        force += average_pressure * T(mesh.areas[face_index]) * amplitude_by_tag[tag]
-    end
-    return force * T(symmetry_reduction_factor(symmetry_mode))
-end
-
 function solve_exterior_direct_cuda(
     mesh, p1_space, dp0_space, neumann_values, wavenumber, rule; kwargs...,
 )
@@ -844,6 +832,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     bem_domain = aggregate_bem_region(meshes, unbounded_region, boundaries, FloatType)
     mesh = snap_symmetry_planes(bem_domain.mesh, symmetry_mode)
     validate_symmetry_fundamental_domain!(mesh, symmetry_mode)
+    validate_compiled_ground_domain!(mesh, symmetry_mode)
     excitation_port_ids = String.(request["excitation_port_ids"])
     excitations = exterior_excitations(
         excitation_port_ids,
