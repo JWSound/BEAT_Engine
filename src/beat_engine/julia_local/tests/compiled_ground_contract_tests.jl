@@ -35,4 +35,10 @@ include(joinpath(@__DIR__, "..", "compiled_ground_contract.jl"))
         [(1, 2, 3)], [2],
     )
     @test validate_compiled_ground_domain!(contact_edge, :ground) === nothing
+
+    raised_volume = (vertices=SVector{3,T}[(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)],)
+    @test validate_compiled_ground_volume!(raised_volume, :ground) === nothing
+    below_volume = (vertices=SVector{3,T}[(0, -0.1, 0)],)
+    @test_throws ErrorException validate_compiled_ground_volume!(below_volume, :ground)
+    @test validate_compiled_ground_volume!(below_volume, :off) === nothing
 end

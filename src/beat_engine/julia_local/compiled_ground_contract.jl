@@ -21,6 +21,18 @@ function validate_compiled_ground_domain!(mesh, symmetry_mode; tolerance::Real=1
     return nothing
 end
 
+"""Keep the physical FEM region above the image plane in coupled ground solves."""
+function validate_compiled_ground_volume!(mesh, symmetry_mode; tolerance::Real=1.0e-6)
+    symmetry_mode == :ground || return nothing
+    isempty(mesh.vertices) && error("Rigid-ground symmetry requires a nonempty FEM volume mesh.")
+    minimum_y = minimum(Float64(vertex[2]) for vertex in mesh.vertices)
+    minimum_y >= -tolerance || error(
+        "Rigid-ground symmetry requires the whole FEM region at Y >= 0; " *
+        "the volume mesh reaches Y=$(minimum_y) m."
+    )
+    return nothing
+end
+
 """Radiation impedance scales by real symmetry copies, not image sources."""
 function exterior_component_impedance(mesh, pressure, excitation, symmetry_mode, ::Type{T}) where {T<:AbstractFloat}
     force = zero(Complex{T})

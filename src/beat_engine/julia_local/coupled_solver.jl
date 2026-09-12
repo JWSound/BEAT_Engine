@@ -2426,6 +2426,16 @@ function solve_request_impl(request; event_mode=false)
         symmetry_mode;
         tolerance=symmetry_tolerance,
     )
+    validate_compiled_ground_volume!(
+        fem_mesh,
+        symmetry_mode;
+        tolerance=symmetry_tolerance,
+    )
+    validate_compiled_ground_domain!(
+        bem_mesh,
+        symmetry_mode;
+        tolerance=symmetry_tolerance,
+    )
     combined_interfaces = combined_interface_map_from_wire(
         interfaces,
         fem_domains,
