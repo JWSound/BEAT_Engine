@@ -227,6 +227,7 @@ function assemble_regular_galerkin_operators_metal_regular(
     symmetry_mode::Symbol=:off,
 ) where {T<:AbstractFloat}
     _require_metal!()
+    k = outgoing_wavenumber(k)
     return_device || error("Metal assembly requires return_device=true.")
     accelerator_quadrature || error("Metal assembly requires accelerator_quadrature=true.")
     normalized_mode = normalized_symmetry_mode(symmetry_mode)

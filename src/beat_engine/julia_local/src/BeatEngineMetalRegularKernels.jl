@@ -147,6 +147,11 @@ function _metal_regular_slp_adjoint_entries_kernel!(
                         inv_radius = one(k) / radius
                         phase = k * radius
                         green_scale = inv_radius / four_pi
+                        # Precise cos/sin on purpose. Metal's fast-math variants
+                        # were measured at 1-2% faster on real cases but push
+                        # validate_metal_exterior.jl past its 1e-6 gate above
+                        # 4 kHz (4e-6 worst); the 5.5x larger Green error at
+                        # 20 kHz is swamped by Float32 conditioning downstream.
                         green_re = cos(phase) * green_scale
                         green_im = sin(phase) * green_scale
                         weight = test_weight * rule_weights[trial_q] * jac_scale * test_basis

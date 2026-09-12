@@ -282,12 +282,23 @@ def format_julia_error(
         "using amdgpu",
         "import amdgpu",
     )
+    metal_load_markers = (
+        "metal.jl could not be loaded",
+        "package metal",
+        "using metal",
+        "import metal",
+    )
     looks_like_dependency_error = any(marker in text for marker in missing_dependency_markers)
     looks_like_julia_load_error = any(marker in text for marker in julia_load_markers)
     looks_like_cuda_error = any(marker in text for marker in cuda_load_markers)
     looks_like_rocm_error = any(marker in text for marker in rocm_load_markers)
+    looks_like_metal_error = any(marker in text for marker in metal_load_markers)
     if not (
-        looks_like_dependency_error or looks_like_julia_load_error or looks_like_cuda_error or looks_like_rocm_error
+        looks_like_dependency_error
+        or looks_like_julia_load_error
+        or looks_like_cuda_error
+        or looks_like_rocm_error
+        or looks_like_metal_error
     ):
         return message
 

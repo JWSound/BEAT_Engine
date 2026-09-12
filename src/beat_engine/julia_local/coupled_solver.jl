@@ -764,6 +764,49 @@ function solve_exterior_direct_cuda(
     end
 end
 
+function metal_direct_assembly_available()
+    return BeatEngineCore._normalized_metal_assembly_mode(nothing) != :host_staged &&
+           BeatEngineCore._normalized_metal_singular_mode() == :native &&
+           BeatEngineCore._normalized_metal_regular_kernel_mode() == :pair_gather
+end
+
+function assemble_exterior_direct_metal(
+    mesh, p1_space, dp0_space, neumann_values, wavenumber, rule; kwargs...,
+)
+    # The fused Metal assembler is the Metal counterpart of the direct CUDA
+    # assembler: A and every excitation's b are formed on the GPU without
+    # materializing S, D, D' or H.
+    started = time_ns()
+    system = assemble_burton_miller_neumann_system_metal(
+        mesh, p1_space, dp0_space, reduce(hcat, neumann_values), wavenumber, rule; kwargs...,
+    )
+    return system, (time_ns() - started) / 1.0e9
+end
+
+function solve_exterior_direct_metal_system(system)
+    # Metal.jl has no GPU LU, so the host reads the shared buffers in place and
+    # one factorization serves every column.
+    started = time_ns()
+    pressure, report = solve_metal_burton_miller_system_with_report(system)
+    pressures = [copy(column) for column in eachcol(pressure)]
+    return pressures, (time_ns() - started) / 1.0e9, report.method
+end
+
+function solve_exterior_direct_metal(
+    mesh, p1_space, dp0_space, neumann_values, wavenumber, rule; kwargs...,
+)
+    system = nothing
+    try
+        system, assembly_s = assemble_exterior_direct_metal(
+            mesh, p1_space, dp0_space, neumann_values, wavenumber, rule; kwargs...,
+        )
+        pressures, solve_s, method = solve_exterior_direct_metal_system(system)
+        return pressures, assembly_s, solve_s, method
+    finally
+        system === nothing || release_metal_burton_miller_system!(system)
+    end
+end
+
 function solve_exterior_request(request, system, unbounded_region; event_mode=false)
     meshes = system["meshes"]
     boundaries = system["boundaries"]
@@ -780,7 +823,14 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
         "Exterior burton_miller_assembly must be direct_system or operator_matrices.",
     )
     direct_cuda_assembly = backend == :cuda && requested_assembly == "direct_system"
-    assembly_mode = direct_cuda_assembly ? "direct_system" : "operator_matrices"
+    # Metal's direct assembler is the fused Burton-Miller path: A and every
+    # excitation's b are formed on the GPU without the four operators, and the
+    # host factorizes once. It exists only for the native singular and
+    # pair-gather regular kernels; the diagnostic kernel modes keep the
+    # four-operator path, and the effective mode is reported either way.
+    direct_metal_assembly = backend == :metal && requested_assembly == "direct_system" &&
+        metal_direct_assembly_available()
+    assembly_mode = direct_cuda_assembly || direct_metal_assembly ? "direct_system" : "operator_matrices"
     symmetry_mode = BeatEngineCore.normalized_symmetry_mode(get(options, "symmetry", "off"))
     sound_speed = FloatType(unbounded_region["sound_speed_m_per_s"])
     density = FloatType(unbounded_region["density_kg_per_m3"])
@@ -870,6 +920,9 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     else
         nothing
     end
+    metal_fused_identity_cache = direct_metal_assembly ?
+                                 build_metal_fused_identity_cache(identity_p1_p1, identity_p1_dp0, FloatType) :
+                                 nothing
     cpu_blas_threads = backend == :cpu ?
                        configure_beat_cpu_blas_threads!(p1_space.global_dof_count) :
                        BLAS.get_num_threads()
@@ -885,8 +938,61 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     # the outer `finally` frees its device buffers when the solve, the field
     # evaluation, or result emission throws.
     current_operators = nothing
+    # Metal overlaps the next frequency's fused assembly with this one's host
+    # solve when the model says it pays, as the source-request driver does; see
+    # `metal_sweep_overlap_plan`. The producer builds exactly what the
+    # sequential branch below builds, from the same inputs.
+    frequencies_hz = request["frequencies_hz"]
+    metal_fused_kwargs = (
+        device_cache=device_cache,
+        singular_cache=singular_cache,
+        device_singular_cache=device_singular_cache,
+        identity_cache=metal_fused_identity_cache,
+        singular_order=singular_order,
+        symmetry_mode=symmetry_mode,
+    )
+    overlap_plan = direct_metal_assembly ? metal_sweep_overlap_plan(
+        p1_space.global_dof_count, length(excitations), symmetry_mode;
+        frequency_count=length(frequencies_hz),
+    ) : nothing
+    metal_pipeline = overlap_plan !== nothing && overlap_plan.enabled
+    produce_metal_system = function (index)
+        omega = FloatType(2pi) * FloatType(frequencies_hz[index])
+        wavenumber = omega / sound_speed
+        neumann_values = [exterior_neumann(mesh, excitation, density, omega) for excitation in excitations]
+        system, assembly_s = assemble_exterior_direct_metal(
+            mesh, p1_space, dp0_space, neumann_values, wavenumber, base_rule; metal_fused_kwargs...,
+        )
+        return (system=system, k=wavenumber, assembly_s=assembly_s)
+    end
+    release_produced_system = produced -> release_metal_burton_miller_system!(produced.system)
+    assembly_pipeline = nothing
+    assembly_lookahead = 0
+    # The pipelined system being solved, freed by the `finally` if the solve throws.
+    current_metal_system = nothing
+    # Metal sweeps leave the assembly producer a core. With BLAS on every
+    # performance core the overlapped solve slows by more than the assembly it
+    # hides (sample.msh, M1 Pro: 1.38 s overlapped against 1.33 s sequential,
+    # 1.21 s with a core given back). A sequential sweep solves on the same
+    # count, because LU rounds differently on a different number of threads and
+    # the overlap must not change the answer.
+    process_blas_threads = BLAS.get_num_threads()
+    sweep_blas_threads = direct_metal_assembly && Threads.nthreads() > 1 ?
+                         max(1, process_blas_threads - 1) : process_blas_threads
     try
-        for (frequency_index, raw_frequency) in enumerate(request["frequencies_hz"])
+        if sweep_blas_threads != process_blas_threads
+            BLAS.set_num_threads(sweep_blas_threads)
+            cpu_blas_threads = BLAS.get_num_threads()
+        end
+        if metal_pipeline
+            assembly_lookahead = metal_sweep_assembly_lookahead(
+                p1_space.global_dof_count, length(excitations), length(frequencies_hz), FloatType,
+            )
+            assembly_pipeline = start_sweep_assembly_pipeline(
+                produce_metal_system, length(frequencies_hz), assembly_lookahead, release_produced_system,
+            )
+        end
+        for (frequency_index, raw_frequency) in enumerate(frequencies_hz)
             cancel_requested() && return (cancelled=true, solved_count=solved_count)
             frequency_hz = FloatType(raw_frequency)
             omega = FloatType(2pi) * frequency_hz
@@ -922,6 +1028,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
             end : nothing
             neumann_values = [exterior_neumann(mesh, excitation, density, omega) for excitation in excitations]
             operators = nothing
+            metal_solve_method = :lu
             if direct_cuda_assembly
                 pressures, assembly_s, solve_s = solve_exterior_direct_cuda(
                     mesh, p1_space, dp0_space, neumann_values, wavenumber, rule;
@@ -930,6 +1037,21 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     device_singular_cache=device_singular_cache,
                     device_image_singular_cache=device_image_singular_cache,
                     symmetry_mode=symmetry_mode,
+                )
+            elseif direct_metal_assembly && metal_pipeline
+                produced = take_sweep_assembly!(assembly_pipeline, frequency_index)
+                current_metal_system = produced.system
+                produced.k == wavenumber || error(
+                    "BEAT exterior sweep pipeline assembled k=$(produced.k) for frequency index " *
+                    "$(frequency_index), which needs k=$(wavenumber).",
+                )
+                assembly_s = produced.assembly_s
+                pressures, solve_s, metal_solve_method = solve_exterior_direct_metal_system(current_metal_system)
+                release_metal_burton_miller_system!(current_metal_system)
+                current_metal_system = nothing
+            elseif direct_metal_assembly
+                pressures, assembly_s, solve_s, metal_solve_method = solve_exterior_direct_metal(
+                    mesh, p1_space, dp0_space, neumann_values, wavenumber, rule; metal_fused_kwargs...,
                 )
             else
                 assembly_started = time_ns()
@@ -1066,11 +1188,12 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 "symmetry" => String(symmetry_mode),
                 "formulation" => "exterior_burton_miller_neumann",
                 "burton_miller_assembly" => assembly_mode,
-                "factorization_count" => direct_cuda_assembly || backend in (:cpu, :metal) ? 1 : length(excitations),
+                "factorization_count" => metal_solve_method == :gmres ? 0 :
+                                         direct_cuda_assembly || backend in (:cpu, :metal) ? 1 : length(excitations),
                 "linear_solver" => backend == :cpu ?
                                    "cpu_dense_lu" :
                                    backend == :cuda ? "cuda_dense_lu" :
-                                   backend == :metal ? "metal_assembly_cpu_dense_lu" :
+                                   backend == :metal ? "metal_assembly_cpu_dense_" * String(metal_solve_method) :
                                    "rocm_rocsolver_dense_lu",
                 "bounded_region_count" => 0,
                 "interface_count" => 0,
@@ -1085,6 +1208,12 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     "cache_setup_s" => 0.0,
                 ),
             )
+            if overlap_plan !== nothing
+                diagnostics["metal_pipeline"] = metal_pipeline
+                diagnostics["metal_pipeline_reason"] = String(overlap_plan.reason)
+                diagnostics["metal_overlap_saving_model_s"] = overlap_plan.saving_model_s
+                diagnostics["sweep_assembly_lookahead"] = assembly_lookahead
+            end
             result = Dict(
                 "schema_version" => 2,
                 "freq_hz" => frequency_hz,
@@ -1100,6 +1229,14 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
             solved_count = frequency_index
         end
     finally
+        shutdown_sweep_assembly_pipeline!(assembly_pipeline, release_produced_system)
+        BLAS.get_num_threads() == process_blas_threads || BLAS.set_num_threads(process_blas_threads)
+        if current_metal_system !== nothing
+            try
+                release_metal_burton_miller_system!(current_metal_system)
+            catch
+            end
+        end
         if current_operators !== nothing
             try
                 release_operator_storage!(current_operators)
@@ -1124,6 +1261,8 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 release_metal_singular_correction_cache!(device_singular_cache)
             field_cache === cpu_field_cache || release_metal_field_evaluation_cache!(field_cache)
             device_cache === nothing || release_metal_regular_assembly_cache!(device_cache)
+            metal_fused_identity_cache === nothing ||
+                release_metal_fused_identity_cache!(metal_fused_identity_cache)
         end
     end
     return (cancelled=cancel_requested(), solved_count=solved_count)
@@ -2170,7 +2309,7 @@ end
 function solve_request(request; event_mode=false)
     convention = get(get(request, "solver_options", Dict()), "phasor_convention", NEGATIVE_TIME_PHASOR)
     convention == POSITIVE_TIME_PHASOR && get(get(request, "solver_options", Dict()), "bem_backend", "cpu") == "rocm" &&
-        error("Positive-time ROCm solves require hardware qualification; use CPU or CUDA.")
+        error("Positive-time ROCm solves require hardware qualification; use CPU, CUDA, or Metal.")
     return with_phasor_convention(convention) do
         solve_request_impl(request; event_mode=event_mode)
     end
@@ -3425,7 +3564,11 @@ end
 
 function worker_backend_availability()
     backends = Dict{String,Any}("cpu" => Dict("available" => true, "reason" => ""))
-    for (name, accelerator) in (("cuda", BeatEngineCore.CUDA_MODULE), ("rocm", BeatEngineCore.AMDGPU_MODULE))
+    for (name, accelerator) in (
+        ("cuda", BeatEngineCore.CUDA_MODULE),
+        ("rocm", BeatEngineCore.AMDGPU_MODULE),
+        ("metal", BeatEngineCore.METAL_MODULE),
+    )
         available, reason = try
             if accelerator === nothing
                 (false, "Package is not loaded in this Julia environment.")

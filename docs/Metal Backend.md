@@ -1,6 +1,7 @@
 # BEAT Engine Apple Metal
 
-BEAT Engine Apple Metal is Boundary Lab's local Apple Silicon GPU backend. It
+BEAT Engine Apple Metal is the engine's Apple Silicon GPU backend, used by
+Boundary Lab and by any other client of the worker. It
 uses the same mesh model, Burton-Miller formulation, symmetry rules, and result
 protocol as the other BEAT Engine backends while moving the dense BEM operator
 assembly and exterior-field evaluation to the GPU through Metal.jl.
@@ -15,8 +16,34 @@ The backend supports:
   points.
 
 Production solves use `Float32` and `ComplexF32`, which is also the only
-floating-point precision Apple GPUs provide. The shared boundary-integral
-formulation is the one used by the CPU and ROCm backends.
+floating-point precision Apple GPUs provide. Boundary Lab's [BEAT Engine
+Core](https://github.com/JWSound/boundary-lab/blob/main/docs/advanced/beat-engine-core.md)
+notes describe the shared boundary-integral formulation.
+
+## Compiled-system requests
+
+Select the backend with `solver_options.bem_backend = "metal"` in a
+compiled-system request; Boundary Lab exposes this as **BEAT Engine (Apple
+Metal)** (`beat_metal`). The worker advertises `metal` in its ready handshake
+when Metal.jl reports a functional device, with both phasor conventions: the
+kernels receive the signed outgoing wavenumber at host entry exactly as CUDA
+and ROCm do, and the fused Burton-Miller kernels combine the coupling with that
+same signed value. See [Phasor Convention](Phasor%20Convention.md).
+
+Exterior solves honour `burton_miller_assembly`. The default `direct_system`
+is the fused path described below, which forms the system on the GPU without
+the four operators and factorizes once on the host; `operator_matrices`
+assembles the four operators and combines them on the host, and the diagnostic
+kernel modes (`host_staged` assembly, the `host` singular mode, the reference
+regular kernels) fall back to it. Diagnostics report the effective mode and a
+`linear_solver` of `metal_assembly_cpu_dense_lu` or `metal_assembly_cpu_dense_gmres`.
+The `BLAB_BEAT_FUSED_BM` variable below governs the source-request driver only.
+
+Coupled solves keep `coupled_bem_assembly = operators`. The combined A/C
+assembly is a CUDA device-block path; Metal assembles the four operators on the
+GPU and runs the coupled algebra and the FEM static condensation on the host
+through `metal_host_operators`, so requesting `combined` on Metal fails clearly.
+See [Coupled CUDA Assembly](Coupled%20CUDA%20Assembly.md).
 
 ## Execution model
 
@@ -26,8 +53,8 @@ coupled FEM-BEM-LEM solves, the `host_staged` assembly fallback and the `host`
 singular mode use, and `BLAB_BEAT_FUSED_BM=0` selects it for exterior solves
 too.
 
-Boundary Lab prepares mesh topology, quadrature rules, symmetry transforms, and
-frequency-independent cache data on the CPU. The Metal worker then:
+The worker prepares mesh topology, quadrature rules, symmetry transforms, and
+frequency-independent cache data on the CPU. The Metal path then:
 
 1. allocates the single-layer, double-layer, adjoint double-layer, and
    hypersingular matrices as `MtlArray` objects;
@@ -163,8 +190,29 @@ read from cached device arrays rather than hoisted into registers.
 The singular corrections use one fused Duffy kernel per (pair, part) that
 evaluates the Green's function once per point pair for all four operators;
 a pair's rule (512 to 1536 point pairs at singular order 4) is split into
-`BLAB_METAL_SINGULAR_PARTS` contiguous ranges and a scatter kernel sums the
-parts with atomics (about 48 per pair, negligible).
+`BLAB_METAL_SINGULAR_PARTS` contiguous ranges. A second kernel then sums the
+parts and adds them to the operators. By default that is a gather: one thread
+owns one dense-matrix cell and reads the list of block values belonging to it
+from a map built on the host once per mesh, so no two threads share a cell and
+the summation order is fixed. `BLAB_METAL_SINGULAR_WRITEBACK=scatter` selects
+the older write-back instead, one thread per pair adding about 48 atomics, which
+is not reproducible.
+
+The map is built by one host pass and cached on the singular correction cache.
+That cache lives as long as the request that built it: the exterior driver
+builds its caches per request, so every sweep pays for the map once, in its
+first frequency. On an M1 Pro the whole build (host pass, sort, upload) takes
+16 ms at `sample.msh` (2,776 faces, 37,198 singular pairs) and 38 ms at
+`sample_detailed.msh` (7,000 faces, 93,740 pairs), with 3.0 and 7.7 MB of device
+memory. It took 195 and 489 ms until the host pass was moved behind a function
+barrier: the cache fields it indexes are untyped, so every index was a dynamic
+dispatch. In exchange the four-operator write-back drops from 2,249,760 atomic
+adds to 311,964 plain ones at the larger mesh, because a corrected cell is
+written once instead of once per pair that touches it (3.2 pairs per cell for
+the single layer and adjoint, 12.2 for the double layer and hypersingular).
+
+Per frequency, the two write-backs are within a few percent of each other and
+the singular stage is under a tenth of assembly, so this is not a speed change.
 
 On an M1 Max at 5,041 P1 dofs (10,078 faces), quadrature order 4, singular
 order 4, one frequency: `pair_gather` assembles in about 1.06 s (pair
@@ -175,37 +223,52 @@ tolerances. hornlab-metal-bem's P1 Galerkin kernel, which
 assembles one operator with 18 atomics per pair, takes 0.42 s on the same
 mesh.
 
-A frequency sweep overlaps the GPU assembly of frequency i+1 with the CPU
-factorization of frequency i on a second Julia thread; two operator sets are
-then resident at once.
+A frequency sweep can overlap the GPU assembly of frequency i+1 with the CPU
+solve of frequency i on a second Julia thread, holding two systems at once.
+Both exterior entry points do it: the source-request driver, and compiled
+exterior-only requests, which is how Boundary Lab's GUI solves exterior
+projects. Coupled solves overlap within a frequency instead; see
+[Stage overlap](#stage-overlap).
 
-The overlap is not free, and it does not always pay. What it buys is the CPU
-solve it hides, which grows as O(N^3) against the assembly's O(N^2). What it
-costs is GPU-side: one assembly already saturates the device, so dispatching
-the next one from a spawned task while this frequency's field evaluation is
-still running does not find idle silicon, it interleaves two command queues
-over the same units. Below a mesh size that costs more than the hidden solve is
-worth, so the sweep decides per solve, from the dof count: see
-`METAL_PIPELINE_MIN_DOFS` in `BeatEngineDriver.jl`.
+`metal_sweep_overlap_plan` in `BeatEngineSweepOverlap.jl` decides per solve,
+from a cost model rather than a mesh size. Per frequency a sequential sweep
+costs A + S + F (GPU assembly, CPU solve, GPU field); overlapped it costs
+F + max(A + c, (1 + kappa) S), where c is the time the assembly loses beside
+the solve and kappa the fraction the solve slows beside the assembly. The sweep
+overlaps when the saving, min(S - c, A - kappa S), is positive. S comes from the
+dense-solve cost model below and A = a N^2 + b per symmetry copy. a, b, c and
+kappa are machine constants: the defaults are an M1 Pro's, each has an
+environment override, and `scripts/calibrate_metal_sweep_overlap.jl` measures
+them through the pipeline itself. Like the dense-solve calibration, it is run by
+hand.
 
-Per frequency on the 1,209-dof quarter, overlapping slows the assembly by 30 ms
-and the field evaluation by 105 ms, and costs the CPU solve a further 10 ms for
-the core the spawned task takes; the same GPU work measures 2.82 s sequentially
-against 5.53 s split across two tasks. On the 4,552-dof full model the GPU work
-goes 8.11 s to 10.11 s, which the larger CPU solve more than pays for.
+On the compiled path a Metal sweep leaves the assembly producer a core: BLAS
+runs one thread below the process default. With BLAS on every performance core
+the overlapped solve slowed by more than the assembly it hid. Sequential sweeps
+use the same count, because LU rounds differently on a different number of
+threads and the overlap must not change the answer;
+`validate_metal_exterior_pipeline.jl` gates that it does not. The source-request
+driver keeps its BLAS on the Julia thread count.
 
-**It is not the command-queue construction, despite the obvious suspicion.**
-Metal.jl keeps its queue in task-local storage, so a spawned task does build its
-own each frequency, but measured directly that is a fixed 0.23-0.29 ms per task
-and does not grow with the number of kernels the task dispatches -- two orders
-of magnitude below the penalty above. A persistent assembly task holding one
-queue would therefore recover almost none of it. This is the same result the
-cross-frequency concurrency probes reached from the other direction: concurrent
-assemblies measure slower than sequential ones because one assembly is already
-enough to fill the GPU.
+Compiled exterior requests on an M1 Pro, 4 Julia threads, 12 frequencies from
+20 Hz to 20 kHz, first sweep / later sweeps. Before is sequential with BLAS on
+all 8 performance cores.
 
-Measured on an M1 Max, 20 frequencies from 100 Hz to 20 kHz, minimum of four
-interleaved rounds, as the ratio of sequential to pipelined wall clock:
+| mesh | P1 dofs | symmetry | before | now | model's choice |
+|---|---:|---|---:|---:|---|
+| `sample.msh` | 1,390 | off | 1.72 / 1.33 s | 1.45 / 1.17 s | overlap |
+| `sample_detailed.msh` | 3,502 | off | 7.94 / 7.61 s | 5.75 / 5.41 s | overlap |
+| `sample_half.msh` | 854 | `x` | | 1.50 / 0.76 s | overlap, +0.8 ms a frequency (sequential: 1.54 / 0.82 s) |
+| `sample_quarter.msh` | 441 | `xy` | | 1.19 / 0.53 s | sequential, -2.4 ms (overlapped: 1.18 / 0.51 s) |
+
+Where the model calls the choice marginal, the two measure within noise of each
+other. The cost is memory: the lookahead holds up to four systems, 530 MB more
+at peak on `sample_detailed.msh`, and `sweep_pipeline_depth` caps it by what the
+device has free.
+
+This replaces a fixed threshold of 1,900 dofs, fitted on an M1 Max through the
+source-request driver, 20 frequencies from 100 Hz to 20 kHz, as sequential over
+overlapped wall clock:
 
 | mesh | P1 dofs | symmetry | pipelining |
 |---|---:|---|---:|
@@ -217,22 +280,121 @@ interleaved rounds, as the ratio of sequential to pipelined wall clock:
 | `asro68` quarter, subdivided | 4,692 | `xy` | 1.11x |
 | ATH ladder A5 | 5,107 | off | 1.30x |
 
-The crossover was then pinned with six spheres filling the gap the waveguide
-ladder leaves, in a second run of five rounds: 1,202 dofs 0.82x, 1,514 0.97x,
-1,742 0.96x, 1,986 1.13x, 2,382 1.22x, 3,122 1.19x. The two families agree
-where they overlap -- the 1,986-dof sphere's 1.13x against the 1,974-dof
-waveguide's 1.13x -- so the crossover is between 1,742 and 1,986 dofs and the
-default sits at 1,900.
+and six spheres: 1,202 dofs 0.82x, 1,514 0.97x, 1,742 0.96x, 1,986 1.13x,
+2,382 1.22x, 3,122 1.19x. On the M1 Pro the same threshold kept `sample.msh`
+sequential, where overlapping it is 12-15% faster. The two machines disagree
+below 2,000 dofs, which is the case for calibrating rather than moving the
+constant; an M1 Max should run the calibration script.
 
-Two things that table is evidence for. The threshold can be expressed in dofs
-alone: the subdivided quarter wins at 4,692 dofs with two mirror planes, so a
-symmetry mode that quadruples the assembly does not move the sign, and the rule
-needs to know nothing about images. And the constant is a machine constant, not
-a physical one -- a GPU with a cheaper queue rebuild, or a slower dense solve,
-puts it somewhere else.
+`BLAB_METAL_PIPELINE` forces the choice either way, and each frequency reports
+`metal_pipeline`, `metal_pipeline_reason` and `metal_overlap_saving_model_s`.
 
-`BLAB_METAL_PIPELINE` overrides it in both directions, and each frequency's
-`metal_pipeline` diagnostic reports which way the choice went.
+## FEM static condensation
+
+Coupled solves reduce the FEM interior onto the retained interface before
+factoring. `beat_metal` is in both `PHYSICAL_SYSTEM_BACKEND_IDS` and
+`CONDENSING_BACKEND_IDS`, so `system_solve.py` requests
+`static_condensation: true` and this is the default path.
+
+Metal has no GPU LU, so the driver routes a condensing Metal solve the same
+way it routes `beat_cpu`: `coupled_solver.jl` selects the condensed solver for
+`:cpu` and `:metal` alike, and `build_condensed_coupled_system` in
+`BeatEngineCoupledCondensed.jl` does the work. The only Metal-specific step is
+the BEM operators, which are assembled on the GPU and handed back as host
+matrices through `metal_host_operators`. The partition, the interior UMFPACK
+factorization and the blocked Schur complement are the shared
+`_blocked_umfpack_schur_complement` in `BeatEngineCoupled.jl`. Diagnostics
+report `fem_condensation_backend: cpu_umfpack` and
+`linear_solver: cpu_umfpack_schur_plus_dense_lu`, exactly as `beat_cpu` does.
+
+### Why condensation is on by default
+
+Measured on the curved-interface production fixture -- 19,492 FEM vertices,
+94,265 tetrahedra, 5,103 BEM triangles, 1,318 retained interface vertices -- at
+1 kHz, `q2/s2`, on an M1 Pro with eight Julia threads. The measurement predates
+the merge and ran on the archived host condensation (see below), but that path
+used the same UMFPACK Schur complement the condensed solver runs today, so the
+ratio carries over:
+
+| | Monolithic | Condensed | Ratio |
+| --- | ---: | ---: | ---: |
+| System order | 23,433 | 5,259 | 4.5x smaller |
+| Build | 96.689 s | 6.305 s | 15.3x |
+| Solve | 2.799 s | 2.185 s | 1.28x |
+| **Total** | **99.489 s** | **8.490 s** | **11.7x** |
+
+The build gap is the dense coupled matrix: 23,433 squared in `ComplexF32` is
+4.4 GB and its LU dominates everything else, against 221 MB condensed.
+Agreement between the two formulations is 1.3e-4 on FEM pressure, 1.8e-4 on BEM
+pressure, and 1.7e-4 on interface flux -- inside the 5e-4 Float32 gate used
+across the coupled validations.
+
+### Stage overlap
+
+Within a frequency the FEM condensation and the BEM operator assembly are
+independent: the condensation reads `fem_system`, the interface operators and
+the retained vertex list, none of which the BEM assembly touches. On Metal they
+also run on different processors -- the condensation is host UMFPACK, the
+assembly is on the GPU -- so `build_condensed_coupled_system` spawns the
+condensation on a Julia thread before it starts the BEM assembly and collects it
+afterwards. On `beat_cpu` both stages are host code competing for the same
+cores, so the overlap is off there by default.
+
+Measured through `blab project solve`, `xy` symmetry, eight Julia threads, M1
+Pro, warm mean of three frequencies, `BLAB_COUPLED_STAGE_OVERLAP=off` against
+the default:
+
+| Fixture | Condensed order | `bem_operator_s` | `assembly_s`, sequential | `assembly_s`, overlapped | Saved |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `S218BP` (40-100 Hz) | 2,151 / 19,379 | 0.19-0.22 s | 0.911 s | **0.719 s** | 0.19 s, 21% |
+| `F2B_FLH` (100-200 Hz) | 3,081 / 24,410 | 0.27-0.31 s | 1.552 s | **1.366 s** | 0.19 s, 12% |
+
+Outputs are bit-identical with the overlap on and off: the algebra is
+unchanged, only the schedule. The saving is bounded by the shorter of the two
+stages, which on these fixtures is the GPU assembly at about 0.2-0.3 s; it grows
+with the BEM mesh. `beat_cpu` on the same fixtures: 1.362 s and 2.251 s.
+
+When the stages overlap, `fem_condensation_s` is measured from before the BEM
+assembly starts, so it spans the concurrent region and must not be added to
+`bem_operator_s`; `stage_overlap` in the system timings says which reading
+applies.
+
+### Schur block balance
+
+The Schur complement hands right-hand-side blocks to worker tasks round-robin,
+and every block costs about the same, so the stage's wall time is set by the
+*most* blocks any one task gets. `_resolved_schur_block_size` therefore rounds
+the block *count* up to a whole multiple of the thread count and derives the
+width from that, rather than capping the width alone: on `F2B_FLH` a
+1,102-column interface at a 64 cap gave 18 blocks over 8 threads, so two tasks
+took three blocks while six took two and idled, and the stage ran 33% longer
+than its work required. The width used is reported as `fem_schur_block_size`
+(26 on `S218BP` with eight threads). `BLAB_SCHUR_BLOCK` pins the width for
+measurement.
+
+### Interior solver: UMFPACK, and the Accelerate path that was removed
+
+The condensation factors the FEM interior and then solves it against roughly one
+right-hand side per retained interface node; nearly all of the stage is those
+triangular solves. The pre-merge Metal branch carried its own condensation
+inside `build_coupled_system` with a `ccall` binding to Apple Accelerate's
+sparse LU as an optional interior solver (`BLAB_METAL_FEM_CONDENSATION=accelerate`).
+Both are gone from this tree. Tag `archive/metal-host-condensation` is the last
+commit that carries them, and [Options: speeding up FEM static condensation on
+Apple Metal](Metal%20FEM%20Condensation%20Options.md) records the full
+argument.
+
+Why: the host condensation duplicated what the condensed solver already does
+and was never on the production Metal route, and Accelerate in `ComplexF32`
+fails the accuracy standard. On `F2B_FLH` it was 1.87x faster on the
+condensation stage but 3.2e-3 relative norm from the UMFPACK result, over the
+5e-4 gate. Re-measured on the production route on `S218BP` before removal, it
+was 23% faster per frequency and **1.1e-2 to 4.0e-2** relative error against
+`beat_cpu` on diaphragm velocity, voice-coil current and probe pressures, where
+UMFPACK is at 1.4e-5. The speed was the precision drop, not a better solver:
+Accelerate in `ComplexF64` matched UMFPACK on both counts. Overlapping the
+condensation with the GPU assembly recovers most of what it offered without
+touching the numerics.
 
 ## Requirements
 
@@ -241,6 +403,13 @@ puts it somewhere else.
 - The dedicated `src/beat_engine/julia_metal` environment with Metal.jl.
 
 To prepare the Julia environment from the repository root:
+
+```bash
+python -m beat_engine instantiate --backend metal
+python -m beat_engine doctor --backend metal --threads 2
+```
+
+or directly with Julia:
 
 ```bash
 julia --project=src/beat_engine/julia_metal -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
@@ -254,9 +423,11 @@ julia --project=src/beat_engine/julia_metal -e 'using Metal; Metal.functional() 
 
 ## Selecting the backend
 
-In application preferences, select **BEAT Engine (Apple Metal)**. The backend
-identifier used by project and server workflows is `beat_metal`. The entry
-is only offered on Apple Silicon macOS.
+A compiled-system request selects Metal with `solver_options.bem_backend =
+"metal"`, and a source request with `config.beat_backend = "metal"`; the worker
+must run with the `julia_metal` project (`engine_paths("metal")`). Boundary Lab
+exposes this in application preferences as **BEAT Engine (Apple Metal)**, backend
+identifier `beat_metal`, and only offers it on Apple Silicon macOS.
 
 ## Runtime controls
 
@@ -272,13 +443,22 @@ Normal application use does not require these environment variables.
 | `BLAB_METAL_GATHER_BUDGET_MB` | `512` | Device memory for the pair-block buffer; sets the trial chunk size of `pair_gather`. `BLAB_METAL_GATHER_CHUNK` overrides the chunk size directly. |
 | `BLAB_METAL_GATHER_TIMING` | `0` | Set to `1` to synchronize after each `pair_gather` stage and report `metal_native_gather_*` timings (slower). |
 | `BLAB_METAL_SINGULAR_PARTS` | `4` | Ranges each singular pair's Duffy rule is split into across threads. |
+| `BLAB_METAL_SINGULAR_WRITEBACK` | `gather` | How the singular blocks reach the operators. `gather` owns one dense cell per thread and is reproducible; `scatter` is the older one-thread-per-pair atomic write-back, kept for comparison. |
 | `BLAB_METAL_OPERATOR_STORAGE` | `shared` | Use `private` to allocate the operator matrices in private storage and copy them to the host, the pre-2026-09-02 behavior. |
-| `BLAB_METAL_PIPELINE` | by dof count | Overlaps the next frequency's GPU assembly with this frequency's CPU factorization. Unset, the sweep decides per solve from the mesh size (`METAL_PIPELINE_MIN_DOFS`); `0` forces sequential, anything else forces the overlap. |
+| `BLAB_METAL_PIPELINE` | by cost model | Overlaps the next frequency's GPU assembly with this frequency's CPU solve. Unset, `metal_sweep_overlap_plan` decides per solve; `0` forces sequential, anything else forces the overlap. |
+| `BLAB_METAL_PIPELINE_DEPTH` | by memory | Frequencies the assembly may run ahead of the solve, for measurement. |
+| `BLAB_METAL_ASSEMBLY_DOF2_SECONDS` | `2.77e-8` | Overlap cost-model constants, calibrated on an Apple M1 Pro: fused assembly seconds per squared dof per symmetry copy, its fixed part, what the assembly loses beside the solve, and the fraction the solve slows beside the assembly. Re-measure with `scripts/calibrate_metal_sweep_overlap.jl` on any other machine. |
+| `BLAB_METAL_ASSEMBLY_FIXED_SECONDS` | `0.016` | |
+| `BLAB_METAL_OVERLAP_COST_SECONDS` | `0.003` | |
+| `BLAB_METAL_OVERLAP_HOST_SLOWDOWN` | `0.1` | |
 | `BLAB_METAL_ATOMIC_SCATTER` | `1` | Diagnostic for `pair_atomic` only: `0` skips the atomic scatter to time the pair arithmetic (the operators are then wrong). |
+| `BLAB_COUPLED_STAGE_OVERLAP` | `auto` | Coupled solves: `auto` runs the FEM condensation on its own thread while the GPU assembles the BEM operators; `off` runs them in sequence; `on` forces the overlap on `beat_cpu` too. Needs more than one Julia thread. |
+| `BLAB_SCHUR_BLOCK` | unset | Coupled solves: pins the Schur complement right-hand-side block width, bypassing the thread-count balancing. For measurement only. |
 | `BLAB_BEAT_FUSED_BM` | `1` | Set to `0` to assemble the four operators and combine them on the host for exterior solves. Coupled solves, `host_staged` assembly and the `host` singular mode always take the four-operator path. |
 
-The fused system is then solved by the shared adaptive dense solve — dense LU
-or diagonally preconditioned GMRES, chosen per solve. Metal has no GPU LU, so
+The fused system is then solved by the adaptive dense solve described at the
+head of [`BeatEngineDenseSolve.jl`](../src/beat_engine/julia_local/src/BeatEngineDenseSolve.jl) — dense LU or
+diagonally preconditioned GMRES, chosen per solve. Metal has no GPU LU, so
 both routes run on the host; shared storage means the host reads the assembled
 matrix in place rather than copying it. Its environment overrides:
 
@@ -310,6 +490,8 @@ CPU-versus-Metal validation scripts:
 | `validate_metal_exterior.jl` | Operators (both singular modes), boundary pressure, residual, and exterior field for an exterior solve. |
 | `validate_metal_symmetry.jl` | X and XY reduced-domain assembly and solve parity, both singular modes. |
 | `validate_metal_coupled.jl` | Coupled FEM-BEM-LEM assembly, condensation, solution, and field for the monolithic and condensed paths, prescribed-velocity and voltage excitations. |
+| `validate_metal_sweep_pipeline.jl` | The sweep assembly pipeline at depths 1-4: steps delivered in order with their own frequency, and pipelined assemblies against sequential ones. |
+| `validate_metal_exterior_pipeline.jl` | A compiled exterior request solved sequentially and overlapped at depths 1-4 through the worker: every output bit-identical and labelled with its own frequency. `BLAB_VALIDATE_SYMMETRY` picks the arm. |
 
 For example:
 
@@ -332,26 +514,85 @@ CPU-versus-Metal differences exceed their tolerances.
 - The default `pair_gather` kernels are bitwise reproducible run to run, as
   are `pair_owned` and `entry_owned`. `pair_atomic` is not (atomic
   accumulation order); its differences are float32 summation noise.
+- That holds for the singular stage as well, but only since the deterministic
+  write-back landed. Before it, every mode routed its singular corrections
+  through an atomic scatter, so nothing was actually reproducible.
+  `BLAB_METAL_SINGULAR_WRITEBACK=scatter` restores the old behavior for
+  comparison.
 - Assembly being reproducible does not make a sweep reproducible: the CPU LU
   is multithreaded, and two runs of the same solve differ by about 3e-7
   relative in the exterior field. Golden-file comparisons belong on the CPU
   `reference` path, tolerance comparisons everywhere else.
 
-## Known issue: the fused Burton-Miller gate at symmetry `xy`
+## Resolved: the fused Burton-Miller gate at symmetry `xy`
 
-`validate_metal_fused_burton_miller.jl` run with `BLAB_VALIDATE_SYMMETRY=xy` on
-the bundled `sample.msh` fails `pressure_relative_error` at about 1e-5 against
-the script's 5e-6 tolerance, and it fails **non-deterministically**: three runs
-of the same tree spread over 2x (1.27e-5 to 2.29e-5) while their `lhs` and
-`rhs` errors match to three digits at 1e-7.
+`validate_metal_fused_burton_miller.jl` used to fail its `xy` arm, and `xy` was
+kept out of the default arm list because of it. It passes now, on all four arms,
+and the cause was the test fixture rather than any assembly code.
 
-So it is not an operator defect. The operators agree; the LU of the
-symmetry-reduced matrix at that fixture amplifies the atomic-accumulation
-non-determinism of the singular scatter (`BLAB_METAL_SINGULAR_MODE=host`
-removes the atomics) into the pressure. It reproduces on a tree with no local
-changes and predates the singular fusion.
+**A symmetry-reduced assembly needs a mesh that is one sector.** It folds mirror
+images onto that sector. Hand it a mesh that already spans both sides of the
+mirror plane and every contribution is counted twice, leaving an operator that is
+close to singular. `sample.msh` spans x in [-0.198, 0.199] and y in
+[-0.126, 0.127], so it is a valid fundamental domain for `off` and `ground` only.
+The tell was that `snap_symmetry_planes` did nothing to it: identical faces,
+vertices and triangle aspect ratios on all four arms, because there was nothing
+to snap.
 
-`xy` is therefore not in the script's default arm list, and closing it means
-either a better-conditioned `xy` fixture or a deterministic singular scatter —
-not a wider tolerance. `off`, `x` and `ground` all pass, and the `xy` arm is
-still one `BLAB_VALIDATE_SYMMETRY=xy` away for anyone working on it.
+Condition number of the Burton-Miller left-hand side, 2 kHz, Apple M1 Pro:
+
+| arm | mesh | kappa (cpu) | kappa (metal) | backends agree? |
+|---|---|---|---|---|
+| `off` | `sample.msh` | 4.44e+02 | 4.44e+02 | yes, to 4.2e-6 |
+| `x` | `sample.msh` | 1.81e+07 | 2.43e+04 | **no, 100% apart** |
+| `xy` | `sample.msh` | 1.33e+09 | 5.52e+04 | **no, 100% apart** |
+| `x` | `sample_half.msh` | 5.29e+02 | 5.29e+02 | yes, to 4.2e-6 |
+| `xy` | `sample_quarter.msh` | 5.23e+02 | 5.23e+02 | yes, to 4.1e-6 |
+
+On the correct mesh every arm is well conditioned and the two backends agree.
+The fold itself is sound. On the wrong mesh both backends produce garbage, and
+different garbage, which is why the CPU and Metal columns diverge completely.
+
+The script now picks the fundamental domain per arm — `sample.msh` for `off` and
+`ground`, `sample_half.msh` for `x`, `sample_quarter.msh` for `xy` — and calls
+`validate_symmetry_fundamental_domain!` after snapping, the same check the
+drivers and every other symmetry script already ran. An invalid combination now
+stops with a named vertex instead of returning a plausible-looking error:
+
+```
+ERROR: Mesh is not in the positive X fundamental domain for XY symmetry.
+       Vertex 41 has x=-0.0098830005 m.
+```
+
+Results after the fix, M1 Pro, tolerance 5e-6:
+
+| arm | mesh | lhs | rhs | pressure |
+|---|---|---|---|---|
+| `off` | `sample.msh` | 2.5e-7 | 5.4e-7 | 6.393e-7 |
+| `x` | `sample_half.msh` | 2.532e-7 | 3.439e-7 | 6.170e-7 |
+| `xy` | `sample_quarter.msh` | 2.559e-7 | 3.275e-7 | **5.397e-7** |
+| `ground` | `sample.msh` | 1.6e-7 | 1.0e-6 | 2.839e-6 |
+
+Against 1.6459548e-5 for `xy` on `sample.msh`. All four arms are in the default
+list now.
+
+### What this cost, and the note that misdirected it
+
+An earlier version of this section blamed the atomic singular scatter and offered
+two candidate fixes: a better-conditioned `xy` fixture, **or** a deterministic
+scatter. The first was right. The second was not, and it was the one that got
+built first.
+
+The deterministic write-back was worth having on its own merits and is now the
+default (see the singular write-back section above). It removed the run-to-run
+spread completely. It did not move the arm:
+
+| write-back | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| `scatter` (atomics) | 2.3376e-5 | 1.7533e-5 | 2.1780e-5 |
+| `gather` (deterministic) | 1.6459548e-5 | 1.6459548e-5 | 1.6459548e-5 |
+
+The atomics were adding about plus or minus thirty percent of noise on top of a
+real error near 1.6e-5, which was already three times the tolerance. The noise
+was the visible symptom; the invalid fixture was the cause. A diagnosis that
+explains only the variance and not the magnitude is not finished.

@@ -13,7 +13,7 @@ class EnginePaths:
 
 
 def engine_paths(backend: str = "cpu") -> EnginePaths:
-    if backend not in {"cpu", "cuda", "rocm"}:
+    if backend not in {"cpu", "cuda", "rocm", "metal"}:
         raise ValueError(f"Unsupported BEAT backend: {backend}")
     root = Path(__file__).resolve().parent
     project = root / ("julia_local" if backend == "cpu" else f"julia_{backend}")

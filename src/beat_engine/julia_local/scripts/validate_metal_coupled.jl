@@ -12,7 +12,12 @@ using .BeatEngineCoupledCondensed
 
 using LinearAlgebra, Printf, SparseArrays, StaticArrays
 
-const FIXTURE_ROOT = normpath(joinpath(@__DIR__, "..", "tests", "fixtures"))
+# The packaged engine ships the coupled fixtures under julia_local/tests;
+# a Boundary Lab checkout also has them under its own tests/fixtures.
+const FIXTURE_ROOT = let packaged = normpath(joinpath(@__DIR__, "..", "tests", "fixtures"))
+    isfile(joinpath(packaged, "femvolume.msh")) ? packaged :
+        normpath(joinpath(@__DIR__, "..", "..", "..", "..", "..", "tests", "fixtures"))
+end
 
 function relative_error(reference, candidate)
     scale = norm(reference)

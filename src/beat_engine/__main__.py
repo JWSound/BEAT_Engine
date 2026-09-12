@@ -11,7 +11,7 @@ from . import EngineWorker, engine_paths
 def main() -> None:
     parser = argparse.ArgumentParser(prog="beat-engine")
     parser.add_argument("command", choices=("paths", "instantiate", "doctor"))
-    parser.add_argument("--backend", choices=("cpu", "cuda", "rocm"), default="cpu")
+    parser.add_argument("--backend", choices=("cpu", "cuda", "rocm", "metal"), default="cpu")
     parser.add_argument("--julia", default="julia")
     parser.add_argument("--threads", default="auto")
     args = parser.parse_args()

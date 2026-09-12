@@ -6,10 +6,12 @@ using Test, StaticArrays, LinearAlgebra
 ENV["BLAB_RUN_COUPLED_REFERENCE"] = "1"
 ENV["BLAB_RUN_COUPLED_CUDA"] = "0"
 ENV["BLAB_RUN_COUPLED_ROCM"] = "0"
+ENV["BLAB_RUN_COUPLED_METAL"] = "0"
 ENV["BLAB_COUPLED_QUADRATURE_ORDER"] = "1"
 ENV["BLAB_COUPLED_SINGULAR_ORDER"] = "1"
 cuda_available() = false
 rocm_available() = false
+metal_available() = false
 
 include(joinpath(@__DIR__, "fixture_integrity_tests.jl"))
 include(joinpath(@__DIR__, "..", "src", "BeatEngineCore.jl"))
