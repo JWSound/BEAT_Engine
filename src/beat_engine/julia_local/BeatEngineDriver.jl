@@ -26,6 +26,12 @@ function emit_event(event_type::String; kwargs...)
     for (key, value) in kwargs
         payload[String(key)] = value
     end
+    payload["phasor_convention"] = phasor_convention()
+    if event_type == "ready"
+        payload["phasor_conventions"] = [NEGATIVE_TIME_PHASOR, POSITIVE_TIME_PHASOR]
+    elseif event_type == "result" && haskey(payload, "result")
+        get!(payload["result"], "diagnostics", Dict{String,Any}())["phasor_convention"] = phasor_convention()
+    end
     println(JSON.json(payload))
     flush(stdout)
 end
@@ -759,6 +765,15 @@ end
 include(joinpath(@__DIR__, "deploy_solver.jl"))
 
 function solve_request(request)
+    convention = get_value(request, "phasor_convention", get_value(get_value(request, "config", Dict()), "phasor_convention", NEGATIVE_TIME_PHASOR))
+    convention == POSITIVE_TIME_PHASOR && beat_backend_from_request(request) == :rocm &&
+        error("Positive-time ROCm solves require hardware qualification; use CPU, CUDA, or Metal.")
+    return with_phasor_convention(convention) do
+        solve_request_with_convention(request)
+    end
+end
+
+function solve_request_with_convention(request)
     try
         schema = String(get_value(request, "schema", ""))
         if schema in ("boundary_lab_deploy_solve", "boundary_lab_deploy_rom")
