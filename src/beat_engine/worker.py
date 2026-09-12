@@ -38,6 +38,9 @@ class WorkerProcess:
         self.environment["JULIA_NUM_THREADS"] = resolve_julia_threads(julia_threads)
         self.backend_label = backend_label
         self._lock = threading.Lock()
+        self._available = threading.Condition(self._lock)
+        self._active_submission: _SubmissionToken | None = None
+        self._terminating = False
         self._process: subprocess.Popen[str] | None = None
         self._stderr_lines: list[str] = []
         self._stderr_thread: threading.Thread | None = None
@@ -65,31 +68,30 @@ class WorkerProcess:
         status_callback: Callable[[str], None] | None = None,
         operation: str = "solve",
     ) -> Iterator[dict]:
-        self._lock.acquire()
-        self._status_callback = status_callback
-        try:
-            self._ensure_started()
-            command = self._prepare_submission(request_path, operation)
-            process = self._process
-            if process is None or process.stdin is None:
-                raise RuntimeError("Warm BEAT Engine solver did not provide stdin.")
-            self._emit_status("Submitting solve request" if operation == "solve" else "Submitting field request")
-            process.stdin.write(
-                json.dumps(
-                    command,
-                    separators=(",", ":"),
-                )
-                + "\n"
-            )
-            process.stdin.flush()
-            return self._iter_events_for_submission()
-        except Exception:
-            self._status_callback = None
-            self._lock.release()
-            raise
+        with self._available:
+            while self._active_submission is not None or self._terminating:
+                self._available.wait()
+            self._status_callback = status_callback
+            try:
+                self._ensure_started()
+                command = self._prepare_submission(request_path, operation)
+                process = self._process
+                if process is None or process.stdin is None:
+                    raise RuntimeError("Warm BEAT Engine solver did not provide stdin.")
+                self._emit_status("Submitting solve request" if operation == "solve" else "Submitting field request")
+                process.stdin.write(json.dumps(command, separators=(",", ":")) + "\n")
+                process.stdin.flush()
+                token = _SubmissionToken()
+                self._active_submission = token
+                return _SubmissionEvents(self, process, token)
+            except Exception:
+                self._status_callback = None
+                raise
 
     def ensure_started(self, *, status_callback: Callable[[str], None] | None = None) -> None:
-        with self._lock:
+        with self._available:
+            while self._active_submission is not None or self._terminating:
+                self._available.wait()
             previous_callback = self._status_callback
             self._status_callback = status_callback
             try:
@@ -98,23 +100,47 @@ class WorkerProcess:
                 self._status_callback = previous_callback
 
     def terminate(self) -> None:
-        self._discard_process()
-        if self._lock.locked():
-            try:
-                self._lock.release()
-            except RuntimeError:
-                pass
+        with self._available:
+            while self._terminating:
+                self._available.wait()
+            self._terminating = True
+            token = self._active_submission
+            if token is not None:
+                token.invalidated = True
+            self._active_submission = None
+            self._status_callback = None
+            process = self._detach_process()
+            self._available.notify_all()
+        try:
+            self._stop_process(process)
+        finally:
+            with self._available:
+                self._terminating = False
+                self._available.notify_all()
 
     def _discard_process(self) -> None:
+        self._stop_process(self._detach_process())
+
+    def _detach_process(self) -> subprocess.Popen[str] | None:
         process = self._process
         self._process = None
         self._worker_info = None
+        return process
+
+    @staticmethod
+    def _stop_process(process: subprocess.Popen[str] | None) -> None:
         if process is not None and process.poll() is None:
-            process.terminate()
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
             try:
                 process.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
-                process.kill()
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
                 process.wait(timeout=2.0)
 
     def _ensure_started(self) -> None:
@@ -148,10 +174,10 @@ class WorkerProcess:
                 "Julia executable was not found. Configure its executable path or add Julia to PATH."
             ) from exc
 
-        self._stderr_thread = threading.Thread(target=self._collect_stderr, daemon=True)
+        self._stderr_thread = threading.Thread(target=self._collect_stderr, args=(self._process,), daemon=True)
         self._stderr_thread.start()
 
-        for event in self._read_events():
+        for event in self._read_events(startup=True):
             event_type = str(event.get("type", ""))
             if event_type == "ready":
                 try:
@@ -174,10 +200,14 @@ class WorkerProcess:
         self._discard_process()
         raise RuntimeError(self._process_error("Warm BEAT Engine solver ended before startup completed."))
 
-    def _iter_events_for_submission(self) -> Iterator[dict]:
+    def _iter_events_for_submission(
+        self, process: subprocess.Popen[str], token: _SubmissionToken
+    ) -> Iterator[dict]:
         terminal = False
         try:
-            for event in self._read_events():
+            for event in self._read_events(process):
+                if token.invalidated:
+                    raise RuntimeError("BEAT Engine worker was terminated during submission.")
                 self._accept_event(event)
                 terminal = str(event.get("type", "")) in {"completed", "cancelled", "failed"}
                 yield event
@@ -185,16 +215,26 @@ class WorkerProcess:
                     return
             raise RuntimeError(self._process_error("Warm BEAT Engine solver ended before job completion."))
         finally:
-            if not terminal:
-                # Unread events belong to this job and cannot become the next
-                # submission's results. Restart and renegotiate after abandonment.
-                self._discard_process()
-            self._status_callback = None
-            if self._lock.locked():
-                self._lock.release()
+            # Unread events belong to this job and cannot become the next
+            # submission's results. Restart and renegotiate after abandonment.
+            self._finish_submission(token, discard=not terminal)
 
-    def _read_events(self) -> Iterator[dict]:
-        process = self._process
+    def _finish_submission(self, token: _SubmissionToken, *, discard: bool) -> None:
+        with self._available:
+            if self._active_submission is not token:
+                return
+            self._active_submission = None
+            self._status_callback = None
+            process = self._detach_process() if discard else None
+            # Keep a new submission from starting until the abandoned child has
+            # actually stopped, including its stderr collection.
+            self._stop_process(process)
+            self._available.notify_all()
+
+    def _read_events(
+        self, process: subprocess.Popen[str] | None = None, *, startup: bool = False
+    ) -> Iterator[dict]:
+        process = self._process if process is None else process
         if process is None or process.stdout is None:
             return
 
@@ -217,16 +257,23 @@ class WorkerProcess:
                 yield event
 
         exit_code = process.wait()
-        self._process = None
-        self._worker_info = None
+        if startup:
+            # Startup is already serialized by the condition lock.
+            if self._process is process:
+                self._detach_process()
+        else:
+            with self._available:
+                if self._process is process:
+                    self._detach_process()
         if exit_code != 0:
             raise RuntimeError(self._process_error(f"Warm BEAT Engine solver exited with code {exit_code}."))
 
-    def _collect_stderr(self) -> None:
-        process = self._process
+    def _collect_stderr(self, process: subprocess.Popen[str] | None) -> None:
         if process is None or process.stderr is None:
             return
         for line in process.stderr:
+            if self._process is not process:
+                return
             text = line.strip()
             if text:
                 self._stderr_lines.append(text)
@@ -245,6 +292,70 @@ class WorkerProcess:
     def _emit_status(self, message: str) -> None:
         if self._status_callback is not None:
             self._status_callback(message)
+
+
+class _SubmissionToken:
+    def __init__(self) -> None:
+        self.invalidated = False
+
+
+class _SubmissionEvents(Iterator[dict]):
+    """Closeable stream that owns one submission, even before its first read."""
+
+    def __init__(self, worker: WorkerProcess, process: subprocess.Popen[str], token: _SubmissionToken):
+        self._worker = worker
+        self._token = token
+        self._events = worker._iter_events_for_submission(process, token)
+        self._closed = False
+
+    def __iter__(self) -> _SubmissionEvents:
+        return self
+
+    def __next__(self) -> dict:
+        if self._closed:
+            raise StopIteration
+        if self._token.invalidated:
+            self.close()
+            raise RuntimeError("BEAT Engine worker was terminated during submission.")
+        try:
+            event = next(self._events)
+        except BaseException:
+            self.close()
+            if self._token.invalidated:
+                raise RuntimeError("BEAT Engine worker was terminated during submission.") from None
+            raise
+        if self._token.invalidated:
+            self.close()
+            raise RuntimeError("BEAT Engine worker was terminated during submission.")
+        if str(event.get("type", "")) in {"completed", "cancelled", "failed"}:
+            # A terminal event releases ownership immediately; callers need not
+            # request one extra item or explicitly close the exhausted stream.
+            self.close()
+        return event
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            try:
+                self._events.close()
+            except ValueError as exc:
+                # A different thread may be blocked in next(). Stopping the
+                # process below wakes it; that reader runs the generator's
+                # finally block itself.
+                if str(exc) != "generator already executing":
+                    raise
+                self._token.invalidated = True
+        finally:
+            # Closing an unstarted generator does not run its finally block.
+            self._worker._finish_submission(self._token, discard=True)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def format_julia_error(

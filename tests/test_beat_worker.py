@@ -1,9 +1,11 @@
 """Subprocess transport tests independent of Julia, NumPy, and application models."""
 
+import gc
 import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -27,6 +29,11 @@ for line in sys.stdin:
     if operation == "crash":
         print("synthetic worker crash", file=sys.stderr, flush=True)
         sys.exit(7)
+    if operation == "hang":
+        print(json.dumps({"type": "status", "message": "waiting"}), flush=True)
+        for unused in sys.stdin:
+            pass
+        continue
     if operation in {"cancelled", "failed"}:
         print(json.dumps({"type": operation}), flush=True)
         continue
@@ -95,6 +102,208 @@ def test_worker_can_restart_after_process_failure(worker_script, tmp_path):
             list(worker.submit(request, operation="crash"))
         assert result(worker, request)["pid"] != first["pid"]
     finally:
+        worker.terminate()
+
+
+def test_closing_unstarted_stream_discards_its_unread_events(worker_script, tmp_path):
+    request = tmp_path / "request.json"
+    request.write_text("{}")
+    worker = WorkerProcess(**options(worker_script))
+    try:
+        stream = worker.submit(request)
+        first_process = worker._process
+        stream.close()
+        assert first_process.poll() is not None
+        assert result(worker, request)["pid"] != first_process.pid
+    finally:
+        worker.terminate()
+
+
+def test_dropped_unstarted_stream_does_not_keep_worker_busy(worker_script, tmp_path):
+    request = tmp_path / "request.json"
+    request.write_text("{}")
+    worker = WorkerProcess(**options(worker_script))
+    try:
+        stream = worker.submit(request)
+        first_process = worker._process
+        del stream
+        gc.collect()
+        assert first_process.poll() is not None
+        assert result(worker, request)["pid"] != first_process.pid
+    finally:
+        worker.terminate()
+
+
+def test_early_close_after_nonterminal_event_discards_process(worker_script, tmp_path):
+    request = tmp_path / "request.json"
+    request.write_text("{}")
+    worker = WorkerProcess(**options(worker_script))
+    try:
+        stream = worker.submit(request)
+        assert next(stream)["type"] == "status"
+        first_process = worker._process
+        stream.close()
+        assert first_process.poll() is not None
+        assert result(worker, request)["pid"] != first_process.pid
+    finally:
+        worker.terminate()
+
+
+def test_terminal_event_releases_ownership_without_extra_next(worker_script, tmp_path):
+    request = tmp_path / "request.json"
+    request.write_text("{}")
+    worker = WorkerProcess(**options(worker_script))
+    try:
+        stream = worker.submit(request, operation="cancelled")
+        assert next(stream) == {"type": "cancelled"}
+        assert result(worker, request)["payload"] == {}
+        assert list(stream) == []
+    finally:
+        worker.terminate()
+
+
+def test_concurrent_submission_waits_for_stream_owner(worker_script, tmp_path):
+    request = tmp_path / "request.json"
+    request.write_text("{}")
+    worker = WorkerProcess(**options(worker_script))
+    entered = threading.Event()
+    finished = threading.Event()
+    outcome = []
+    thread = None
+    try:
+        first = worker.submit(request)
+        first_process = worker._process
+
+        def submit_second():
+            entered.set()
+            try:
+                outcome.append(result(worker, request))
+            except Exception as exc:
+                outcome.append(exc)
+            finally:
+                finished.set()
+
+        thread = threading.Thread(target=submit_second)
+        thread.start()
+        assert entered.wait(2)
+        assert not finished.wait(0.1)
+        first.close()
+        assert finished.wait(5)
+        assert len(outcome) == 1 and isinstance(outcome[0], dict), outcome
+        assert outcome[0]["pid"] != first_process.pid
+    finally:
+        if thread is not None:
+            thread.join(timeout=5)
+        worker.terminate()
+
+
+def test_termination_invalidates_stream_and_unblocks_waiting_submission(worker_script, tmp_path):
+    request = tmp_path / "request.json"
+    request.write_text("{}")
+    worker = WorkerProcess(**options(worker_script))
+    entered = threading.Event()
+    finished = threading.Event()
+    outcome = []
+    thread = None
+    try:
+        first = worker.submit(request)
+        first_process = worker._process
+
+        def submit_second():
+            entered.set()
+            try:
+                outcome.append(result(worker, request))
+            except Exception as exc:
+                outcome.append(exc)
+            finally:
+                finished.set()
+
+        thread = threading.Thread(target=submit_second)
+        thread.start()
+        assert entered.wait(2)
+        assert not finished.wait(0.1)
+        worker.terminate()
+        assert first_process.poll() is not None
+        with pytest.raises(RuntimeError, match="terminated"):
+            next(first)
+        assert finished.wait(5)
+        assert len(outcome) == 1 and isinstance(outcome[0], dict), outcome
+        assert outcome[0]["pid"] != first_process.pid
+    finally:
+        if thread is not None:
+            thread.join(timeout=5)
+        worker.terminate()
+
+
+def test_termination_interrupts_blocked_event_read(worker_script, tmp_path):
+    request = tmp_path / "request.json"
+    request.write_text("{}")
+    worker = WorkerProcess(**options(worker_script))
+    entered = threading.Event()
+    finished = threading.Event()
+    outcome = []
+    thread = None
+    try:
+        stream = worker.submit(request, operation="hang")
+        assert next(stream)["message"] == "waiting"
+
+        def read_next():
+            entered.set()
+            try:
+                outcome.append(next(stream))
+            except Exception as exc:
+                outcome.append(exc)
+            finally:
+                finished.set()
+
+        thread = threading.Thread(target=read_next)
+        thread.start()
+        assert entered.wait(2)
+        assert not finished.wait(0.1)
+        worker.terminate()
+        assert finished.wait(5)
+        assert len(outcome) == 1 and isinstance(outcome[0], RuntimeError), outcome
+        assert "terminated" in str(outcome[0])
+        assert result(worker, request)["type"] == "result"
+    finally:
+        if thread is not None:
+            thread.join(timeout=5)
+        worker.terminate()
+
+
+def test_close_interrupts_reader_in_another_thread(worker_script, tmp_path):
+    request = tmp_path / "request.json"
+    request.write_text("{}")
+    worker = WorkerProcess(**options(worker_script))
+    entered = threading.Event()
+    finished = threading.Event()
+    outcome = []
+    thread = None
+    try:
+        stream = worker.submit(request, operation="hang")
+        assert next(stream)["message"] == "waiting"
+
+        def read_next():
+            entered.set()
+            try:
+                outcome.append(next(stream))
+            except Exception as exc:
+                outcome.append(exc)
+            finally:
+                finished.set()
+
+        thread = threading.Thread(target=read_next)
+        thread.start()
+        assert entered.wait(2)
+        assert not finished.wait(0.1)
+        stream.close()
+        assert finished.wait(5)
+        assert len(outcome) == 1 and isinstance(outcome[0], RuntimeError), outcome
+        assert "terminated" in str(outcome[0])
+        assert result(worker, request)["type"] == "result"
+    finally:
+        if thread is not None:
+            thread.join(timeout=5)
         worker.terminate()
 
 
