@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -101,6 +102,67 @@ def test_worker_can_restart_after_process_failure(worker_script, tmp_path):
         with pytest.raises(RuntimeError, match="exited with code 7"):
             list(worker.submit(request, operation="crash"))
         assert result(worker, request)["pid"] != first["pid"]
+    finally:
+        worker.terminate()
+
+
+@pytest.fixture
+def never_ready_script(tmp_path):
+    script = tmp_path / "never_ready.py"
+    script.write_text("import time\nwhile True: time.sleep(1)\n", encoding="utf-8")
+    return script
+
+
+@pytest.mark.parametrize("entry", ["ensure_started", "submit"])
+def test_terminate_interrupts_never_ready_startup(never_ready_script, entry):
+    worker = WorkerProcess(**options(never_ready_script))
+    request = never_ready_script.parent / "request.json"
+    request.write_text("{}")
+    finished = threading.Event()
+    outcome = []
+
+    def start_worker():
+        try:
+            if entry == "ensure_started":
+                worker.ensure_started()
+            else:
+                worker.submit(request)
+        except Exception as exc:
+            outcome.append(exc)
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=start_worker)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 5
+        while worker._process is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert worker._process is not None
+        process = worker._process
+        worker.terminate()
+        assert finished.wait(5)
+        assert len(outcome) == 1 and isinstance(outcome[0], RuntimeError), outcome
+        assert "startup terminated" in str(outcome[0])
+        assert process.poll() is not None
+        assert worker._process is None
+    finally:
+        worker.terminate()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("entry", ["ensure_started", "submit"])
+def test_never_ready_startup_times_out(never_ready_script, entry):
+    worker = WorkerProcess(**options(never_ready_script, startup_timeout_s=0.1))
+    request = never_ready_script.parent / "request.json"
+    request.write_text("{}")
+    try:
+        with pytest.raises(RuntimeError, match="startup timed out"):
+            if entry == "ensure_started":
+                worker.ensure_started()
+            else:
+                worker.submit(request)
+        assert worker._process is None
     finally:
         worker.terminate()
 
@@ -318,6 +380,7 @@ def test_pool_keys_include_runtime_environment_and_shutdown_releases_workers(wor
         changed = pool.get_worker(**options(worker_script, environment=env | {"TEST_SDK": "second"}))
         assert changed is not first
         assert pool.get_worker(**options(worker_script, julia_threads=3, environment=env)) is not first
+        assert pool.get_worker(**options(worker_script, environment=env, startup_timeout_s=30)) is not first
         assert result(first, request)["sdk"] == "first"
         assert result(changed, request)["sdk"] == "second"
         processes = [first._process, changed._process]

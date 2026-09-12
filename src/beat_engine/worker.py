@@ -28,6 +28,7 @@ class WorkerProcess:
         julia_sysimage: Path | None = None,
         environment: Mapping[str, str] | None = None,
         backend_label: str = "the selected BEAT Engine backend",
+        startup_timeout_s: float = 300.0,
     ):
         self.julia_executable = julia_executable
         self.solver_script = solver_script
@@ -37,9 +38,13 @@ class WorkerProcess:
         self.environment = dict(os.environ if environment is None else environment)
         self.environment["JULIA_NUM_THREADS"] = resolve_julia_threads(julia_threads)
         self.backend_label = backend_label
+        if startup_timeout_s <= 0:
+            raise ValueError("startup_timeout_s must be positive.")
+        self.startup_timeout_s = startup_timeout_s
         self._lock = threading.Lock()
         self._available = threading.Condition(self._lock)
         self._active_submission: _SubmissionToken | None = None
+        self._starting: _StartupToken | None = None
         self._terminating = False
         self._process: subprocess.Popen[str] | None = None
         self._stderr_lines: list[str] = []
@@ -69,11 +74,15 @@ class WorkerProcess:
         operation: str = "solve",
     ) -> Iterator[dict]:
         with self._available:
-            while self._active_submission is not None or self._terminating:
+            while self._active_submission is not None or self._starting is not None or self._terminating:
                 self._available.wait()
+            startup = _StartupToken()
+            self._starting = startup
             self._status_callback = status_callback
-            try:
-                self._ensure_started()
+        try:
+            self._ensure_started(startup)
+            with self._available:
+                self._check_startup(startup)
                 command = self._prepare_submission(request_path, operation)
                 process = self._process
                 if process is None or process.stdin is None:
@@ -84,26 +93,48 @@ class WorkerProcess:
                 token = _SubmissionToken()
                 self._active_submission = token
                 return _SubmissionEvents(self, process, token)
-            except Exception:
-                self._status_callback = None
-                raise
+        finally:
+            with self._available:
+                if self._starting is startup:
+                    self._starting = None
+                    if self._active_submission is None:
+                        self._status_callback = None
+                    self._available.notify_all()
 
     def ensure_started(self, *, status_callback: Callable[[str], None] | None = None) -> None:
         with self._available:
-            while self._active_submission is not None or self._terminating:
+            while self._active_submission is not None or self._starting is not None or self._terminating:
                 self._available.wait()
+            startup = _StartupToken()
+            self._starting = startup
             previous_callback = self._status_callback
             self._status_callback = status_callback
-            try:
-                self._ensure_started()
-            finally:
-                self._status_callback = previous_callback
+        try:
+            self._ensure_started(startup)
+        finally:
+            with self._available:
+                if self._starting is startup:
+                    self._starting = None
+                    self._status_callback = previous_callback
+                    self._available.notify_all()
 
     def terminate(self) -> None:
+        self._terminate()
+
+    def _terminate(self, *, expected_startup: _StartupToken | None = None, timeout: bool = False) -> None:
         with self._available:
             while self._terminating:
                 self._available.wait()
+            if expected_startup is not None and self._starting is not expected_startup:
+                return
+            if timeout and expected_startup is not None and expected_startup.ready:
+                return
             self._terminating = True
+            startup = self._starting
+            if startup is not None:
+                startup.invalidated = True
+                startup.reason = "timed out" if timeout else "terminated"
+            self._starting = None
             token = self._active_submission
             if token is not None:
                 token.invalidated = True
@@ -118,8 +149,10 @@ class WorkerProcess:
                 self._terminating = False
                 self._available.notify_all()
 
-    def _discard_process(self) -> None:
-        self._stop_process(self._detach_process())
+    def _discard_expected_process(self, expected: subprocess.Popen[str]) -> None:
+        with self._available:
+            process = self._detach_process() if self._process is expected else None
+        self._stop_process(process)
 
     def _detach_process(self) -> subprocess.Popen[str] | None:
         process = self._process
@@ -143,62 +176,79 @@ class WorkerProcess:
                     pass
                 process.wait(timeout=2.0)
 
-    def _ensure_started(self) -> None:
-        if self._process is not None and self._process.poll() is None:
-            self._emit_status("BEAT Engine ready")
-            return
+    @staticmethod
+    def _check_startup(startup: _StartupToken) -> None:
+        if startup.invalidated:
+            raise RuntimeError(f"BEAT Engine worker startup {startup.reason}.")
 
-        self._stderr_lines.clear()
-        self._worker_info = None
-        command = julia_worker_command(
-            self.julia_executable,
-            self.solver_script,
-            julia_project=self.julia_project,
-            julia_sysimage=self.julia_sysimage,
-        )
-        self._emit_status("Initializing BEAT Engine")
-        try:
-            self._process = subprocess.Popen(
-                command,
-                cwd=str(self.solver_script.parent),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=self.environment,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                "Julia executable was not found. Configure its executable path or add Julia to PATH."
-            ) from exc
-
-        self._stderr_thread = threading.Thread(target=self._collect_stderr, args=(self._process,), daemon=True)
-        self._stderr_thread.start()
-
-        for event in self._read_events(startup=True):
-            event_type = str(event.get("type", ""))
-            if event_type == "ready":
-                try:
-                    self._accept_ready(event)
-                except Exception:
-                    self._discard_process()
-                    raise
+    def _ensure_started(self, startup: _StartupToken) -> None:
+        with self._available:
+            self._check_startup(startup)
+            if self._process is not None and self._process.poll() is None:
                 self._emit_status("BEAT Engine ready")
                 return
-            if event_type == "failed":
-                self._discard_process()
-                raise RuntimeError(
-                    format_julia_error(
-                        str(event.get("error", "BEAT Engine solver failed during startup.")),
-                        julia_project=self.julia_project,
-                        backend_label=self.backend_label,
-                    )
-                )
 
-        self._discard_process()
-        raise RuntimeError(self._process_error("Warm BEAT Engine solver ended before startup completed."))
+            self._stderr_lines.clear()
+            self._worker_info = None
+            command = julia_worker_command(
+                self.julia_executable,
+                self.solver_script,
+                julia_project=self.julia_project,
+                julia_sysimage=self.julia_sysimage,
+            )
+            self._emit_status("Initializing BEAT Engine")
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(self.solver_script.parent),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=self.environment,
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    "Julia executable was not found. Configure its executable path or add Julia to PATH."
+                ) from exc
+            self._process = process
+            self._stderr_thread = threading.Thread(target=self._collect_stderr, args=(process,), daemon=True)
+            self._stderr_thread.start()
+
+        timer = threading.Timer(self.startup_timeout_s, self._terminate, kwargs={"expected_startup": startup, "timeout": True})
+        timer.daemon = True
+        timer.start()
+        try:
+            for event in self._read_events(process):
+                with self._available:
+                    self._check_startup(startup)
+                    event_type = str(event.get("type", ""))
+                    if event_type == "ready":
+                        self._accept_ready(event)
+                        startup.ready = True
+                        self._emit_status("BEAT Engine ready")
+                        return
+                if event_type == "failed":
+                    self._discard_expected_process(process)
+                    raise RuntimeError(
+                        format_julia_error(
+                            str(event.get("error", "BEAT Engine solver failed during startup.")),
+                            julia_project=self.julia_project,
+                            backend_label=self.backend_label,
+                        )
+                    )
+            with self._available:
+                self._check_startup(startup)
+            raise RuntimeError(self._process_error("Warm BEAT Engine solver ended before startup completed."))
+        except Exception:
+            self._discard_expected_process(process)
+            with self._available:
+                self._check_startup(startup)
+            raise
+        finally:
+            timer.cancel()
 
     def _iter_events_for_submission(
         self, process: subprocess.Popen[str], token: _SubmissionToken
@@ -231,9 +281,7 @@ class WorkerProcess:
             self._stop_process(process)
             self._available.notify_all()
 
-    def _read_events(
-        self, process: subprocess.Popen[str] | None = None, *, startup: bool = False
-    ) -> Iterator[dict]:
+    def _read_events(self, process: subprocess.Popen[str] | None = None) -> Iterator[dict]:
         process = self._process if process is None else process
         if process is None or process.stdout is None:
             return
@@ -257,14 +305,9 @@ class WorkerProcess:
                 yield event
 
         exit_code = process.wait()
-        if startup:
-            # Startup is already serialized by the condition lock.
+        with self._available:
             if self._process is process:
                 self._detach_process()
-        else:
-            with self._available:
-                if self._process is process:
-                    self._detach_process()
         if exit_code != 0:
             raise RuntimeError(self._process_error(f"Warm BEAT Engine solver exited with code {exit_code}."))
 
@@ -297,6 +340,13 @@ class WorkerProcess:
 class _SubmissionToken:
     def __init__(self) -> None:
         self.invalidated = False
+
+
+class _StartupToken:
+    def __init__(self) -> None:
+        self.invalidated = False
+        self.reason = "terminated"
+        self.ready = False
 
 
 class _SubmissionEvents(Iterator[dict]):
@@ -491,6 +541,7 @@ class WorkerPool:
         julia_sysimage: Path | None = None,
         environment: Mapping[str, str] | None = None,
         backend_label: str = "the selected BEAT Engine backend",
+        startup_timeout_s: float = 300.0,
     ) -> WorkerProcess:
         threads = resolve_julia_threads(julia_threads)
         env = dict(os.environ if environment is None else environment)
@@ -503,6 +554,7 @@ class WorkerPool:
             threads,
             tuple(sorted(env.items())),
             backend_label,
+            startup_timeout_s,
         )
         with self._lock:
             worker = self._workers.get(key)
@@ -515,6 +567,7 @@ class WorkerPool:
                     julia_sysimage=julia_sysimage,
                     environment=env,
                     backend_label=backend_label,
+                    startup_timeout_s=startup_timeout_s,
                 )
                 self._workers[key] = worker
             return worker
