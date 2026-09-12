@@ -508,7 +508,7 @@ function channel_neumann_columns(mesh, element_mesh_ids, radiators, channel_name
             tag = Int(radiator["tag"])
             for element_index in eachindex(mesh.physical_tags)
                 if mesh.physical_tags[element_index] == tag && radiator_owns_element(radiator, element_mesh_ids, element_index)
-                    columns[element_index, channel_index] = Complex{T}(0, rho * omega) * drive
+                    columns[element_index, channel_index] = neumann_scale(rho, omega) * drive
                 end
             end
         end
