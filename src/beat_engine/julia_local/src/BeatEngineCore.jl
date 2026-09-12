@@ -7,17 +7,35 @@ export NEGATIVE_TIME_PHASOR, POSITIVE_TIME_PHASOR, phasor_convention, propagatio
     outgoing_wavenumber, neumann_scale, time_derivative, burton_miller_coupling, with_phasor_convention
 
 const BEAT_ACCELERATOR_HINT = let
-    configured = lowercase(strip(get(ENV, "BLAB_BEAT_ENGINE_GPU_BACKEND", "")))
-    if configured in ("cuda", "rocm")
+    # A bundle package in julia_engine/ names its backend here, and it has to:
+    # when these sources are loaded from a package, the environment variable and
+    # the active project are the ones the precompile *cache* was built in, not
+    # the ones the solve runs in, so neither can be trusted to name the
+    # accelerator. The two fallbacks below still apply to a direct `include`,
+    # which is how the analysis scripts and any un-instantiated checkout load
+    # the engine.
+    bundled = let parent = parentmodule(@__MODULE__)
+        isdefined(parent, :BEAT_ENGINE_BACKEND) ?
+            lowercase(strip(String(getfield(parent, :BEAT_ENGINE_BACKEND)))) : ""
+    end
+    configured = isempty(bundled) ?
+        lowercase(strip(get(ENV, "BLAB_BEAT_ENGINE_GPU_BACKEND", ""))) : bundled
+    if configured in ("cuda", "rocm", "metal")
         configured
+    elseif configured == "cpu"
+        # A bundle that says "cpu" means it: no GPU package is a dependency of
+        # it, and falling through to the project-name guess would ask for one.
+        "none"
     else
         active_project = Base.active_project()
         project_directory = active_project === nothing ? "" : lowercase(basename(dirname(active_project)))
-        project_directory == "julia_cuda" ? "cuda" : project_directory == "julia_rocm" ? "rocm" : ""
+        project_directory == "julia_cuda" ? "cuda" :
+            project_directory == "julia_rocm" ? "rocm" :
+            project_directory == "julia_metal" ? "metal" : ""
     end
 end
 
-const CUDA_MODULE = if BEAT_ACCELERATOR_HINT == "rocm"
+const CUDA_MODULE = if BEAT_ACCELERATOR_HINT in ("rocm", "metal", "none")
     nothing
 else
     try
@@ -28,12 +46,23 @@ else
     end
 end
 
-const AMDGPU_MODULE = if BEAT_ACCELERATOR_HINT == "cuda"
+const AMDGPU_MODULE = if BEAT_ACCELERATOR_HINT in ("cuda", "metal", "none")
     nothing
 else
     try
         @eval import AMDGPU
         AMDGPU
+    catch
+        nothing
+    end
+end
+
+const METAL_MODULE = if BEAT_ACCELERATOR_HINT in ("cuda", "rocm", "none")
+    nothing
+else
+    try
+        @eval import Metal
+        Metal
     catch
         nothing
     end
@@ -95,6 +124,32 @@ export BoundaryMesh,
     evaluate_galerkin_field_cpu,
     evaluate_galerkin_field_cuda,
     evaluate_galerkin_field_rocm,
+    build_metal_regular_assembly_cache,
+    release_metal_regular_assembly_cache!,
+    build_metal_singular_correction_cache,
+    release_metal_singular_correction_cache!,
+    build_metal_field_evaluation_cache,
+    release_metal_field_evaluation_cache!,
+    build_metal_burton_miller_identity_cache,
+    release_metal_burton_miller_identity_cache!,
+    build_metal_sparse_scatter_cache,
+    release_metal_sparse_scatter_cache!,
+    scatter_metal_sparse_to_dense!,
+    metal_dense_lu!,
+    solve_metal_dense_factorization,
+    metal_host_operators,
+    assemble_burton_miller_neumann_system_cpu,
+    solve_burton_miller_neumann_system_cpu,
+    solve_burton_miller_neumann_system_cpu_with_report,
+    build_metal_fused_identity_cache,
+    release_metal_fused_identity_cache!,
+    assemble_burton_miller_neumann_system_metal,
+    metal_host_burton_miller_system,
+    solve_metal_burton_miller_system,
+    solve_metal_burton_miller_system_with_report,
+    release_metal_burton_miller_system!,
+    assemble_regular_galerkin_operators_metal_regular,
+    evaluate_galerkin_field_metal,
     fibonacci_sphere,
     helmholtz_adjoint_double_layer_kernel,
     helmholtz_double_layer_kernel,
@@ -102,15 +157,37 @@ export BoundaryMesh,
     load_gmsh22_with_tags,
     mesh_for_frequency,
     release_operator_storage!,
+    SweepAssemblyPipeline,
+    sweep_pipeline_depth,
+    start_sweep_assembly_pipeline,
+    take_sweep_assembly!,
+    shutdown_sweep_assembly_pipeline!,
+    metal_sweep_memory_available,
     surface_curls,
     scatter_element_block!,
     burton_miller_neumann_matrices,
+    burton_miller_neumann_lhs,
+    burton_miller_neumann_rhs,
     build_burton_miller_neumann_cpu_system,
     beat_cpu_blas_thread_count,
     configure_beat_cpu_blas_threads!,
     solve_burton_miller_neumann_cpu_system,
     solve_burton_miller_neumann_cpu,
     solve_burton_miller_neumann,
+    beat_dense_solve_method,
+    beat_dense_solve_plan,
+    beat_dense_solve_crossover_dofs,
+    beat_dense_lu_seconds,
+    beat_dense_triangular_seconds,
+    beat_dense_matvec_seconds,
+    beat_gmres_seconds,
+    beat_gmres_iteration_budget,
+    beat_diagonal_preconditioner,
+    beat_gmres!,
+    beat_gmres_krylov_type,
+    beat_gmres_reorthogonalization,
+    beat_solve_dense_system,
+    describe_dense_solve,
     reflect_curl,
     reflect_normal,
     reflect_point,
@@ -135,6 +212,11 @@ end
 function amdgpu_module()
     AMDGPU_MODULE === nothing && error("ROCm solve requested, but AMDGPU.jl could not be loaded.")
     return AMDGPU_MODULE
+end
+
+function metal_module()
+    METAL_MODULE === nothing && error("Metal solve requested, but Metal.jl could not be loaded.")
+    return METAL_MODULE
 end
 
 struct BoundaryMesh{T<:AbstractFloat}
@@ -168,6 +250,12 @@ struct CudaBurtonMillerIdentityCache{A,B}
 end
 
 struct RocmBurtonMillerIdentityCache{A,B}
+    identity_p1_p1::A
+    identity_p1_dp0::B
+end
+
+# Metal keeps the dense solve on the CPU, so this cache holds host matrices.
+struct MetalBurtonMillerIdentityCache{A,B}
     identity_p1_p1::A
     identity_p1_dp0::B
 end
@@ -1134,6 +1222,7 @@ function assemble_regular_galerkin_operators(
     image_near_correction_cache=nothing,
     device_image_near_correction_cache=nothing,
     rocm_assembly_mode=nothing,
+    metal_assembly_mode=nothing,
     symmetry_mode::Symbol=:off,
 ) where {T<:AbstractFloat}
     if backend == :cpu
@@ -1204,7 +1293,29 @@ function assemble_regular_galerkin_operators(
         )
     end
 
-    error("Unsupported BEAT Engine assembly backend: $(backend). Expected :cpu, :cuda, or :rocm.")
+    if backend == :metal
+        accelerator_quadrature || error("Metal regular assembly requires accelerator_quadrature=true.")
+        return assemble_regular_galerkin_operators_metal_regular(
+            mesh,
+            p1_space,
+            dp0_space,
+            k,
+            rule;
+            skip_singular=skip_singular,
+            singular_order=singular_order,
+            element_indices=element_indices,
+            cache=device_cache,
+            return_device=return_device,
+            accelerator_quadrature=true,
+            timing=timing,
+            singular_cache=singular_cache,
+            metal_singular_cache=device_singular_cache,
+            assembly_mode=metal_assembly_mode,
+            symmetry_mode=symmetry_mode,
+        )
+    end
+
+    error("Unsupported BEAT Engine assembly backend: $(backend). Expected :cpu, :cuda, :rocm, or :metal.")
 end
 
 function build_cuda_regular_assembly_cache(args...; kwargs...)
@@ -1295,6 +1406,156 @@ end
 
 release_operator_storage!(operators) = nothing
 
+# ---------------------------------------------------------------------------
+# Sweep assembly pipeline
+#
+# A frequency sweep is a producer-consumer pair, not a sequence: the operator
+# assembly runs on the accelerator and the dense solve runs on the host, so one
+# frequency's assembly can proceed while the previous one is being solved,
+# evaluated and reported. The scheduler below is the generic half of that -- it
+# knows nothing about operators or frequencies, only that steps are produced in
+# ascending order on one background task and consumed in that same order on the
+# caller's task.
+#
+# Two properties are load-bearing and are why this is a single producer task
+# rather than a pool:
+#
+#   * Consumption stays in index order. The Python wrapper matches `result`
+#     events to requested frequencies positionally and rejects a mismatch, and
+#     the user-visible progress count must not jump around. `take_sweep_assembly!`
+#     asserts the invariant rather than assuming it.
+#   * Assembly stays serialized. The accelerator assembly caches carry shared
+#     per-device scratch (the Metal fused path reuses one pair-block buffer), so
+#     two concurrent assemblies would race on it, and the Metal `pair_gather`
+#     kernel's run-to-run bit reproducibility depends on one assembly owning
+#     that scratch at a time. One producer keeps both.
+# ---------------------------------------------------------------------------
+
+"""
+    sweep_pipeline_depth(system_bytes, available_bytes, remaining_steps; max_depth=4, ...)
+
+How many sweep steps the assembly producer may run ahead of the solve.
+
+Every step in flight holds its own dense operator, so the lookahead is a memory
+decision rather than a tuning constant: the producer's `depth` systems, the one
+the consumer is solving, and the copy a dense factorization makes of it must all
+fit inside `headroom` of the memory still available. Hence
+`depth = floor(headroom * available / system_bytes) - reserved_systems`.
+
+The result is clamped to at least 1, which is the behaviour that shipped before
+any of this existed -- one frequency prefetched -- and is always affordable,
+because the solve holds a system of that size regardless. It is clamped above by
+`max_depth` and by the steps that remain: a single producer feeding one
+accelerator gains nothing from running further ahead than it takes to cover
+host-side jitter.
+"""
+function sweep_pipeline_depth(
+    system_bytes::Integer,
+    available_bytes::Integer,
+    remaining_steps::Integer;
+    max_depth::Integer=4,
+    headroom::Real=0.5,
+    reserved_systems::Integer=2,
+)
+    remaining_steps <= 1 && return 1
+    ceiling = min(Int(max_depth), Int(remaining_steps))
+    ceiling <= 1 && return 1
+    system_bytes <= 0 && return ceiling
+    available_bytes <= 0 && return 1
+    budget = floor(Int128, headroom * available_bytes)
+    resident = fld(budget, Int128(system_bytes))
+    affordable = Int(clamp(resident - Int128(reserved_systems), Int128(0), Int128(ceiling)))
+    return clamp(affordable, 1, ceiling)
+end
+
+"""
+One background task assembling sweep steps ahead of the consumer, and the
+bounded channel it hands them over on. The channel's capacity *is* the
+lookahead: the producer parks on a full channel instead of allocating another
+operator.
+"""
+struct SweepAssemblyPipeline
+    channel::Channel{Tuple{Int,Any}}
+    stop::Threads.Atomic{Bool}
+    depth::Int
+end
+
+"""
+    start_sweep_assembly_pipeline(produce, step_count, depth, release)
+
+Start assembling steps `1:step_count` on one background task, at most `depth`
+ahead of the consumer. `produce(index)` builds one step; `release(payload)`
+frees one that will never be consumed.
+
+The channel is bound to the producer task, so a failure inside `produce` reaches
+the consumer through `take_sweep_assembly!` rather than surfacing as a closed
+channel.
+"""
+function start_sweep_assembly_pipeline(produce, step_count::Integer, depth::Integer, release)
+    capacity = max(1, Int(depth))
+    steps = Int(step_count)
+    stop = Threads.Atomic{Bool}(false)
+    channel = Channel{Tuple{Int,Any}}(capacity; spawn=true) do sink
+        for index in 1:steps
+            stop[] && break
+            payload = produce(index)
+            # A cancel that lands while this step was being assembled must not
+            # leak it: the consumer is gone and will never drain this one.
+            if stop[]
+                release(payload)
+                break
+            end
+            put!(sink, (index, payload))
+        end
+    end
+    return SweepAssemblyPipeline(channel, stop, capacity)
+end
+
+"""
+    take_sweep_assembly!(pipeline, index)
+
+Take step `index`'s payload, blocking until the producer has it.
+
+Raises rather than returning a payload built for a different step. Nothing in
+the design can deliver one out of order, which is exactly why the invariant is
+asserted here: a mismatched pairing would otherwise publish one frequency's
+field under another's label, and every number downstream would stay plausible.
+"""
+function take_sweep_assembly!(pipeline::SweepAssemblyPipeline, index::Integer)
+    produced_index, payload = take!(pipeline.channel)
+    produced_index == Int(index) && return payload
+    error(
+        "BEAT sweep pipeline delivered step $(produced_index) where step $(index) was next; " *
+        "results would be mismatched to their frequencies.",
+    )
+end
+
+"""
+    shutdown_sweep_assembly_pipeline!(pipeline, release)
+
+Stop the producer and release every step it built that nobody consumed. Returns
+how many were released.
+
+Draining is what makes this terminate: a producer parked on a full channel is
+only freed by a `take!`, so setting the flag alone would hang. Safe to call more
+than once, and on `nothing`.
+"""
+function shutdown_sweep_assembly_pipeline!(pipeline, release)
+    pipeline === nothing && return 0
+    pipeline.stop[] = true
+    drained = 0
+    try
+        for (_, payload) in pipeline.channel
+            release(payload)
+            drained += 1
+        end
+    catch
+        # The producer failed; its exception is the caller's to report, and
+        # there is nothing left in the channel to free.
+    end
+    return drained
+end
+
 function build_cuda_burton_miller_identity_cache(identity_p1_p1, identity_p1_dp0, ::Type{T}) where {T<:AbstractFloat}
     cuda = cuda_module()
     cuda.functional() || error("CUDA Burton-Miller identity cache requested, but CUDA.functional() is false.")
@@ -1347,6 +1608,37 @@ end
 
 function solve_rocm_dense_factorization(args...; kwargs...)
     error("ROCm dense solve requested, but AMDGPU.jl is not loaded.")
+end
+
+for name in (
+    :build_metal_regular_assembly_cache,
+    :release_metal_regular_assembly_cache!,
+    :build_metal_singular_correction_cache,
+    :release_metal_singular_correction_cache!,
+    :build_metal_field_evaluation_cache,
+    :release_metal_field_evaluation_cache!,
+    :build_metal_burton_miller_identity_cache,
+    :release_metal_burton_miller_identity_cache!,
+    :build_metal_sparse_scatter_cache,
+    :release_metal_sparse_scatter_cache!,
+    :scatter_metal_sparse_to_dense!,
+    :metal_dense_lu!,
+    :solve_metal_dense_factorization,
+    :metal_host_operators,
+    :build_metal_fused_identity_cache,
+    :release_metal_fused_identity_cache!,
+    :assemble_burton_miller_neumann_system_metal,
+    :metal_host_burton_miller_system,
+    :solve_metal_burton_miller_system,
+    :solve_metal_burton_miller_system_with_report,
+    :release_metal_burton_miller_system!,
+    :assemble_regular_galerkin_operators_metal_regular,
+    :evaluate_galerkin_field_metal,
+    :metal_sweep_memory_available,
+)
+    @eval function $(name)(args...; kwargs...)
+        error($(string(name)) * " requested, but Metal.jl is not loaded. Run with the julia_metal project on Apple Silicon.")
+    end
 end
 
 function _cuda_burton_miller_rhs(operators, identity_cache::CudaBurtonMillerIdentityCache, d_q_neumann, coupling::Complex{T}) where {T<:AbstractFloat}
@@ -1416,6 +1708,14 @@ function solve_burton_miller_neumann(operators, identity_p1_p1, identity_p1_dp0,
             release_rocm_burton_miller_identity_cache!(identity_cache)
         end
     end
+    if gpu_backend == :metal
+        identity_cache = build_metal_burton_miller_identity_cache(identity_p1_p1, identity_p1_dp0, T)
+        try
+            return solve_burton_miller_neumann(operators, identity_cache, q_neumann, k)
+        finally
+            release_metal_burton_miller_identity_cache!(identity_cache)
+        end
+    end
 
     identity_cache = build_cuda_burton_miller_identity_cache(identity_p1_p1, identity_p1_dp0, T)
     try
@@ -1466,6 +1766,7 @@ function build_field_evaluation_cache(mesh::BoundaryMesh{T}, rule::TriangleRule{
     )
 end
 
+include(joinpath(@__DIR__, "BeatEngineDenseSolve.jl"))
 include(joinpath(@__DIR__, "BeatEngineCpu.jl"))
 
 if CUDA_MODULE !== nothing
@@ -1474,6 +1775,10 @@ end
 
 if AMDGPU_MODULE !== nothing
     include(joinpath(@__DIR__, "BeatEngineRocm.jl"))
+end
+
+if METAL_MODULE !== nothing
+    include(joinpath(@__DIR__, "BeatEngineMetal.jl"))
 end
 
 end

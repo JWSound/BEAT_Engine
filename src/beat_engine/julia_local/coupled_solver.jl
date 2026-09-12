@@ -22,7 +22,8 @@ function record_result_provenance!(result, request)
     diagnostics["phasor_convention"] = phasor_convention()
     backend = get(diagnostics, "bem_backend", get(diagnostics, "linear_backend", nothing))
     device, device_error = try
-        accelerator = backend == "cuda" ? BeatEngineCore.CUDA_MODULE : backend == "rocm" ? BeatEngineCore.AMDGPU_MODULE : nothing
+        accelerator = backend == "cuda" ? BeatEngineCore.CUDA_MODULE : backend == "rocm" ? BeatEngineCore.AMDGPU_MODULE :
+                      backend == "metal" ? BeatEngineCore.METAL_MODULE : nothing
         (backend == "cpu" ? Sys.CPU_NAME : accelerator === nothing ? nothing : string(accelerator.device()), nothing)
     catch exception
         (nothing, sprint(showerror, exception))
@@ -698,6 +699,8 @@ function exterior_field(points, mesh, pressure, neumann, wavenumber, cache, back
         return evaluate_galerkin_field_cuda(points, mesh, pressure, neumann, wavenumber, cache)
     elseif backend == :rocm
         return evaluate_galerkin_field_rocm(points, mesh, pressure, neumann, wavenumber, cache)
+    elseif backend == :metal
+        return evaluate_galerkin_field_metal(points, mesh, pressure, neumann, wavenumber, cache)
     end
     return evaluate_galerkin_field_cpu(points, mesh, pressure, neumann, wavenumber, cache)
 end
@@ -771,7 +774,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     FloatType = precision_name == "float64" ? Float64 : precision_name == "float32" ? Float32 :
                 error("Exterior precision must be float32 or float64.")
     backend = Symbol(lowercase(String(get(options, "bem_backend", "cpu"))))
-    backend in (:cpu, :cuda, :rocm) || error("Exterior BEM backend must be cpu, cuda, or rocm.")
+    backend in (:cpu, :cuda, :rocm, :metal) || error("Exterior BEM backend must be cpu, cuda, rocm, or metal.")
     requested_assembly = lowercase(String(get(options, "burton_miller_assembly", "direct_system")))
     requested_assembly in ("direct_system", "operator_matrices") || error(
         "Exterior burton_miller_assembly must be direct_system or operator_matrices.",
@@ -811,11 +814,20 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
         mesh, p1_space, dp0_space, base_rule, :p1, :dp0; symmetry_mode=symmetry_mode,
     )
     cpu_field_cache = build_field_evaluation_cache(mesh, base_rule; symmetry_mode=symmetry_mode)
-    accelerator_backend = backend in (:cuda, :rocm)
+    accelerator_backend = backend in (:cuda, :rocm, :metal)
     device_cache = if backend == :cuda
         build_cuda_regular_assembly_cache(mesh, base_rule)
     elseif backend == :rocm
         build_rocm_regular_assembly_cache(
+            mesh,
+            p1_space,
+            dp0_space,
+            base_rule;
+            singular_order=singular_order,
+            symmetry_mode=symmetry_mode,
+        )
+    elseif backend == :metal
+        build_metal_regular_assembly_cache(
             mesh,
             p1_space,
             dp0_space,
@@ -830,6 +842,8 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
         build_cuda_field_evaluation_cache(cpu_field_cache)
     elseif backend == :rocm
         build_rocm_field_evaluation_cache(cpu_field_cache)
+    elseif backend == :metal
+        build_metal_field_evaluation_cache(cpu_field_cache)
     else
         cpu_field_cache
     end
@@ -837,6 +851,11 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
         BeatEngineCore.build_cuda_singular_correction_cache(singular_cache, p1_space, dp0_space)
     elseif backend == :rocm
         build_rocm_singular_correction_cache(singular_cache)
+    elseif backend == :metal
+        # Metal's host-staged assembly runs the singular correction on the CPU
+        # and rejects a native device cache, so only build one for :native.
+        BeatEngineCore._normalized_metal_assembly_mode(nothing) == :native ?
+        build_metal_singular_correction_cache(singular_cache) : nothing
     else
         nothing
     end
@@ -862,6 +881,10 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     cancel_path = get(request, "cancel_path", nothing)
     cancel_requested() = cancel_path !== nothing && isfile(String(cancel_path))
     solved_count = 0
+    # The operator set for the frequency currently in flight. Held out here so
+    # the outer `finally` frees its device buffers when the solve, the field
+    # evaluation, or result emission throws.
+    current_operators = nothing
     try
         for (frequency_index, raw_frequency) in enumerate(request["frequencies_hz"])
             cancel_requested() && return (cancelled=true, solved_count=solved_count)
@@ -928,14 +951,22 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     device_image_singular_cache=device_image_singular_cache,
                     symmetry_mode=symmetry_mode,
                 )
+                if backend == :metal
+                    # Metal has no GPU LU: unified memory lets the host wrap
+                    # the operators in place, and one CPU factorization is shared
+                    # across every excitation port. The host tuple owns the device
+                    # storage and is released after this frequency's solves.
+                    operators = metal_host_operators(operators)
+                end
+                current_operators = operators
                 assembly_s = (time_ns() - assembly_started) / 1.0e9
                 solve_started = time_ns()
-                cpu_system = backend == :cpu ? build_burton_miller_neumann_cpu_system(
+                cpu_system = backend in (:cpu, :metal) ? build_burton_miller_neumann_cpu_system(
                     operators, selected_identity[1], selected_identity[2], wavenumber,
                 ) : nothing
                 pressures = Vector{Vector{Complex{FloatType}}}()
                 for neumann in neumann_values
-                    pressure = backend == :cpu ?
+                    pressure = backend in (:cpu, :metal) ?
                                solve_burton_miller_neumann_cpu_system(cpu_system, neumann, FloatType) :
                                solve_burton_miller_neumann(
                         operators, device_identity_cache, neumann, wavenumber,
@@ -1035,10 +1066,12 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 "symmetry" => String(symmetry_mode),
                 "formulation" => "exterior_burton_miller_neumann",
                 "burton_miller_assembly" => assembly_mode,
-                "factorization_count" => direct_cuda_assembly || backend == :cpu ? 1 : length(excitations),
+                "factorization_count" => direct_cuda_assembly || backend in (:cpu, :metal) ? 1 : length(excitations),
                 "linear_solver" => backend == :cpu ?
                                    "cpu_dense_lu" :
-                                   backend == :cuda ? "cuda_dense_lu" : "rocm_rocsolver_dense_lu",
+                                   backend == :cuda ? "cuda_dense_lu" :
+                                   backend == :metal ? "metal_assembly_cpu_dense_lu" :
+                                   "rocm_rocsolver_dense_lu",
                 "bounded_region_count" => 0,
                 "interface_count" => 0,
                 "regular_quadrature_mode" => selection.mode,
@@ -1063,9 +1096,16 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
             println(JSON.json(event_mode ? Dict("type" => "result", "result" => result) : result))
             flush(stdout)
             operators === nothing || release_operator_storage!(operators)
+            current_operators = nothing
             solved_count = frequency_index
         end
     finally
+        if current_operators !== nothing
+            try
+                release_operator_storage!(current_operators)
+            catch
+            end
+        end
         if device_identity_cache !== nothing
             backend == :cuda ?
             release_cuda_burton_miller_identity_cache!(device_identity_cache) :
@@ -1078,6 +1118,12 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 release_rocm_singular_correction_cache!(device_singular_cache)
             field_cache === cpu_field_cache || release_rocm_field_evaluation_cache!(field_cache)
             device_cache === nothing || release_rocm_regular_assembly_cache!(device_cache)
+        end
+        if backend == :metal
+            device_singular_cache === nothing ||
+                release_metal_singular_correction_cache!(device_singular_cache)
+            field_cache === cpu_field_cache || release_metal_field_evaluation_cache!(field_cache)
+            device_cache === nothing || release_metal_regular_assembly_cache!(device_cache)
         end
     end
     return (cancelled=cancel_requested(), solved_count=solved_count)
@@ -2191,8 +2237,8 @@ function solve_request_impl(request; event_mode=false)
         error("Unsupported coupled precision: $precision_name. Expected float32 or float64.")
     end
     bem_backend = Symbol(lowercase(String(get(solver_options, "bem_backend", "cpu"))))
-    bem_backend in (:cpu, :cuda, :rocm) ||
-        error("Unsupported coupled BEM backend: $bem_backend. Expected cpu, cuda, or rocm.")
+    bem_backend in (:cpu, :cuda, :rocm, :metal) ||
+        error("Unsupported coupled BEM backend: $bem_backend. Expected cpu, cuda, rocm, or metal.")
     symmetry_mode = BeatEngineCore.normalized_symmetry_mode(
         get(solver_options, "symmetry", "off"),
     )
@@ -2424,8 +2470,9 @@ function solve_request_impl(request; event_mode=false)
     )
     # CPU condensation is deliberately isolated from the accelerator implementations. CUDA
     # continues to use cuDSS and ROCm continues to use the hybrid CPU-Schur/ROCm-dense path in
-    # BeatEngineCoupled.
-    use_condensed_solver = static_condensation && bem_backend == :cpu
+    # BeatEngineCoupled. Metal has no GPU LU, so it uses the CPU condensed solver with its
+    # BEM operators assembled on the GPU.
+    use_condensed_solver = static_condensation && bem_backend in (:cpu, :metal)
     quadrature_selections = if use_condensed_solver
         mode = lowercase(String(get(solver_options, "regular_quadrature_mode", "fixed")))
         mode in ("fixed", "wavelength") || error(
@@ -2476,6 +2523,7 @@ function solve_request_impl(request; event_mode=false)
                 retained_fem_vertices=retained_fem_vertices,
                 bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
                 wall_impedances=fem_domains.wall_impedances,
+                bem_backend=bem_backend,
             )
         else
             prepare_coupled_cache(
@@ -2764,6 +2812,15 @@ function solve_request_impl(request; event_mode=false)
                                     coupled_system.wavenumber,
                                     coupled_system.field_cache,
                                 )
+                            elseif bem_backend == :metal
+                                evaluate_galerkin_field_metal(
+                                    points,
+                                    bem_mesh,
+                                    solution.bem_pressure,
+                                    solution.bem_neumann,
+                                    coupled_system.wavenumber,
+                                    coupled_system.field_cache,
+                                )
                             else
                                 evaluate_galerkin_field_cpu(
                                     points,
@@ -2815,6 +2872,15 @@ function solve_request_impl(request; event_mode=false)
                             )
                         elseif bem_backend == :rocm
                             evaluate_galerkin_field_rocm(
+                                points,
+                                bem_mesh,
+                                combined_pressure,
+                                combined_neumann,
+                                coupled_system.wavenumber,
+                                coupled_system.field_cache,
+                            )
+                        elseif bem_backend == :metal
+                            evaluate_galerkin_field_metal(
                                 points,
                                 bem_mesh,
                                 combined_pressure,
@@ -3179,6 +3245,8 @@ function release_bem_field_evaluation_cache!(cache_key::String)
             )
         elseif entry.backend == :rocm
             release_rocm_field_evaluation_cache!(entry.field_cache)
+        elseif entry.backend == :metal
+            release_metal_field_evaluation_cache!(entry.field_cache)
         end
     end
     filter!(!=(cache_key), BEM_FIELD_EVALUATION_CACHE_ORDER)
@@ -3247,6 +3315,8 @@ function retained_bem_field_evaluation_cache(
         build_cuda_field_evaluation_cache(cpu_cache)
     elseif backend == :rocm
         build_rocm_field_evaluation_cache(cpu_cache)
+    elseif backend == :metal
+        build_metal_field_evaluation_cache(cpu_cache)
     else
         cpu_cache
     end
@@ -3272,7 +3342,7 @@ function evaluate_bem_field_request_impl(request, request_path)
     FloatType = precision_name == "float64" ? Float64 : precision_name == "float32" ? Float32 :
                 error("Exterior field precision must be float32 or float64.")
     backend = Symbol(lowercase(String(get(request, "bem_backend", "cpu"))))
-    backend in (:cpu, :cuda, :rocm) || error("Exterior field backend must be cpu, cuda, or rocm.")
+    backend in (:cpu, :cuda, :rocm, :metal) || error("Exterior field backend must be cpu, cuda, rocm, or metal.")
     symmetry = BeatEngineCore.normalized_symmetry_mode(get(request, "symmetry", "off"))
     retained = retained_bem_field_evaluation_cache(request, request_path, FloatType, backend, symmetry)
     mesh = retained.mesh
@@ -3326,6 +3396,15 @@ function evaluate_bem_field_request_impl(request, request_path)
         )
     elseif backend == :rocm
         return evaluate_galerkin_field_rocm(
+            points,
+            mesh,
+            pressure,
+            normal_derivative,
+            wavenumber,
+            field_cache,
+        )
+    elseif backend == :metal
+        return evaluate_galerkin_field_metal(
             points,
             mesh,
             pressure,

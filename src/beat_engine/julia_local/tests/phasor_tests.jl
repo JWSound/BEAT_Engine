@@ -21,6 +21,10 @@
             a,b = BeatEngineCore.burton_miller_neumann_matrices(op,ipp,ipq,k)
             p = solve_burton_miller_neumann(op,ipp,ipq,q,k)
             field = evaluate_galerkin_field_cpu(points,mesh,p,q,k,cache)
+            direct_cpu = assemble_burton_miller_neumann_system_cpu(mesh,p1,dp0,q,k,rule;
+                identity_p1_p1=ipp,identity_p1_dp0=ipq,singular_order=3)
+            @test direct_cpu.matrix ≈ a rtol=5f-4 atol=5f-5
+            @test vec(direct_cpu.rhs) ≈ b*q rtol=5f-4 atol=5f-5
             if cuda_available()
                 dc = build_cuda_regular_assembly_cache(mesh,rule)
                 sc = build_singular_correction_cache(mesh,3)
@@ -131,3 +135,5 @@ if get(ENV,"BLAB_RUN_COUPLED_REFERENCE","0") == "1"
         end
     end
 end
+
+include(joinpath(@__DIR__, "source_driver_phasor_tests.jl"))
