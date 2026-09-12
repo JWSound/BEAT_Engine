@@ -24,7 +24,7 @@ import array
 import base64
 import ctypes
 import json
-import os
+import platform
 import subprocess
 import sys
 import threading
@@ -44,7 +44,7 @@ class PeakMemory:
     """
 
     def __init__(self, pid: int, interval_s: float = 0.02):
-        self.pid, self.interval_s, self.peak = pid, interval_s, 0
+        self.pid, self.interval_s, self.peak = pid, interval_s, None
         self._read = self._reader()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -57,34 +57,44 @@ class PeakMemory:
                 _fields_ = [("uuid", ctypes.c_uint8 * 16), ("vals", ctypes.c_uint64 * 36)]
 
             buf = RUsageV4()
-            return lambda: buf.vals[7] if libc.proc_pid_rusage(self.pid, 4, ctypes.byref(buf)) == 0 else 0
+            return lambda: buf.vals[7] if libc.proc_pid_rusage(self.pid, 4, ctypes.byref(buf)) == 0 else None
         status = Path(f"/proc/{self.pid}/status")
         if status.exists():
             def read():
                 for line in status.read_text().splitlines():
                     if line.startswith("VmRSS:"):
                         return int(line.split()[1]) * 1024
-                return 0
+                return None
             return read
-        return lambda: 0
+        return lambda: None
 
-    def current_mb(self) -> float:
-        return self._read() / 2**20
+    def current_mb(self) -> float | None:
+        value = self._read()
+        return None if value is None else value / 2**20
+
+    @property
+    def peak_mb(self) -> float | None:
+        return None if self.peak is None else self.peak / 2**20
+
+    def _sample(self):
+        value = self._read()
+        if value is not None:
+            self.peak = value if self.peak is None else max(self.peak, value)
 
     def _loop(self):
         while not self._stop.is_set():
-            self.peak = max(self.peak, self._read())
+            self._sample()
             self._stop.wait(self.interval_s)
 
     def __enter__(self):
-        self.peak = self._read()
+        self._sample()
         self._thread.start()
         return self
 
     def __exit__(self, *exc):
         self._stop.set()
         self._thread.join()
-        self.peak = max(self.peak, self._read())
+        self._sample()
 
 
 def source_request(mesh: Path, backend: str, frequencies, scale: float, tag: int):
@@ -198,7 +208,7 @@ def main():
             before_mb = memory.current_mb()
             with memory:
                 wall_s, rows = submit(worker, build(freqs), scratch / f"sweep_{repeat + 1}.json")
-            sweeps.append((wall_s, rows, before_mb, memory.peak / 2**20))
+            sweeps.append((wall_s, rows, before_mb, memory.peak_mb))
     finally:
         worker.terminate()
 
@@ -220,7 +230,7 @@ def write_run(out, args, commit, startup_s, warmup_s, repeat, wall_s, rows, befo
         outputs.update(outputs_of(result))
     record = {
         "label": args.label, "commit": commit, "backend": args.backend, "precision": args.precision,
-        "case": str(args.request or args.mesh), "threads": args.threads, "host": os.uname().machine,
+        "case": str(args.request or args.mesh), "threads": args.threads, "host": platform.machine(),
         "startup_s": startup_s, "warmup_s": warmup_s, "repeat_in_worker": repeat, "wall_s": wall_s,
         "memory_mb": {"before_sweep": before_mb, "peak_sweep": peak_mb},
         "frequencies": frequencies, "outputs": outputs,
@@ -231,7 +241,8 @@ def write_run(out, args, commit, startup_s, warmup_s, repeat, wall_s, rows, befo
         for key, value in row["timings"].items():
             totals[key] = totals.get(key, 0.0) + value
     sections = "  ".join(f"{k}={v:.2f}" for k, v in sorted(totals.items()) if v >= 0.01)
-    print(f"{commit} {args.backend} r{repeat}: wall {wall_s:.2f} s  peak {peak_mb:.0f} MB  {sections}")
+    peak = "unavailable" if peak_mb is None else f"{peak_mb:.0f} MB"
+    print(f"{commit} {args.backend} r{repeat}: wall {wall_s:.2f} s  peak {peak}  {sections}")
 
 
 if __name__ == "__main__":

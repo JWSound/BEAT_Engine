@@ -8,7 +8,7 @@ compared in the order given. With --variance (the run-to-run half-range, in %,
 established for this machine and workload), a change is called real when it
 exceeds twice that, and "close" otherwise: add runs and use the per-section
 timings to locate it. Without --variance, stages with 3+ runs are compared by
-whether their min-max ranges overlap. Accuracy is each stage's first run
+whether their min-max ranges overlap. Accuracy is the worst across all runs
 against --reference: relative L2 over every output, and the worst dB error over
 points within 30 dB of each output's peak (deeper nulls are noise in dB).
 """
@@ -24,31 +24,58 @@ from pathlib import Path
 
 
 def complex_values(entry):
-    raw, _ = entry
+    raw, shape = entry
+    if not isinstance(shape, list) or any(type(n) is not int or n < 0 for n in shape):
+        raise ValueError("invalid output shape")
     floats = array.array("d")
-    floats.frombytes(base64.b64decode(raw))
+    floats.frombytes(base64.b64decode(raw, validate=True))
+    if len(floats) != 2 * math.prod(shape):
+        raise ValueError("output length does not match its shape")
+    if not all(math.isfinite(value) for value in floats):
+        raise ValueError("output contains non-finite values")
     return [complex(floats[i], floats[i + 1]) for i in range(0, len(floats), 2)]
 
 
 def accuracy(run, ref):
     """{quantity: (relative L2, worst dB within 30 dB of peak)}."""
     groups = {}
+    if not ref["outputs"]:
+        raise ValueError("reference has no outputs")
+    if run["outputs"].keys() != ref["outputs"].keys():
+        raise ValueError("output quantities/frequencies do not match the reference")
     for key, entry in ref["outputs"].items():
-        if key in run["outputs"]:
-            groups.setdefault(key.split("@")[0], []).append((complex_values(run["outputs"][key]),
-                                                            complex_values(entry)))
+        actual = run["outputs"][key]
+        if actual[1] != entry[1]:
+            raise ValueError(f"{key}: output shape does not match the reference")
+        groups.setdefault(key.split("@")[0], []).append((complex_values(actual), complex_values(entry)))
     result = {}
     for quantity, pairs in groups.items():
         num = den = worst = 0.0
         for values, reference in pairs:
             num += sum(abs(a - b) ** 2 for a, b in zip(values, reference))
             den += sum(abs(b) ** 2 for b in reference)
-            peak = max(abs(b) for b in reference)
+            peak = max((abs(b) for b in reference), default=0.0)
             for a, b in zip(values, reference):
-                if abs(b) > peak * 10 ** (-30 / 20) and abs(a) > 0:
-                    worst = max(worst, abs(20 * math.log10(abs(a) / abs(b))))
-        result[quantity] = (math.sqrt(num / den) if den else 0.0, worst)
+                if abs(b) > peak * 10 ** (-30 / 20):
+                    error = abs(20 * math.log10(abs(a) / abs(b))) if abs(a) else math.inf
+                    worst = max(worst, error)
+        relative = math.sqrt(num / den) if den else (math.inf if num else 0.0)
+        result[quantity] = (relative, worst)
     return result
+
+
+def stage_accuracy(runs, reference):
+    """Validate every repeat and report each metric's worst value."""
+    worst = {}
+    for index, run in enumerate(runs, start=1):
+        try:
+            metrics = accuracy(run, reference)
+        except ValueError as exc:
+            raise ValueError(f"run {index}: {exc}") from exc
+        for quantity, (relative, db) in metrics.items():
+            previous = worst.get(quantity, (0.0, 0.0))
+            worst[quantity] = (max(previous[0], relative), max(previous[1], db))
+    return worst
 
 
 def sections(runs):
@@ -83,16 +110,24 @@ def main():
         walls = [r["wall_s"] for r in runs]
         median = statistics.median(walls)
         half_range = (max(walls) - min(walls)) / 2 / median * 100
-        peak = statistics.median(r["memory_mb"]["peak_sweep"] for r in runs)
-        growth = statistics.median(r["memory_mb"]["peak_sweep"] - r["memory_mb"]["before_sweep"] for r in runs)
+        memories = [r["memory_mb"] for r in runs]
         print(f"{label} ({runs[0]['commit']}, {runs[0]['backend']}, n={len(runs)})")
         print(f"  wall    {median:.2f} s  range {min(walls):.2f}-{max(walls):.2f} (±{half_range:.1f}%)"
               f"  {first_median / median:.2f}x vs {stages[0][0]}")
-        print(f"  memory  peak {peak:.0f} MB, +{growth:.0f} MB over the pre-sweep worker")
+        if all(m["peak_sweep"] is not None and m["before_sweep"] is not None for m in memories):
+            peak = statistics.median(m["peak_sweep"] for m in memories)
+            growth = statistics.median(m["peak_sweep"] - m["before_sweep"] for m in memories)
+            print(f"  memory  peak {peak:.0f} MB, +{growth:.0f} MB over the pre-sweep worker")
+        else:
+            print("  memory  unavailable (not measured for every run)")
         print("  sections " + "  ".join(f"{k.removesuffix('_s')} {v:.2f}" for k, v in sections(runs).items()))
         if reference is not None:
-            print("  accuracy " + "; ".join(f"{q} {rel:.1e} rel, {db:.3f} dB"
-                                           for q, (rel, db) in accuracy(runs[0], reference).items()))
+            try:
+                metrics = stage_accuracy(runs, reference)
+            except ValueError as exc:
+                parser.error(f"{label}: {exc}")
+            print("  accuracy (worst across runs) " + "; ".join(f"{q} {rel:.1e} rel, {db:.3f} dB"
+                                                               for q, (rel, db) in metrics.items()))
     print("changes:")
     for (label_a, runs_a), (label_b, runs_b) in zip(stages, stages[1:]):
         a, b = [r["wall_s"] for r in runs_a], [r["wall_s"] for r in runs_b]

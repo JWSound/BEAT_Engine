@@ -57,10 +57,14 @@ checkout's meshes, so it is not committed here.
   section can cost another; the totals show it.
 - Memory: peak over the sweep and growth over the warmed worker. On macOS this
   is `phys_footprint`, which includes Metal buffers in unified memory; RSS does
-  not.
+  not. Linux reports RSS. Unsupported platforms, including Windows, store
+  `null` memory measurements and display `unavailable`, rather than zero.
 - Accuracy against a reference: Float64 CPU on `main` for compiled requests,
   `main` CPU for source requests (Float32 only). Relative L2 over each output,
-  and the worst dB error within 30 dB of each output's peak.
+  and the worst dB error within 30 dB of each output's peak. The comparison
+  checks every repeat and reports the worst of each metric across repeats.
+  Quantities, frequencies, shapes and lengths must match the reference, and
+  values must be finite; incomplete or invalid outputs stop the comparison.
 
 ## Overlap, pipelining and offload
 
