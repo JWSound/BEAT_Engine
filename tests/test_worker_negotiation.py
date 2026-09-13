@@ -179,3 +179,11 @@ def test_response_version_mismatch_discards_process(tmp_path, ready, payload):
         assert worker._process is None
     finally:
         worker.terminate()
+
+
+def test_interface_velocity_requires_advertised_output(ready, payload):
+    payload["outputs"][0]["quantity"] = "interface_average_normal_velocity"
+    assert negotiate_submission(ready, payload, "solve")["result_schema_version"] == 2
+    ready.pop("optional_output_quantities")
+    with pytest.raises(WorkerCompatibilityError, match="interface-average velocity"):
+        negotiate_submission(ready, payload, "solve")

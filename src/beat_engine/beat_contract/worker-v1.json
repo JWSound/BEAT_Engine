@@ -48,5 +48,8 @@
   "phasor_conventions": [
     "exp(-i omega t)",
     "exp(+i omega t)"
+  ],
+  "optional_output_quantities": [
+    "interface_average_normal_velocity"
   ]
 }

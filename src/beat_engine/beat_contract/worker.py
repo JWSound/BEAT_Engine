@@ -72,6 +72,11 @@ def negotiate_submission(info: dict, request: dict, operation: str) -> dict:
         ):
             _require(version in contracts[name], f"{name} version {version} is unavailable.")
         command["result_schema_version"] = SYSTEM_RESULT_VERSION
+        if any(output["quantity"] == "interface_average_normal_velocity" for output in request["outputs"]):
+            _require(
+                "interface_average_normal_velocity" in info.get("optional_output_quantities", []),
+                "interface-average velocity output is unavailable; update BEAT Engine.",
+            )
         options = request["solver_options"]
         kinds = {region["kind"] for region in request["compiled_system"]["regions"]}
         kind = (

@@ -1552,3 +1552,5 @@ end
 if cuda_available()
     include(joinpath(@__DIR__, "coupled_bem_cuda_tests.jl"))
 end
+
+include(joinpath(@__DIR__, "interface_velocity_tests.jl"))

@@ -14,6 +14,9 @@ using .BeatEngineCoupledCondensed
 include(joinpath(@__DIR__, "src", "BeatEngineSpeakerRom.jl"))
 using .BeatEngineSpeakerRom
 
+include(joinpath(@__DIR__, "src", "BeatEngineInterfaceVelocity.jl"))
+using .BeatEngineInterfaceVelocity
+
 const DEFAULT_TRANSDUCER_REFERENCE_VOLTAGE_V = 2.83
 const RUN_MESH_PROVENANCE = Ref{Any}([])
 
@@ -2440,6 +2443,9 @@ function solve_request_impl(request; event_mode=false)
         boundaries,
         bem_domain,
     )
+    interface_averages = interface_average_weights(
+        fem_mesh, combined_interfaces.maps, combined_interfaces.ranges, FloatType,
+    )
     interface_map = combined_interfaces.map
     mesh_setup_s = (time_ns() - mesh_setup_started) / 1.0e9
     sound_speed = FloatType(reference_sound_speed)
@@ -2847,6 +2853,22 @@ function solve_request_impl(request; event_mode=false)
                             ),
                         ),
                     )
+                elseif quantity == "interface_average_normal_velocity"
+                    push!(quantities, quantity_wire(
+                        output,
+                        rows([interface_average_normal_velocity(
+                            solution.interface_flux, combined_interfaces.ranges,
+                            interface_averages.weights, BeatEngineCoupled.neumann_scale(density, FloatType(2pi) * frequency_hz),
+                        ) for solution in solutions], FloatType),
+                        "m/s", ["excitation", "interface"],
+                        metadata=Dict(
+                            "interface_ids" => [String(interface["id"]) for interface in interfaces],
+                            "represented_area_m2" => interface_averages.areas,
+                            "normal_orientation" => "bounded_region_outward",
+                            "spatial_average" => "area_weighted_complex_normal_velocity",
+                            "amplitude_convention" => "rms",
+                        ),
+                    ))
                 elseif quantity == "interface_normal_derivative"
                     push!(
                         quantities,
