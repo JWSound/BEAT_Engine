@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+from .backends import backend_info
+
 
 @dataclass(frozen=True)
 class EnginePaths:
@@ -13,8 +15,7 @@ class EnginePaths:
 
 
 def engine_paths(backend: str = "cpu") -> EnginePaths:
-    if backend not in {"cpu", "cuda", "rocm", "metal"}:
-        raise ValueError(f"Unsupported BEAT backend: {backend}")
+    info = backend_info(backend)
     root = Path(__file__).resolve().parent
-    project = root / ("julia_local" if backend == "cpu" else f"julia_{backend}")
+    project = root / info.project_directory
     return EnginePaths(root, project, root / "julia_local/coupled_solver.jl", root / "julia_local/solver.jl")

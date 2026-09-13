@@ -5,16 +5,19 @@ import json
 import subprocess
 from dataclasses import asdict
 
-from . import EngineWorker, engine_paths
+from . import EngineWorker, backend_catalog, engine_paths
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="beat-engine")
-    parser.add_argument("command", choices=("paths", "instantiate", "doctor"))
-    parser.add_argument("--backend", choices=("cpu", "cuda", "rocm", "metal"), default="cpu")
+    parser.add_argument("command", choices=("backends", "paths", "instantiate", "doctor"))
+    parser.add_argument("--backend", choices=tuple(info.backend_id for info in backend_catalog()), default="cpu")
     parser.add_argument("--julia", default="julia")
     parser.add_argument("--threads", default="auto")
     args = parser.parse_args()
+    if args.command == "backends":
+        print(json.dumps([asdict(info) for info in backend_catalog()], indent=2))
+        return
     paths = engine_paths(args.backend)
     if args.command == "paths":
         print(json.dumps({key: str(value) for key, value in asdict(paths).items()}, indent=2))

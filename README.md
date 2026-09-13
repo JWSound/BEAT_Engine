@@ -89,10 +89,24 @@ diagnostics. Coupled Metal solves assemble the four operators on the GPU and run
 the coupled algebra, including FEM static condensation, on the host. Register caps are explicit hardware tuning options; the compiler
 default is preserved. See [coupled CUDA architecture and controls](docs/Coupled%20CUDA%20Assembly.md).
 
-The stable package release is `0.1.2`. CI builds a wheel after independent
+The package version is `0.1.3`. CI builds a wheel after independent
 Python and CPU checks on Windows, Linux, and macOS. The manually dispatched release
 workflow requires a successful CI run for the tag's exact commit before attaching
 wheel/sdist artifacts to a stable GitHub release. No PyPI publication is configured.
 
 History and original authorship were retained from Boundary Lab. See
 [extraction provenance](docs/EXTRACTION.md) and the repository [LICENSE](LICENSE).
+
+## Backend catalog
+
+`beat_engine.backend_catalog()` returns immutable `BackendInfo` records for the
+backends supplied by the installed engine. Each record contains a stable ID,
+display label, Julia project directory, supported platforms and solve capabilities.
+`backend_info(id)` looks up one record, and `engine_paths(id)` resolves its assets.
+The catalog also drives the CLI: `python -m beat_engine backends` prints JSON.
+
+Listing backends does not launch Julia, inspect hardware, install dependencies or
+access the network. A listed backend may not work on the current machine. Clients
+should retain the selected ID and let worker negotiation validate device/runtime
+availability and request compatibility at solve time. Preferences can therefore
+list the catalog immediately without probing or changing options by host.

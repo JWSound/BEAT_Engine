@@ -6,7 +6,7 @@
   },
   "engine": {
     "name": "BEAT Engine",
-    "version": "0.1.2"
+    "version": "0.1.3"
   },
   "contracts": {
     "system_request": [
