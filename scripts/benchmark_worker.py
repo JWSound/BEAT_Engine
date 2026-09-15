@@ -60,11 +60,13 @@ class PeakMemory:
             return lambda: buf.vals[7] if libc.proc_pid_rusage(self.pid, 4, ctypes.byref(buf)) == 0 else None
         status = Path(f"/proc/{self.pid}/status")
         if status.exists():
+
             def read():
                 for line in status.read_text().splitlines():
                     if line.startswith("VmRSS:"):
                         return int(line.split()[1]) * 1024
                 return None
+
             return read
         return lambda: None
 
@@ -99,8 +101,16 @@ class PeakMemory:
 
 def source_request(mesh: Path, backend: str, frequencies, scale: float, tag: int):
     return {
-        "config": {"mesh_file": str(mesh), "scale_factor": scale, "tag_throat": tag, "symmetry": "off",
-                   "step_size": 5.0, "distance": 2.0, "quadrature_order": 4, "singular_order": 4},
+        "config": {
+            "mesh_file": str(mesh),
+            "scale_factor": scale,
+            "tag_throat": tag,
+            "symmetry": "off",
+            "step_size": 5.0,
+            "distance": 2.0,
+            "quadrature_order": 4,
+            "singular_order": 4,
+        },
         "frequencies_hz": frequencies,
         "beat_engine_backend": backend,
     }
@@ -166,11 +176,13 @@ def main():
     parser.add_argument("--tag", type=int, default=2, help="--mesh radiator physical tag")
     parser.add_argument("--threads", default="4")
     parser.add_argument("--label", default="", help="free text stored with the run")
-    parser.add_argument("--advertise-metal", action="store_true",
-                        help="for workers that run Metal but predate advertising it")
+    parser.add_argument(
+        "--advertise-metal", action="store_true", help="for workers that run Metal but predate advertising it"
+    )
     parser.add_argument("--repeats", type=int, default=1, help="timed sweeps in the one warm worker")
-    parser.add_argument("--out", type=Path, required=True,
-                        help="run JSON; with --repeats N > 1, one file per sweep as <out>_r<i>.json")
+    parser.add_argument(
+        "--out", type=Path, required=True, help="run JSON; with --repeats N > 1, one file per sweep as <out>_r<i>.json"
+    )
     args = parser.parse_args()
 
     try:
@@ -186,22 +198,26 @@ def main():
         build = lambda f: source_request(args.mesh.resolve(), args.backend, f, args.scale, args.tag)  # noqa: E731
 
     root = Path(paths.root)
-    commit = subprocess.run(["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
-                            capture_output=True, text=True).stdout.strip()
+    commit = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--short", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
     scratch = args.out.with_suffix(".requests")
     scratch.mkdir(parents=True, exist_ok=True)
-    worker = EngineWorker(julia_executable="julia", solver_script=script,
-                          julia_threads=args.threads, julia_project=paths.project)
+    worker = EngineWorker(
+        julia_executable="julia", solver_script=script, julia_threads=args.threads, julia_project=paths.project
+    )
     try:
         started = time.perf_counter()
         worker.ensure_started()
         startup_s = time.perf_counter() - started
         if args.advertise_metal:
             worker._worker_info.setdefault("backends", {}).setdefault(
-                "metal", {"available": True, "reason": "", "phasor_conventions": ["exp(-i omega t)"]})
+                "metal", {"available": True, "reason": "", "phasor_conventions": ["exp(-i omega t)"]}
+            )
         freqs = list(args.frequencies)
-        warmup_s, _ = submit(worker, build([freqs[len(freqs) // 4], freqs[3 * len(freqs) // 4]]),
-                             scratch / "warmup.json")
+        warmup_s, _ = submit(
+            worker, build([freqs[len(freqs) // 4], freqs[3 * len(freqs) // 4]]), scratch / "warmup.json"
+        )
         sweeps = []
         for repeat in range(args.repeats):
             memory = PeakMemory(worker._process.pid)
@@ -222,18 +238,29 @@ def write_run(out, args, commit, startup_s, warmup_s, repeat, wall_s, rows, befo
     for result in rows:
         diagnostics = result.get("diagnostics") or {}
         timings = result.get("timings") or diagnostics.get("timings") or {}
-        frequencies.append({
-            "freq_hz": float(result["freq_hz"]),
-            "timings": {k: v for k, v in timings.items() if isinstance(v, (int, float))},
-            "diagnostics": {k: v for k, v in diagnostics.items() if isinstance(v, (int, float, str, bool))},
-        })
+        frequencies.append(
+            {
+                "freq_hz": float(result["freq_hz"]),
+                "timings": {k: v for k, v in timings.items() if isinstance(v, (int, float))},
+                "diagnostics": {k: v for k, v in diagnostics.items() if isinstance(v, (int, float, str, bool))},
+            }
+        )
         outputs.update(outputs_of(result))
     record = {
-        "label": args.label, "commit": commit, "backend": args.backend, "precision": args.precision,
-        "case": str(args.request or args.mesh), "threads": args.threads, "host": platform.machine(),
-        "startup_s": startup_s, "warmup_s": warmup_s, "repeat_in_worker": repeat, "wall_s": wall_s,
+        "label": args.label,
+        "commit": commit,
+        "backend": args.backend,
+        "precision": args.precision,
+        "case": str(args.request or args.mesh),
+        "threads": args.threads,
+        "host": platform.machine(),
+        "startup_s": startup_s,
+        "warmup_s": warmup_s,
+        "repeat_in_worker": repeat,
+        "wall_s": wall_s,
         "memory_mb": {"before_sweep": before_mb, "peak_sweep": peak_mb},
-        "frequencies": frequencies, "outputs": outputs,
+        "frequencies": frequencies,
+        "outputs": outputs,
     }
     out.write_text(json.dumps(record))
     totals = {}

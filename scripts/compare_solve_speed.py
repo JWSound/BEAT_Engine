@@ -111,8 +111,7 @@ def speed_failures(baseline, results, threshold):
         ratio = res_med / base_med
         if threshold is not None and ratio > threshold:
             failures.append(
-                f"{stage}: median {res_med:.4f}s vs baseline {base_med:.4f}s "
-                f"({ratio:.2f}x > {threshold:.2f}x)"
+                f"{stage}: median {res_med:.4f}s vs baseline {base_med:.4f}s ({ratio:.2f}x > {threshold:.2f}x)"
             )
         elif threshold is not None:
             notes.append(f"{stage}: {res_med:.4f}s vs {base_med:.4f}s ({ratio:.2f}x)")
@@ -120,14 +119,21 @@ def speed_failures(baseline, results, threshold):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--baseline", required=True, help="committed baseline JSON")
     parser.add_argument("--results", required=True, help="benchmark run JSON to check")
-    parser.add_argument("--time-threshold", type=float, default=None,
-                        help="fail if any stage median exceeds the baseline by more than this factor")
-    parser.add_argument("--accuracy-tolerance", type=float, default=1e-4,
-                        help="fail if a correctness norm drifts by more than this relative amount")
+    parser.add_argument(
+        "--time-threshold",
+        type=float,
+        default=None,
+        help="fail if any stage median exceeds the baseline by more than this factor",
+    )
+    parser.add_argument(
+        "--accuracy-tolerance",
+        type=float,
+        default=1e-4,
+        help="fail if a correctness norm drifts by more than this relative amount",
+    )
     args = parser.parse_args(argv)
 
     with open(args.baseline, encoding="utf-8") as fh:
@@ -148,11 +154,15 @@ def main(argv=None):
 
     stage = baseline.get("summary_seconds", {}).get("total_sweep", {})
     print("Comparing solve-speed run:")
-    print(f"  workload: {results.get('mesh')} | {results.get('backend')} | "
-          f"{results.get('precision')} | {results.get('p1_dofs')} P1 dofs | "
-          f"{results.get('steps')} steps {results.get('min_freq')}-{results.get('max_freq')} Hz")
-    print(f"  baseline total_sweep median: {stage.get('median', 'n/a'):.4f} s  "
-          f"(accuracy tolerance {args.accuracy_tolerance:.1e})")
+    print(
+        f"  workload: {results.get('mesh')} | {results.get('backend')} | "
+        f"{results.get('precision')} | {results.get('p1_dofs')} P1 dofs | "
+        f"{results.get('steps')} steps {results.get('min_freq')}-{results.get('max_freq')} Hz"
+    )
+    print(
+        f"  baseline total_sweep median: {stage.get('median', 'n/a'):.4f} s  "
+        f"(accuracy tolerance {args.accuracy_tolerance:.1e})"
+    )
 
     for note in time_notes:
         print("  " + note)
@@ -164,9 +174,11 @@ def main(argv=None):
             print("  - " + f)
         return 1
 
-    print("\nPASS: correctness within tolerance"
-          + (f" and no stage regressed past {args.time_threshold:.2f}x" if args.time_threshold else "")
-          + ".")
+    print(
+        "\nPASS: correctness within tolerance"
+        + (f" and no stage regressed past {args.time_threshold:.2f}x" if args.time_threshold else "")
+        + "."
+    )
     return 0
 
 

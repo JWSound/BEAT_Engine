@@ -84,8 +84,9 @@ def sections(runs):
     for run in runs:
         for row in run["frequencies"]:
             keys.extend(k for k in row["timings"] if k not in keys)
-    totals = {k: statistics.median(sum(r["timings"].get(k, 0.0) for r in run["frequencies"]) for run in runs)
-              for k in keys}
+    totals = {
+        k: statistics.median(sum(r["timings"].get(k, 0.0) for r in run["frequencies"]) for run in runs) for k in keys
+    }
     return {k: v for k, v in totals.items() if v >= 0.01}
 
 
@@ -112,8 +113,10 @@ def main():
         half_range = (max(walls) - min(walls)) / 2 / median * 100
         memories = [r["memory_mb"] for r in runs]
         print(f"{label} ({runs[0]['commit']}, {runs[0]['backend']}, n={len(runs)})")
-        print(f"  wall    {median:.2f} s  range {min(walls):.2f}-{max(walls):.2f} (±{half_range:.1f}%)"
-              f"  {first_median / median:.2f}x vs {stages[0][0]}")
+        print(
+            f"  wall    {median:.2f} s  range {min(walls):.2f}-{max(walls):.2f} (±{half_range:.1f}%)"
+            f"  {first_median / median:.2f}x vs {stages[0][0]}"
+        )
         if all(m["peak_sweep"] is not None and m["before_sweep"] is not None for m in memories):
             peak = statistics.median(m["peak_sweep"] for m in memories)
             growth = statistics.median(m["peak_sweep"] - m["before_sweep"] for m in memories)
@@ -126,8 +129,10 @@ def main():
                 metrics = stage_accuracy(runs, reference)
             except ValueError as exc:
                 parser.error(f"{label}: {exc}")
-            print("  accuracy (worst across runs) " + "; ".join(f"{q} {rel:.1e} rel, {db:.3f} dB"
-                                                               for q, (rel, db) in metrics.items()))
+            print(
+                "  accuracy (worst across runs) "
+                + "; ".join(f"{q} {rel:.1e} rel, {db:.3f} dB" for q, (rel, db) in metrics.items())
+            )
     print("changes:")
     for (label_a, runs_a), (label_b, runs_b) in zip(stages, stages[1:]):
         a, b = [r["wall_s"] for r in runs_a], [r["wall_s"] for r in runs_b]

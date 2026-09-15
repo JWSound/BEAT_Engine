@@ -90,7 +90,7 @@ diagnostics. Coupled Metal solves assemble the four operators on the GPU and run
 the coupled algebra, including FEM static condensation, on the host. Register caps are explicit hardware tuning options; the compiler
 default is preserved. See [coupled CUDA architecture and controls](docs/Coupled%20CUDA%20Assembly.md).
 
-The package version is `0.1.3`. CI builds a wheel after independent
+The package version is `0.1.4`. CI builds a wheel after independent
 Python and CPU checks on Windows, Linux, and macOS. The manually dispatched release
 workflow requires a successful CI run for the tag's exact commit before attaching
 wheel/sdist artifacts to a stable GitHub release. No PyPI publication is configured.

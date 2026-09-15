@@ -217,7 +217,9 @@ class WorkerProcess:
             self._stderr_thread = threading.Thread(target=self._collect_stderr, args=(process,), daemon=True)
             self._stderr_thread.start()
 
-        timer = threading.Timer(self.startup_timeout_s, self._terminate, kwargs={"expected_startup": startup, "timeout": True})
+        timer = threading.Timer(
+            self.startup_timeout_s, self._terminate, kwargs={"expected_startup": startup, "timeout": True}
+        )
         timer.daemon = True
         timer.start()
         try:
@@ -250,9 +252,7 @@ class WorkerProcess:
         finally:
             timer.cancel()
 
-    def _iter_events_for_submission(
-        self, process: subprocess.Popen[str], token: _SubmissionToken
-    ) -> Iterator[dict]:
+    def _iter_events_for_submission(self, process: subprocess.Popen[str], token: _SubmissionToken) -> Iterator[dict]:
         terminal = False
         try:
             for event in self._read_events(process):

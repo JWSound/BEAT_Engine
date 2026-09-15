@@ -33,9 +33,9 @@ class EngineWorker(WorkerProcess):
         if isinstance(protocol, dict) and protocol.get("name") == "beat-worker":
             validate_worker_event(event)
         if event.get("type") in {"result", "field_result"}:
-            actual = ((event.get("result", {}).get("diagnostics") or event) if event["type"] == "result" else event).get(
-                "phasor_convention", "exp(-i omega t)"
-            )
+            actual = (
+                (event.get("result", {}).get("diagnostics") or event) if event["type"] == "result" else event
+            ).get("phasor_convention", "exp(-i omega t)")
             expected = getattr(self, "_expected_phasor", "exp(-i omega t)")
             if actual != expected:
                 raise RuntimeError(f"BEAT phasor convention mismatch: requested {expected}, received {actual}.")

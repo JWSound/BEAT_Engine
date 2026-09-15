@@ -38,8 +38,9 @@ def test_windows_report_preserves_unavailable_memory(tmp_path, monkeypatch, caps
     with benchmark.PeakMemory(os.getpid()) as memory:
         assert memory.current_mb() is None
     assert memory.peak_mb is None
-    args = argparse.Namespace(label="test", backend="cpu", precision="float32", request=None,
-                              mesh="test.msh", threads="2")
+    args = argparse.Namespace(
+        label="test", backend="cpu", precision="float32", request=None, mesh="test.msh", threads="2"
+    )
     out = tmp_path / "run.json"
     benchmark.write_run(out, args, "test", 0, 0, 1, 1, [], None, memory.peak_mb)
     record = json.loads(out.read_text())
@@ -85,11 +86,18 @@ def test_stage_checks_later_repeats():
 
 def test_cli_compares_all_repeats_with_unavailable_memory(tmp_path, monkeypatch, capsys):
     for index, value in enumerate([1, 2]):
-        record = {**run([value]), "wall_s": 1.0, "commit": "test", "backend": "cpu",
-                  "memory_mb": {"before_sweep": None, "peak_sweep": None}, "frequencies": []}
+        record = {
+            **run([value]),
+            "wall_s": 1.0,
+            "commit": "test",
+            "backend": "cpu",
+            "memory_mb": {"before_sweep": None, "peak_sweep": None},
+            "frequencies": [],
+        }
         (tmp_path / f"run{index}.json").write_text(json.dumps(record))
-    monkeypatch.setattr(sys, "argv", ["compare", "--reference", str(tmp_path / "run0.json"),
-                                     "--stage", f"cpu={tmp_path / 'run*.json'}"])
+    monkeypatch.setattr(
+        sys, "argv", ["compare", "--reference", str(tmp_path / "run0.json"), "--stage", f"cpu={tmp_path / 'run*.json'}"]
+    )
     compare.main()
     output = capsys.readouterr().out
     assert "memory  unavailable" in output
@@ -97,12 +105,19 @@ def test_cli_compares_all_repeats_with_unavailable_memory(tmp_path, monkeypatch,
 
 
 def test_cli_rejects_invalid_later_repeat(tmp_path, monkeypatch):
-    reference = {**run([1]), "wall_s": 1.0, "commit": "test", "backend": "cpu",
-                 "memory_mb": {"before_sweep": None, "peak_sweep": None}, "frequencies": []}
+    reference = {
+        **run([1]),
+        "wall_s": 1.0,
+        "commit": "test",
+        "backend": "cpu",
+        "memory_mb": {"before_sweep": None, "peak_sweep": None},
+        "frequencies": [],
+    }
     (tmp_path / "run0.json").write_text(json.dumps(reference))
     (tmp_path / "run1.json").write_text(json.dumps({**reference, "outputs": {}}))
-    monkeypatch.setattr(sys, "argv", ["compare", "--reference", str(tmp_path / "run0.json"),
-                                     "--stage", f"cpu={tmp_path / 'run*.json'}"])
+    monkeypatch.setattr(
+        sys, "argv", ["compare", "--reference", str(tmp_path / "run0.json"), "--stage", f"cpu={tmp_path / 'run*.json'}"]
+    )
     with pytest.raises(SystemExit) as exc:
         compare.main()
     assert exc.value.code == 2

@@ -38,12 +38,16 @@ def seeded_exterior_project(mesh: Path, tag: int, scale: float, symmetry: str, d
         (RadiatorConfig(name=f"{mesh.stem}:radiator", tag=tag, mesh=mesh.stem),),
     )
     path = directory / f"{mesh.stem}.blab.json"
-    path.write_text(json.dumps({
-        "schema_version": 1,
-        "symmetry": symmetry,
-        "physical_system": physical_system_to_dict(system),
-        "component_channel_by_id": channels,
-    }))
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "symmetry": symmetry,
+                "physical_system": physical_system_to_dict(system),
+                "component_channel_by_id": channels,
+            }
+        )
+    )
     return path
 
 
@@ -61,7 +65,11 @@ def main():
 
     with tempfile.TemporaryDirectory() as scratch:
         path = args.project or seeded_exterior_project(
-            args.exterior_mesh, args.tag, args.scale, args.symmetry, Path(scratch),
+            args.exterior_mesh,
+            args.tag,
+            args.scale,
+            args.symmetry,
+            Path(scratch),
         )
         capture(path, args.frequencies, args.out)
 
@@ -72,8 +80,10 @@ def capture(path: Path, frequencies, out: Path):
     prepared = prepare_headless_solve(project, spec, backend_id="beat_cpu")
     request = system_solve_request_to_dict(prepared.request)
     out.write_text(json.dumps(request))
-    print(f"{out}: {prepared.solve_kind}, symmetry {project.symmetry}, "
-          f"{len(request['excitation_port_ids'])} excitations, {len(request['frequencies_hz'])} frequencies")
+    print(
+        f"{out}: {prepared.solve_kind}, symmetry {project.symmetry}, "
+        f"{len(request['excitation_port_ids'])} excitations, {len(request['frequencies_hz'])} frequencies"
+    )
 
 
 if __name__ == "__main__":

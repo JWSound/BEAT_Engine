@@ -17,6 +17,7 @@ jobs:
           version: "1.12"
       - run: python -m pip install -e ".[dev]"
       - run: python -m ruff check src/beat_engine/*.py src/beat_engine/beat_contract tests
+      - run: python -m ruff format --check pyproject.toml scripts src tests
       - run: python -m pytest
       - run: python -m beat_engine instantiate --backend cpu
       - run: julia --threads=2 --startup-file=no --project=src/beat_engine/julia_local src/beat_engine/julia_local/tests/runtests.jl
