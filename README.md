@@ -52,6 +52,7 @@ from the installed package, including editable contributor checkouts.
 Read [the compiled-system contract](docs/BEAT%20Compiled%20System%20Contract.md),
 [worker protocol](docs/BEAT%20Worker%20Protocol.md), and
 [provenance format](docs/BEAT%20Run%20Provenance.md).
+Rapid, subsequent CUDA solves can have memory cleanup policies applied via [bounded worker cleanup reuse](docs/WorkerCleanup.md).
 
 ## Tests and releases
 

@@ -4,6 +4,8 @@ using Base64, JSON, LinearAlgebra, SparseArrays, StaticArrays, Statistics
 
 include(joinpath(@__DIR__, "src", "BeatEngineContract.jl"))
 using .BeatEngineContract
+include(joinpath(@__DIR__, "src", "BeatEngineWorkerCleanup.jl"))
+using .BeatEngineWorkerCleanup
 
 include(joinpath(@__DIR__, "src", "BeatEngineCore.jl"))
 using .BeatEngineCore
@@ -3610,8 +3612,11 @@ function worker_backend_availability()
 end
 
 function run_worker()
-    println(JSON.json(worker_ready(worker_backend_availability())))
+    ready = worker_ready(worker_backend_availability())
+    ready["worker_cleanup_policies"] = ["aggressive", "cuda_reuse"]
+    println(JSON.json(ready))
     flush(stdout)
+    requests_since_cleanup = 0
     for line in eachline(stdin)
         isempty(strip(line)) && continue
         try
@@ -3641,19 +3646,48 @@ function run_worker()
                 )
                 println(JSON.json(Dict("type" => "completed")))
             elseif operation == "solve"
+                cleanup = cleanup_options(options)
                 release_all_bem_field_evaluation_caches!()
                 outcome = solve_request(request; event_mode=true)
-                # A Deploy worker may receive a differently sized array on its
-                # next job. Return freed solve buffers to the driver now so a
-                # previous dense BEM allocation cannot starve that request.
-                reclaim_accelerator_memory!()
+                # Preserve historical driver reclamation by default. Campaign
+                # clients may opt into bounded reuse; cancellation, pressure,
+                # periodic cleanup and failures still take the full path.
+                cleanup_started = time_ns()
+                free_fraction = nothing
+                if cleanup.policy == "cuda_reuse" && !outcome.cancelled
+                    free_fraction = try
+                        free_bytes, total_bytes = BeatEngineCore.cuda_module().memory_info()
+                        total_bytes > 0 ? free_bytes / total_bytes : nothing
+                    catch
+                        nothing
+                    end
+                end
+                requests_since_cleanup += 1
+                reason = cleanup_reason(cleanup, requests_since_cleanup;
+                    cancelled=outcome.cancelled, free_fraction=free_fraction)
+                if reason == "reuse"
+                    # Release request-owned field caches, retaining allocator/library
+                    # caches. CUDA's allocation-pressure reclamation remains enabled.
+                    release_all_bem_field_evaluation_caches!()
+                else
+                    reclaim_accelerator_memory!()
+                    requests_since_cleanup = 0
+                end
                 event_type = outcome.cancelled ? "cancelled" : "completed"
-                println(JSON.json(Dict("type" => event_type, "solved_count" => outcome.solved_count)))
+                event = Dict{String,Any}("type" => event_type, "solved_count" => outcome.solved_count)
+                if cleanup.policy == "cuda_reuse"
+                    event["worker_cleanup"] = Dict("policy" => cleanup.policy,
+                        "reason" => reason, "requests_since_cleanup" => requests_since_cleanup,
+                        "free_fraction_before" => free_fraction,
+                        "seconds" => (time_ns() - cleanup_started) / 1e9)
+                end
+                println(JSON.json(event))
             else
                 error("Unsupported coupled worker operation: $operation")
             end
         catch exception
             reclaim_accelerator_memory!()
+            requests_since_cleanup = 0
             error_text = sprint(showerror, exception, catch_backtrace())
             println(JSON.json(Dict("type" => "failed", "error" => error_text, "code" => "worker_request_failed")))
         end
