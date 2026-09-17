@@ -3149,6 +3149,9 @@ function solve_request_impl(request; event_mode=false)
                     "$(coupled_system.linear_backend)_dense_lu"
                 end,
                 "full_system_order" => coupled_system.full_system_order,
+                BeatEngineCoupledCondensed.dense_solver_diagnostics(coupled_system)...,
+                "fem_matrix_precision" => hasproperty(coupled_system, :fem_scalar_type) ?
+                                          lowercase(string(coupled_system.fem_scalar_type)) : nothing,
                 "solved_system_order" => coupled_system.solved_system_order,
                 "bounded_region_count" => length(bounded_regions),
                 "interface_count" => length(interfaces),

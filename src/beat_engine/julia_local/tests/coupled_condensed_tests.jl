@@ -178,6 +178,11 @@ end
     forcing32 = Matrix(system32 * planted32)
     reduced32, interior32 = BeatEngineCoupledCondensed._forward_schur(condensation32, forcing32)
     @test eltype(reduced32) == ComplexF32
+    # Under double dense assembly the reduced right-hand side is returned before demotion.
+    reduced32_double, _ = BeatEngineCoupledCondensed._forward_schur(condensation32, forcing32; result_type=Float64)
+    @test eltype(reduced32_double) == ComplexF64
+    @test ComplexF32.(reduced32_double) == reduced32
+    @test any(value -> ComplexF64(ComplexF32(value)) != value, reduced32_double)
     recovered32, residual32 = BeatEngineCoupledCondensed._backward_schur(
         condensation32,
         interior32,
@@ -413,6 +418,57 @@ if get(ENV, "BLAB_RUN_COUPLED_REFERENCE", "0") == "1"
         finally
             release_coupled_system!(transducer_monolithic)
             release_condensed_coupled_system!(transducer_condensed)
+        end
+
+        # Precision switches on the fixture with a transducer. Unset on the CPU backend nothing
+        # changes; `auto` (what an unset environment selects on Metal) gives a Float64 FEM system,
+        # a double-precision dense system and a refined Float32 LU, agreeing with the plain
+        # Float64 LU of the same system.
+        transducer32 = ElectrodynamicTransducer{Float32}(
+            "component:test", [physical_tag(fem_mesh32, 2, "Radiator")], Float32[1], [1], Float32[-1],
+            SVector(0f0, 0f0, 1f0), 2f0, 1, 6f0, 0.0005f0, 7f0, 0.015f0, 0.0005f0, 1f0,
+        )
+        precision_names = ("BLAB_COUPLED_DENSE_FLOAT64", "BLAB_COUPLED_DENSE_REFINEMENT", "BLAB_COUPLED_FEM_FLOAT64")
+        voltage32 = [(kind=:voltage, radiator_tag=0, transducer_index=1, amplitude=ComplexF32(1, 0))]
+        default32 = withenv(() -> condensed_system_at(Float32, 700.0; transducers=[transducer32]),
+                            (name => nothing for name in precision_names)...)
+        refined32 = withenv(() -> condensed_system_at(Float32, 700.0; transducers=[transducer32]),
+                            "BLAB_COUPLED_DENSE_REFINEMENT" => "auto", "BLAB_COUPLED_FEM_FLOAT64" => "auto")
+        plain64lu = withenv(() -> condensed_system_at(Float32, 700.0; transducers=[transducer32]),
+                            "BLAB_COUPLED_DENSE_FLOAT64" => "1", "BLAB_COUPLED_FEM_FLOAT64" => "1")
+        try
+            @test default32.factorization isa LinearAlgebra.LU{ComplexF32}
+            @test default32.dense_scalar_type == Float32 && default32.fem_scalar_type == Float32
+            @test refined32.factorization isa BeatEngineCoupledCondensed.RefinedDenseLU
+            @test refined32.dense_scalar_type == Float64 && refined32.fem_scalar_type == Float64
+            # The Schur block is formed in Float64 and must not be demoted on the way to the dense matrix.
+            @test eltype(refined32.condensation.schur) == ComplexF64
+            @test any(value -> ComplexF64(ComplexF32(value)) != value,
+                      refined32.factorization.matrix[refined32.gamma_range, refined32.gamma_range])
+            @test plain64lu.factorization isa LinearAlgebra.LU{ComplexF64}
+            @test BeatEngineCoupledCondensed.dense_solver_diagnostics(refined32)["dense_solver"] == "lu_float32_refined"
+            refined_solution = only(solve_condensed_coupled_excitations(refined32, voltage32))
+            plain_solution = only(solve_condensed_coupled_excitations(plain64lu, voltage32))
+            @test eltype(refined_solution.bem_pressure) == ComplexF32
+            for field in (:fem_pressure, :bem_pressure, :interface_flux, :diaphragm_velocity, :voice_coil_current)
+                @test relative_error(getproperty(plain_solution, field), getproperty(refined_solution, field)) < 1e-6
+            end
+        finally
+            foreach(release_condensed_coupled_system!, (default32, refined32, plain64lu))
+        end
+        # Under precision=float64 the switches change nothing.
+        switched64 = withenv(() -> condensed_system_at(Float64, 700.0; transducers=[transducer]),
+                             "BLAB_COUPLED_DENSE_REFINEMENT" => "1", "BLAB_COUPLED_FEM_FLOAT64" => "1")
+        unswitched64 = withenv(() -> condensed_system_at(Float64, 700.0; transducers=[transducer]),
+                               (name => nothing for name in precision_names)...)
+        try
+            voltage64 = [(kind=:voltage, radiator_tag=0, transducer_index=1, amplitude=ComplexF64(1, 0))]
+            @test switched64.factorization isa LinearAlgebra.LU{ComplexF64}
+            @test only(solve_condensed_coupled_excitations(switched64, voltage64)).bem_pressure ==
+                  only(solve_condensed_coupled_excitations(unswitched64, voltage64)).bem_pressure
+        finally
+            release_condensed_coupled_system!(switched64)
+            release_condensed_coupled_system!(unswitched64)
         end
     end
 
@@ -796,4 +852,168 @@ end
     @test factors[2] != factors[4]
 
     release_condensed_coupled_cache!(cache)
+end
+
+@testset "Condensed coupled precision switches: Metal defaults" begin
+    CC = BeatEngineCoupledCondensed
+    names = ("BLAB_COUPLED_DENSE_FLOAT64", "BLAB_COUPLED_DENSE_REFINEMENT", "BLAB_COUPLED_FEM_FLOAT64")
+    withenv((name => nothing for name in names)...) do
+        for backend in (:cpu, :cuda, :rocm)
+            @test !CC._dense_double_assembly(backend) && !CC._dense_refinement_enabled(backend)
+            @test !CC._fem_float64_enabled(backend)
+        end
+        @test !CC._fem_float64_enabled() && !CC._dense_double_assembly()
+        @test CC._dense_refinement_enabled(:metal) && !CC._dense_float64_enabled(:metal) && CC._dense_double_assembly(:metal)
+        @test CC._fem_float64_enabled(:metal)
+    end
+    withenv("BLAB_COUPLED_DENSE_REFINEMENT" => "off", "BLAB_COUPLED_FEM_FLOAT64" => "AUTO", "BLAB_COUPLED_DENSE_FLOAT64" => "1") do
+        @test !CC._dense_refinement_enabled(:metal) && CC._dense_float64_enabled(:cpu)
+        @test CC._coupled_mode("BLAB_COUPLED_FEM_FLOAT64", :cpu) == :auto
+    end
+    @test_throws "BLAB_COUPLED_FEM_FLOAT64" withenv(() -> CC._fem_float64_enabled(:metal), "BLAB_COUPLED_FEM_FLOAT64" => "maybe")
+end
+
+@testset "Float32 dense LU with Float64 refinement (BLAB_COUPLED_DENSE_REFINEMENT)" begin
+    Random.seed!(20260917)
+    n = 240
+    relative(reference, candidate) = norm(candidate - reference) / norm(reference)
+    # Moderately conditioned, like the coupled systems (κ ~ 1e5): refinement converges.
+    basis = qr(randn(ComplexF64, n, n)).Q
+    singular_values = exp10.(range(0, -5; length=n))
+    matrix = Matrix(basis * Diagonal(ComplexF64.(singular_values)) * qr(randn(ComplexF64, n, n)).Q')
+    rhs = randn(ComplexF64, n, 3)
+    reference = lu(matrix) \ rhs
+    refined = BeatEngineCoupledCondensed.RefinedDenseLU(matrix)
+    @test size(refined, 1) == n
+    single = ComplexF64.(refined.factor \ ComplexF32.(rhs))
+    @test relative(reference, single) > 1e-6
+    solution = refined \ rhs
+    @test eltype(solution) == ComplexF64
+    @test relative(reference, solution) < 1e-10
+    @test 1 <= refined.iterations <= 4
+    @test isnothing(refined.fallback) && isnothing(refined.fallback_reason)
+    @test relative(reference[:, 2], refined \ rhs[:, 2]) < 1e-10
+    diagnostics = BeatEngineCoupledCondensed.dense_solver_diagnostics((factorization=refined,))
+    @test diagnostics["dense_solver"] == "lu_float32_refined"
+    @test diagnostics["dense_refinement_iterations"] == refined.iterations
+    @test isnothing(diagnostics["dense_refinement_fallback_reason"])
+    @test BeatEngineCoupledCondensed.dense_solver_diagnostics((factorization=lu(matrix),))["dense_solver"] == "lu_float64"
+
+    # κ ~ 1e10 is beyond what a Float32 factor can refine: fall back to Float64 LU and say why.
+    hard_values = exp10.(range(0, -10; length=n))
+    hard = Matrix(basis * Diagonal(ComplexF64.(hard_values)) * qr(randn(ComplexF64, n, n)).Q')
+    hard_refined = BeatEngineCoupledCondensed.RefinedDenseLU(hard)
+    hard_solution = @test_logs (:warn, r"fell back to a Float64 LU") match_mode=:any hard_refined \ rhs
+    @test hard_solution == lu(hard) \ rhs
+    @test !isnothing(hard_refined.fallback)
+    @test occursin("fell back to a Float64 LU", hard_refined.fallback_reason)
+    @test hard_refined \ rhs == hard_solution
+    hard_diagnostics = BeatEngineCoupledCondensed.dense_solver_diagnostics((factorization=hard_refined,))
+    @test hard_diagnostics["dense_solver"] == "lu_float64_fallback"
+    @test hard_diagnostics["dense_refinement_fallback_reason"] == hard_refined.fallback_reason
+
+    # Accepted solves record their backward error (in units of the Float64 attainable one).
+    @test 0 <= refined.backward_error <= 1
+    @test diagnostics["dense_refinement_backward_error"] === nothing ||
+          BeatEngineCoupledCondensed.dense_solver_diagnostics((factorization=refined,))["dense_refinement_backward_error"] <= 1
+
+    # Right-hand sides of very different scale, including an all-zero column: every column must
+    # meet the test on its own, and a zero column solves to exactly zero.
+    mixed_rhs = hcat(rhs[:, 1] .* 1e-20, zeros(ComplexF64, n), rhs[:, 2] .* 1e20)
+    mixed_reference = lu(matrix) \ mixed_rhs
+    mixed = BeatEngineCoupledCondensed.RefinedDenseLU(matrix) \ mixed_rhs
+    @test all(iszero, mixed[:, 2])
+    @test relative(mixed_reference[:, 1], mixed[:, 1]) < 1e-10
+    @test relative(mixed_reference[:, 3], mixed[:, 3]) < 1e-10
+
+    # Entries outside the Float32 range cannot be narrowed: straight to Float64, with the reason.
+    huge = matrix .* 1e40
+    huge_refined = @test_logs (:warn, r"outside the Float32 range") BeatEngineCoupledCondensed.RefinedDenseLU(huge)
+    @test isnothing(huge_refined.factor) && !isnothing(huge_refined.fallback)
+    @test huge_refined \ rhs == lu(huge) \ rhs
+    @test huge_refined.backward_error <= 1
+
+    # Singular in Float32 but not in Float64: a pivot below Float32's range.
+    tiny_pivot = Matrix{ComplexF64}(I, 4, 4)
+    tiny_pivot[4, 4] = 1e-50
+    tiny_refined = @test_logs (:warn, r"singular or not finite") BeatEngineCoupledCondensed.RefinedDenseLU(tiny_pivot)
+    @test tiny_refined \ ones(ComplexF64, 4) == lu(tiny_pivot) \ ones(ComplexF64, 4)
+
+    # Singular in Float64 too: a structured failure, not a silent result.
+    singular = copy(matrix); singular[:, 1] .= 0
+    @test_throws SingularException BeatEngineCoupledCondensed.RefinedDenseLU(singular)
+    # Non-finite inputs are rejected.
+    bad_matrix = copy(matrix); bad_matrix[1, 1] = NaN
+    @test_throws ArgumentError BeatEngineCoupledCondensed.RefinedDenseLU(bad_matrix)
+    bad_rhs = copy(rhs); bad_rhs[2, 2] = Inf
+    @test_throws ArgumentError refined \ bad_rhs
+end
+
+@testset "Double-precision FEM matrices (BLAB_COUPLED_FEM_FLOAT64)" begin
+    mesh32 = load_gmsh41_volume(joinpath(CONDENSED_FIXTURE_ROOT, "femvolume.msh"), Float32(0.001))
+    vertex_count = length(mesh32.vertices)
+    mesh64 = VolumeMesh{Float64}(
+        SVector{3,Float64}.(mesh32.vertices), mesh32.tetrahedra, mesh32.tetra_physical_tags, mesh32.boundary_faces,
+        mesh32.boundary_physical_tags, mesh32.physical_names, mesh32.quadratic_tetrahedra, mesh32.quadratic_boundary_faces,
+    )
+    stiffness32, mass32 = assemble_p1_fem_matrices(mesh32)
+    stiffness64, mass64 = assemble_p1_fem_matrices(mesh64)
+    radiator_faces = findall(==(physical_tag(mesh32, 2, "Radiator")), mesh32.boundary_physical_tags)
+    Random.seed!(20260917)
+    loss = rand(Float32, vertex_count) .* 0.05f0
+    wall = assemble_boundary_mass_matrix(mesh32, radiator_faces, collect(1:vertex_count))
+    prepared = (
+        stiffness=stiffness32,
+        bulk_loss_factor_by_vertex=loss,
+        wall_impedance_operators=[(matrix=wall, thickness_m=0.02f0, flow_resistivity_pa_s_per_m2=12000f0)],
+    )
+    store = Dict{Symbol,Any}()
+    frequency, sound_speed, density = 20f0, 343f0, 1.21f0
+    system = BeatEngineCoupledCondensed._fem_system_float64(store, mesh32, prepared, frequency, sound_speed, density)
+    omega = 2pi * Float64(frequency)
+    expected = assemble_fem_dynamic_stiffness(
+        stiffness64, mass64, omega / Float64(sound_speed);
+        bulk_loss_mass=spdiagm(0 => Float64.(loss)) * mass64,
+    ) - BeatEngineCoupledCondensed.neumann_scale(Float64(density), omega) *
+        miki_rigid_backed_surface_admittance(Float64(frequency), Float64(sound_speed), Float64(density),
+                                             Float64(0.02f0), Float64(12000f0)) .*
+        SparseMatrixCSC{Float64,Int}(wall)
+    @test eltype(system) == ComplexF64
+    @test system == expected
+    # The matrices are cached by what they depend on, across frequencies and mesh objects, and are
+    # rebuilt when a dependency changes in place (a persistent worker reusing its cache).
+    cached = store[:matrices]
+    BeatEngineCoupledCondensed._fem_system_float64(store, mesh32, prepared, 200f0, sound_speed, density)
+    @test store[:matrices] === cached
+    equal_mesh = deepcopy(mesh32)
+    BeatEngineCoupledCondensed._fem_system_float64(store, equal_mesh, prepared, frequency, sound_speed, density)
+    @test store[:matrices] === cached
+    moved_mesh = deepcopy(mesh32)
+    moved_mesh.vertices[1] = moved_mesh.vertices[1] .+ 1f-4
+    moved = BeatEngineCoupledCondensed._fem_system_float64(store, moved_mesh, prepared, frequency, sound_speed, density)
+    @test store[:matrices] !== cached && moved != system
+    rebuilt = store[:matrices]
+    prepared.bulk_loss_factor_by_vertex[2] += 0.01f0
+    BeatEngineCoupledCondensed._fem_system_float64(store, moved_mesh, prepared, frequency, sound_speed, density)
+    @test store[:matrices] !== rebuilt
+    prepared.bulk_loss_factor_by_vertex[2] -= 0.01f0
+    # Matrices with another element structure than the cached system are refused.
+    wrong_structure = (stiffness=sparse(1.0f0 * I, vertex_count, vertex_count), bulk_loss_factor_by_vertex=loss,
+                       wall_impedance_operators=NamedTuple[])
+    @test_throws "structure" BeatEngineCoupledCondensed._fem_system_float64(nothing, mesh32, wrong_structure, frequency, sound_speed, density)
+
+    # Why: the air spring of a cavity with nothing retained, `Cᵀ A⁻¹ C` for a transducer surface load
+    # on the whole volume (the sealed-chamber case). Through the Float32-assembled K it loses digits
+    # like 1/k^2; through the double-precision matrices it matches the Float64 assembly exactly.
+    surface_load = assemble_boundary_mass_matrix(mesh64, radiator_faces, collect(1:vertex_count)) * ones(vertex_count)
+    surface = SparseMatrixCSC{ComplexF64,Int}(reshape(ComplexF64.(surface_load), vertex_count, 1))
+    air_spring(fem_system) = transpose(surface) * (lu(SparseMatrixCSC{ComplexF64,Int}(fem_system)) \ Matrix(surface))
+    lossless = (stiffness=stiffness32, bulk_loss_factor_by_vertex=zeros(Float32, vertex_count), wall_impedance_operators=NamedTuple[])
+    reference = air_spring(assemble_fem_dynamic_stiffness(stiffness64, mass64, omega / Float64(sound_speed)))
+    single = air_spring(SparseMatrixCSC{ComplexF64,Int}(
+        assemble_fem_dynamic_stiffness(stiffness32, mass32, Float32(2pi) * frequency / sound_speed),
+    ))
+    double = air_spring(BeatEngineCoupledCondensed._fem_system_float64(nothing, mesh32, lossless, frequency, sound_speed, density))
+    @test norm(single - reference) / norm(reference) > 1e-4
+    @test norm(double - reference) / norm(reference) < 1e-12
 end
