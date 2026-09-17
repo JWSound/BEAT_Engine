@@ -47,6 +47,22 @@ end
 const BEM_FIELD_EVALUATION_CACHES = Dict{String,Any}()
 const BEM_FIELD_EVALUATION_CACHE_ORDER = String[]
 const MAX_BEM_FIELD_EVALUATION_CACHES = Int(BeatEngineContract.WORKER["field_cache"]["max_entries"])
+"""
+Coupled outputs computed from BEM pressure and flux, interface pressure and flux, diaphragm
+velocity and voice-coil current only, never from interior FEM pressure. The only ones for which
+`BLAB_COUPLED_DEMAND_RECONSTRUCTION` may skip the condensed interior back substitution; anything
+not listed keeps it.
+"""
+const INTERIOR_FREE_COUPLED_OUTPUTS = Set([
+    "exterior_pressure",
+    "bem_boundary_pressure",
+    "bem_boundary_neumann",
+    "interface_average_normal_velocity",
+    "interface_normal_derivative",
+    "diaphragm_velocity",
+    "voice_coil_current",
+])
+
 const SPEAKER_ROM_QUANTITIES = Set([
     "speaker_rom_k",
     "speaker_rom_c",
@@ -85,6 +101,10 @@ function speaker_interior_state_matrix(system)
         "Speaker ROM construction requires the FEM-interface-condensed formulation.",
     )
     condensation = system.condensation
+    hasproperty(condensation, :transducer_condensed) && condensation.transducer_condensed && error(
+        "Speaker ROM construction needs transducer surfaces in the retained Schur block; " *
+        "unset BLAB_COUPLED_TRANSDUCER_CONDENSATION.",
+    )
     schur = if hasproperty(condensation, :schur)
         condensation.schur
     elseif hasproperty(condensation, :device_schur)
@@ -2309,6 +2329,29 @@ function solve_request(request; event_mode=false)
     end
 end
 
+"""
+    _condensed_split_timings(system, solutions) -> Dict
+
+Sub-stage timings of the condensed solver when it records them: `interface_elim_<key>_s` from the
+build and `solve_<key>_s` from the solve. Empty for other formulations.
+"""
+function _condensed_split_timings(system, solutions)
+    timings = Dict{String,Any}()
+    if hasproperty(system, :timings) && hasproperty(system.timings, :interface_elimination_split)
+        for (key, value) in system.timings.interface_elimination_split
+            timings["interface_elim_$(key)_s"] = value
+        end
+    end
+    split = isempty(solutions) || !hasproperty(first(solutions), :solve_split) ? nothing :
+            first(solutions).solve_split
+    if !isnothing(split)
+        for (key, value) in split
+            timings["solve_$(key)_s"] = value
+        end
+    end
+    return timings
+end
+
 function solve_request_impl(request; event_mode=false)
     validate_system_request(request)
     BeatEngineContract.BeatEngineProvenance.engine_identity()
@@ -2718,6 +2761,8 @@ function solve_request_impl(request; event_mode=false)
                     transducers=transducers,
                     transducer_operators=transducer_operators,
                     prescribed_bem_normal_velocity=prescribed_bem_normal_velocity,
+                    # The speaker ROM experiment reads transducer surfaces from the Schur block.
+                    allow_transducer_condensation=isnothing(get(solver_options, "speaker_rom_rank_experiment", nothing)),
                 )
             else
                 build_coupled_system(
@@ -2745,9 +2790,22 @@ function solve_request_impl(request; event_mode=false)
                 )
             end
             assembly_s = (time_ns() - assembly_started) / 1.0e9
+            # BLAB_COUPLED_DEMAND_RECONSTRUCTION: skip the interior back substitution only when every
+            # requested output is known not to read interior FEM pressure.
+            reconstruct_interior = !(
+                use_condensed_solver &&
+                BeatEngineCoupledCondensed._demand_reconstruction_enabled(bem_backend) &&
+                !validation_diagnostics &&
+                isnothing(get(solver_options, "speaker_rom_rank_experiment", nothing)) &&
+                all(String(output["quantity"]) in INTERIOR_FREE_COUPLED_OUTPUTS for output in outputs)
+            )
             solve_started = time_ns()
             solutions = use_condensed_solver ?
-                        solve_condensed_coupled_excitations(coupled_system, excitations) :
+                        solve_condensed_coupled_excitations(
+                            coupled_system,
+                            excitations;
+                            reconstruct_interior=reconstruct_interior,
+                        ) :
                         solve_coupled_excitations(coupled_system, excitations)
             solve_s = (time_ns() - solve_started) / 1.0e9
             interface_error_sets = [
@@ -3140,6 +3198,8 @@ function solve_request_impl(request; event_mode=false)
                         "cuda_cudss_schur_plus_dense_lu"
                     elseif coupled_system.condensation.backend == :cpu_noop
                         "cpu_dense_lu_noop_schur"
+                    elseif coupled_system.condensation.backend == :mumps_seq
+                        "cpu_mumps_seq_schur_plus_dense_lu"
                     else
                         "cpu_umfpack_schur_plus_dense_lu"
                     end
@@ -3149,10 +3209,15 @@ function solve_request_impl(request; event_mode=false)
                     "$(coupled_system.linear_backend)_dense_lu"
                 end,
                 "full_system_order" => coupled_system.full_system_order,
+                "solved_system_order" => coupled_system.solved_system_order,
+                "interface_elimination" => hasproperty(coupled_system, :interface_elimination) ?
+                                           String(coupled_system.interface_elimination) : "none",
+                BeatEngineCoupledCondensed.interface_mass_diagnostics(coupled_system)...,
                 BeatEngineCoupledCondensed.dense_solver_diagnostics(coupled_system)...,
+                "coupled_optimization_fallback_reasons" => hasproperty(coupled_system, :optimization_fallback_reasons) ?
+                                                           coupled_system.optimization_fallback_reasons : String[],
                 "fem_matrix_precision" => hasproperty(coupled_system, :fem_scalar_type) ?
                                           lowercase(string(coupled_system.fem_scalar_type)) : nothing,
-                "solved_system_order" => coupled_system.solved_system_order,
                 "bounded_region_count" => length(bounded_regions),
                 "interface_count" => length(interfaces),
                 "transducer_count" => length(transducers),
@@ -3169,6 +3234,15 @@ function solve_request_impl(request; event_mode=false)
                 "fem_condensation_backend" => isnothing(coupled_system.condensation) ?
                                               nothing :
                                               String(coupled_system.condensation.backend),
+                "fem_solver_requested" => isnothing(coupled_system.condensation) ||
+                                          !hasproperty(coupled_system.condensation, :fem_solver_requested) ?
+                                          nothing : String(coupled_system.condensation.fem_solver_requested),
+                "fem_solver_fallback_reason" => isnothing(coupled_system.condensation) ||
+                                                !hasproperty(coupled_system.condensation, :fem_solver_fallback_reason) ?
+                                                nothing : coupled_system.condensation.fem_solver_fallback_reason,
+                "mumps_threads" => isnothing(coupled_system.condensation) ||
+                                   !hasproperty(coupled_system.condensation, :mumps_threads) ?
+                                   0 : coupled_system.condensation.mumps_threads,
                 "fem_schur_block_size" => isnothing(coupled_system.condensation) ||
                                           !hasproperty(
                     coupled_system.condensation,
@@ -3188,7 +3262,7 @@ function solve_request_impl(request; event_mode=false)
                 "interface_ids" => [String(interface["id"]) for interface in interfaces],
                 "interface_pressure_continuity_errors" => interface_pressure_errors,
                 "interface_flux_conservation_errors" => interface_flux_errors,
-                "timings" => Dict(
+                "timings" => merge(_condensed_split_timings(coupled_system, solutions), Dict(
                     "assembly_s" => assembly_s,
                     "solve_s" => solve_s,
                     "field_s" => field_s,
@@ -3234,6 +3308,11 @@ function solve_request_impl(request; event_mode=false)
                     "fem_schur_extraction_s" => isnothing(coupled_system.condensation) ?
                                                 0.0 :
                                                 coupled_system.condensation.timings.schur_extraction_s,
+                    "fem_transducer_solves_s" => isnothing(coupled_system.condensation) ||
+                                                 !hasproperty(
+                        coupled_system.condensation.timings,
+                        :transducer_solves_s,
+                    ) ? 0.0 : coupled_system.condensation.timings.transducer_solves_s,
                     "fem_schur_upload_s" => isnothing(coupled_system.condensation) ||
                                             !hasproperty(
                         coupled_system.condensation.timings,
@@ -3246,9 +3325,15 @@ function solve_request_impl(request; event_mode=false)
                         something(solution.fem_reconstruction_s, 0.0) for solution in solutions
                     ),
                     "block_assembly_s" => coupled_system.timings.block_assembly_s,
+                    "interface_elimination_s" => hasproperty(coupled_system.timings, :interface_elimination_s) ?
+                                                 coupled_system.timings.interface_elimination_s : 0.0,
+                    "interface_mass_factorization_s" => hasproperty(
+                        coupled_system.timings,
+                        :interface_mass_factorization_s,
+                    ) ? coupled_system.timings.interface_mass_factorization_s : 0.0,
                     "coupled_factorization_s" => coupled_system.timings.coupled_factorization_s,
                     "replay_factorization_s" => coupled_system.timings.replay_factorization_s,
-                ),
+                )),
             )
             if validation_diagnostics
                 diagnostics["relative_residual"] = maximum(solution.relative_residual for solution in solutions)
@@ -3256,8 +3341,10 @@ function solve_request_impl(request; event_mode=false)
                     solution.all_bem_replay_error for solution in solutions
                 )
             end
-            diagnostics["fem_interior_residual"] = use_condensed_solver ?
+            diagnostics["fem_interior_residual"] = use_condensed_solver && reconstruct_interior ?
                 maximum(solution.fem_interior_residual for solution in solutions) : nothing
+            diagnostics["fem_interior_reconstruction"] = !use_condensed_solver ? "monolithic" :
+                                                         reconstruct_interior ? "evaluated" : "skipped"
             isnothing(rank_experiment) ||
                 (diagnostics["speaker_rom_rank_experiment"] = rank_experiment)
             result = Dict(

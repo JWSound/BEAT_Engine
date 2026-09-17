@@ -305,7 +305,10 @@ matrices through `metal_host_operators`. The partition, the interior UMFPACK
 factorization and the blocked Schur complement are the shared
 `_blocked_umfpack_schur_complement` in `BeatEngineCoupled.jl`. Diagnostics
 report `fem_condensation_backend: cpu_umfpack` and
-`linear_solver: cpu_umfpack_schur_plus_dense_lu`, exactly as `beat_cpu` does.
+`linear_solver: cpu_umfpack_schur_plus_dense_lu`, exactly as `beat_cpu` does,
+unless the Metal defaults described in [Coupled condensed optimizations on
+Metal](#coupled-condensed-optimizations-on-metal) are active, which they are
+by default: the Schur complement then comes from MUMPS (`mumps_seq`).
 
 ### Why condensation is on by default
 
@@ -412,6 +415,51 @@ median assembly per frequency: Float32 LU 7.36 s, Float64 LU 10.38 s,
 refinement 8.79 s: refinement recovers about half of what a plain Float64 LU
 costs.
 
+### Coupled condensed optimizations on Metal
+
+On `beat_metal` the condensed solver reduces the dense coupled system further
+and takes the Schur complement from a sparse direct solver's partial
+factorization instead of per-column triangular solves. Every step is exact up
+to round-off, each is a switch, and on Metal each defaults to `auto`: used when
+the model's structure allows it, otherwise the established path is taken and
+`coupled_optimization_fallback_reasons` says why. `1` requires a step (refusing
+unsupported structure), `0` turns it off. Other backends are unchanged unless a
+variable is set explicitly.
+
+| Step | Switch | What it does |
+| --- | --- | --- |
+| Transducer condensation | `BLAB_COUPLED_TRANSDUCER_CONDENSATION` | Eliminates transducer-surface FEM vertices with the interior (rank one per transducer) instead of retaining them in `Γ`; the full transducer × transducer air-spring coupling is kept. Off for the speaker ROM experiment, which reads those surfaces from the Schur block. |
+| Interface flux elimination | `BLAB_COUPLED_INTERFACE_FLUX_ELIMINATION` (`_PRESSURE_ELIMINATION` for pressure only, opt-in) | Removes the duplicated interface pressures (unit-selection continuity) and substitutes `q = M_Γ⁻¹(S P p_B + E y − g)` into the BEM rows, leaving only BEM pressures and transducer unknowns. Needs transducer condensation when transducers are present. |
+| Interface mass solve | `BLAB_COUPLED_INTERFACE_MASS_SOLVER` (`cholmod` on Metal, `lu` elsewhere) | Cached sparse Cholesky of the real SPD interface mass, residual-checked, LU fallback with a reason. |
+| Mass overlap | `BLAB_COUPLED_INTERFACE_MASS_OVERLAP` | Forms `M_Γ⁻¹S` and `M_Γ⁻¹E` inside the FEM task, overlapping the GPU BEM assembly. |
+| Per-component blocks | `BLAB_COUPLED_INTERFACE_BLOCKS` | Keeps independent FEM components as separate blocks through the elimination. |
+| Demand reconstruction | `BLAB_COUPLED_DEMAND_RECONSTRUCTION` | Skips the interior back-substitution when no requested output reads interior pressure (`fem_interior_reconstruction: skipped`). |
+| MUMPS Schur complement | `BLAB_COUPLED_FEM_SOLVER` (`mumps` on Metal, `umfpack` elsewhere) | Sequential MUMPS 5.9.1 (`MUMPS_seq_jll`), complex-symmetric LDLᵀ in Schur mode, analysis cached across a sweep; falls back to UMFPACK with `fem_solver_fallback_reason`. |
+
+`MUMPS_seq_jll` and `OpenBLAS32_jll` are dependencies of `julia_metal` only
+(about 25 MB of artifacts on macOS arm64), so CPU, CUDA and ROCm installs do
+not download them; there `mumps` falls back with the reason "MUMPS_seq_jll is
+not in this Julia environment". Its tests are `tests/mumps_tests.jl`, run under
+`julia_metal` in the macOS CI job.
+
+On Multi_region_SAWMOD (three transducers, three FEM regions, four interfaces,
+xy symmetry; M1 Max, eight Julia threads, 4 frequencies, 3 interleaved rounds)
+the dense order falls from 7,933 to 3,116. Median assembly per frequency, each
+row adding one step to the row above, with the dense precision fixed at
+Float64:
+
+| Configuration | s/frequency, median [range] |
+| --- | --- |
+| Float64 dense LU, no reductions | 10.38 [10.22–11.47] |
+| + transducer condensation | 6.12 [5.94–6.42] |
+| + flux elimination | 3.60 [3.18–4.59] |
+| + CHOLMOD, overlap, blocks | 3.47 [3.03–3.64] |
+| + demand reconstruction | 3.18 [3.15–3.72] |
+| + MUMPS | 1.72 [1.68–1.80] |
+| Metal defaults (+ refinement, Float64 FEM) | 1.76 [1.60–1.83] |
+
+Each step agrees with its predecessor to within 1.6e-7 relative L2.
+
 ### Interior solver: UMFPACK, and the Accelerate path that was removed
 
 The condensation factors the FEM interior and then solves it against roughly one
@@ -496,6 +544,15 @@ Normal application use does not require these environment variables.
 | `BLAB_COUPLED_DENSE_REFINEMENT` | `auto` on Metal, `off` elsewhere | Coupled Float32 solves: assemble the dense system in `ComplexF64`, factor in `ComplexF32`, refine to the Float64 backward error (falls back to a `ComplexF64` LU with a reason). `1`/`auto`/`0`. |
 | `BLAB_COUPLED_DENSE_FLOAT64` | `off` | Coupled Float32 solves: plain `ComplexF64` dense LU instead (refinement takes precedence when both are on). |
 | `BLAB_COUPLED_FEM_FLOAT64` | `auto` on Metal, `off` elsewhere | Coupled Float32 solves: assemble the FEM stiffness, mass and bulk-loss matrices in `Float64`. |
+| `BLAB_COUPLED_TRANSDUCER_CONDENSATION` | `auto` on Metal, `off` elsewhere | See [Coupled condensed optimizations on Metal](#coupled-condensed-optimizations-on-metal). `1`/`auto`/`0`. |
+| `BLAB_COUPLED_INTERFACE_FLUX_ELIMINATION` | `auto` on Metal, `off` elsewhere | As above. |
+| `BLAB_COUPLED_INTERFACE_PRESSURE_ELIMINATION` | `off` | Pressure-only elimination (flux elimination takes precedence). |
+| `BLAB_COUPLED_INTERFACE_MASS_SOLVER` | `cholmod` on Metal, `lu` elsewhere | `lu` or `cholmod`. |
+| `BLAB_COUPLED_INTERFACE_MASS_OVERLAP` | `auto` on Metal, `off` elsewhere | As above. |
+| `BLAB_COUPLED_INTERFACE_BLOCKS` | `auto` on Metal, `off` elsewhere | As above. |
+| `BLAB_COUPLED_DEMAND_RECONSTRUCTION` | `auto` on Metal, `off` elsewhere | As above. |
+| `BLAB_COUPLED_FEM_SOLVER` | `mumps` on Metal, `umfpack` elsewhere | `umfpack` or `mumps`. |
+| `BLAB_MUMPS_THREADS` / `BLAB_MUMPS_SOLVE_THREADS` | `4` / `1` | BLAS threads for the MUMPS factorization and solve phases. |
 | `BLAB_SCHUR_BLOCK` | unset | Coupled solves: pins the Schur complement right-hand-side block width, bypassing the thread-count balancing. For measurement only. |
 | `BLAB_BEAT_FUSED_BM` | `1` | Set to `0` to assemble the four operators and combine them on the host for exterior solves. Coupled solves, `host_staged` assembly and the `host` singular mode always take the four-operator path. |
 

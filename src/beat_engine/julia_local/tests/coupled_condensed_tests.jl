@@ -1,38 +1,4 @@
-isdefined(@__MODULE__, :BeatEngineCoupledCondensed) ||
-    include(joinpath(@__DIR__, "..", "src", "BeatEngineCoupledCondensed.jl"))
-using .BeatEngineCoupled
-using .BeatEngineCoupledCondensed
-using LinearAlgebra, Random, SparseArrays, StaticArrays
-
-const CONDENSED_FIXTURE_ROOT = joinpath(@__DIR__, "fixtures")
-const CONDENSED_QUADRATURE_ORDER = parse(Int, get(ENV, "BLAB_COUPLED_QUADRATURE_ORDER", "1"))
-const CONDENSED_SINGULAR_ORDER = parse(Int, get(ENV, "BLAB_COUPLED_SINGULAR_ORDER", "1"))
-
-function condensed_synthetic_case(
-    ::Type{T};
-    vertex_count::Int=60,
-    retained_count::Int=10,
-    density::Float64=0.08,
-    interior_load::Bool=false,
-) where {T<:AbstractFloat}
-    Random.seed!(20260814)
-    retained = sort(randperm(vertex_count)[1:retained_count])
-    # Diagonally dominant so the interior block is safely invertible and the manufactured
-    # solution isolates the condensation algebra rather than conditioning.
-    system = SparseMatrixCSC{Complex{T},Int}(
-        sprand(Complex{T}, vertex_count, vertex_count, density) +
-        Complex{T}(vertex_count / 4) * I,
-    )
-    load_rows = interior_load ? vcat(retained[2:end], first(setdiff(1:vertex_count, retained))) : retained
-    fem_load = sparse(load_rows, 1:retained_count, ones(T, retained_count), vertex_count, retained_count)
-    operators = InterfaceOperators(
-        fem_load,
-        spzeros(T, 4, retained_count),
-        spzeros(T, retained_count, vertex_count),
-        spzeros(T, retained_count, 4),
-    )
-    return system, operators, retained
-end
+include(joinpath(@__DIR__, "coupled_condensed_test_setup.jl"))
 
 @testset "Schur condensation algebra" begin
     system, operators, retained = condensed_synthetic_case(Float64)
@@ -278,7 +244,7 @@ if get(ENV, "BLAB_RUN_COUPLED_REFERENCE", "0") == "1"
             )
         end
 
-        function condensed_system_at(::Type{T}, frequency; transducers=ElectrodynamicTransducer{T}[]) where {T}
+        function condensed_system_at(::Type{T}, frequency; transducers=ElectrodynamicTransducer{T}[], extra...) where {T}
             mesh, boundary, mapping = T === Float32 ?
                                       (fem_mesh32, bem_mesh32, interface_map32) :
                                       (fem_mesh, bem_mesh, interface_map)
@@ -292,6 +258,7 @@ if get(ENV, "BLAB_RUN_COUPLED_REFERENCE", "0") == "1"
                 quadrature_order=CONDENSED_QUADRATURE_ORDER,
                 singular_order=CONDENSED_SINGULAR_ORDER,
                 transducers=transducers,
+                extra...,
             )
         end
 
@@ -418,6 +385,503 @@ if get(ENV, "BLAB_RUN_COUPLED_REFERENCE", "0") == "1"
         finally
             release_coupled_system!(transducer_monolithic)
             release_condensed_coupled_system!(transducer_condensed)
+        end
+
+        # Transducer condensation eliminates the transducer surfaces with the interior and carries
+        # their rank-one coupling as low-rank columns. It must reproduce the monolithic solve to
+        # round-off, including a prescribed-velocity load that lands on the eliminated vertices.
+        voltage_excitation = (kind=:voltage, radiator_tag=0, transducer_index=1, amplitude=ComplexF64(1, 0))
+        velocity_excitation = (
+            kind=:normal_velocity,
+            radiator_tag=radiator_tag,
+            transducer_index=0,
+            amplitude=ComplexF64(0.3, -0.2),
+        )
+        reference_monolithic = monolithic_system(Float64, 500.0; transducers=[transducer])
+        retained_condensed = condensed_system_at(Float64, 500.0; transducers=[transducer])
+        eliminated_condensed = withenv("BLAB_COUPLED_TRANSDUCER_CONDENSATION" => "1") do
+            condensed_system_at(Float64, 500.0; transducers=[transducer])
+        end
+        try
+            @test !retained_condensed.transducer_condensation
+            @test eliminated_condensed.transducer_condensation
+            @test eliminated_condensed.condensation.transducer_condensed
+            @test eliminated_condensed.condensation.retained_count ==
+                  length(unique(interface_map.fem_vertex_indices))
+            @test eliminated_condensed.gamma_fem_vertices == sort(unique(interface_map.fem_vertex_indices))
+            @test eliminated_condensed.retained_fem_vertices == retained_condensed.retained_fem_vertices
+            @test eliminated_condensed.solved_system_order ==
+                  retained_condensed.solved_system_order -
+                  (retained_condensed.condensation.retained_count -
+                   eliminated_condensed.condensation.retained_count)
+            @test eliminated_condensed.solved_system_order < retained_condensed.solved_system_order
+            excitations = [voltage_excitation, velocity_excitation]
+            references = solve_coupled_excitations(reference_monolithic, excitations)
+            retained_solutions = solve_condensed_coupled_excitations(retained_condensed, excitations)
+            eliminated_solutions = solve_condensed_coupled_excitations(eliminated_condensed, excitations)
+            for (reference, retained_solution, candidate) in
+                zip(references, retained_solutions, eliminated_solutions)
+                for field in (:fem_pressure, :bem_pressure, :interface_flux, :diaphragm_velocity, :voice_coil_current)
+                    @test relative_error(getproperty(reference, field), getproperty(candidate, field)) < 1e-9
+                    @test relative_error(getproperty(retained_solution, field), getproperty(candidate, field)) < 1e-9
+                end
+                @test candidate.fem_interior_residual < 1e-10
+            end
+        finally
+            release_coupled_system!(reference_monolithic)
+            release_condensed_coupled_system!(retained_condensed)
+            release_condensed_coupled_system!(eliminated_condensed)
+        end
+
+        # Interface elimination substitutes p_Γ = P p_B (pressure) and then
+        # q = M_Γ⁻¹ (S P p_B + E y - g) (flux). Both are exact, so every output must match the
+        # monolithic solve and the unmodified condensed layout to round-off.
+        interface_count = length(interface_map.fem_vertex_indices)
+        elimination_fields = (
+            :fem_pressure, :bem_pressure, :interface_flux, :bem_neumann,
+            :diaphragm_velocity, :voice_coil_current,
+        )
+        lever_one = "BLAB_COUPLED_TRANSDUCER_CONDENSATION" => "1"
+        pressure_switch = "BLAB_COUPLED_INTERFACE_PRESSURE_ELIMINATION" => "1"
+        flux_switch = "BLAB_COUPLED_INTERFACE_FLUX_ELIMINATION" => "1"
+        elimination_reference = monolithic_system(Float64, 700.0; transducers=[transducer])
+        elimination_baseline = withenv(lever_one) do
+            condensed_system_at(Float64, 700.0; transducers=[transducer])
+        end
+        pressure_eliminated = withenv(lever_one, pressure_switch) do
+            condensed_system_at(Float64, 700.0; transducers=[transducer])
+        end
+        flux_eliminated = withenv(lever_one, flux_switch) do
+            condensed_system_at(Float64, 700.0; transducers=[transducer])
+        end
+        try
+            @test elimination_baseline.interface_elimination == :none
+            @test pressure_eliminated.interface_elimination == :pressure
+            @test flux_eliminated.interface_elimination == :flux
+            # Only the flux elimination solves with M_Γ; the unspecialized path is one LU.
+            for (system, requested, solver, block_count) in (
+                (elimination_baseline, nothing, nothing, 0),
+                (pressure_eliminated, nothing, nothing, 0),
+                (flux_eliminated, "lu", "lu", 1),
+            )
+                diagnostics = BeatEngineCoupledCondensed.interface_mass_diagnostics(system)
+                @test diagnostics["interface_mass_solver_requested"] == requested
+                @test diagnostics["interface_mass_solver"] == solver
+                @test diagnostics["interface_mass_block_count"] == block_count
+                @test isempty(diagnostics["interface_mass_fallback_reasons"])
+            end
+            gamma_count = elimination_baseline.condensation.retained_count
+            @test gamma_count == interface_count
+            @test pressure_eliminated.solved_system_order ==
+                  elimination_baseline.solved_system_order - gamma_count
+            @test flux_eliminated.solved_system_order ==
+                  elimination_baseline.solved_system_order - gamma_count - interface_count
+            @test flux_eliminated.solved_system_order == length(bem_mesh.vertices) + 2
+            excitations = [
+                voltage_excitation,
+                velocity_excitation,
+                (kind=:voltage, radiator_tag=0, transducer_index=1, amplitude=ComplexF64(-0.4, 1.3)),
+            ]
+            references = solve_coupled_excitations(elimination_reference, excitations)
+            baselines = solve_condensed_coupled_excitations(elimination_baseline, excitations)
+            for candidate_system in (pressure_eliminated, flux_eliminated)
+                candidates = solve_condensed_coupled_excitations(candidate_system, excitations)
+                for (reference, baseline, candidate) in zip(references, baselines, candidates)
+                    for field in elimination_fields
+                        @test relative_error(getproperty(reference, field), getproperty(candidate, field)) < 1e-9
+                        @test relative_error(getproperty(baseline, field), getproperty(candidate, field)) < 1e-9
+                    end
+                    @test candidate.fem_interior_residual < 1e-10
+                    @test candidate.pressure_continuity_error == 0
+                    @test candidate.flux_conservation_error < 1e-10
+                end
+            end
+            # The mass factorization is geometry-only and reused by the next frequency.
+            @test !flux_eliminated.timings.interface_mass_cached
+            flux_eliminated_next = withenv(lever_one, flux_switch) do
+                build_condensed_coupled_system(
+                    fem_mesh, bem_mesh, interface_map, 900.0, 343.0, 1.21;
+                    quadrature_order=CONDENSED_QUADRATURE_ORDER,
+                    singular_order=CONDENSED_SINGULAR_ORDER,
+                    transducers=[transducer],
+                    cache=flux_eliminated.cache,
+                )
+            end
+            baseline_next = withenv(lever_one) do
+                condensed_system_at(Float64, 900.0; transducers=[transducer])
+            end
+            try
+                @test flux_eliminated_next.timings.interface_mass_cached
+                for (baseline, candidate) in zip(
+                    solve_condensed_coupled_excitations(baseline_next, excitations),
+                    solve_condensed_coupled_excitations(flux_eliminated_next, excitations),
+                )
+                    for field in elimination_fields
+                        @test relative_error(getproperty(baseline, field), getproperty(candidate, field)) < 1e-9
+                    end
+                end
+            finally
+                release_condensed_coupled_system!(flux_eliminated_next)
+                release_condensed_coupled_system!(baseline_next)
+            end
+        finally
+            release_coupled_system!(elimination_reference)
+            release_condensed_coupled_system!(elimination_baseline)
+            release_condensed_coupled_system!(pressure_eliminated)
+            release_condensed_coupled_system!(flux_eliminated)
+        end
+
+        # Specialized flux elimination: Cholesky mass solves, per-component blocks, mass solves in
+        # the FEM stage, and the demand-driven interior reconstruction. All exact: every output
+        # must match the unmodified flux elimination and the monolithic solve to round-off.
+        specialized_switch_sets = (
+            ("BLAB_COUPLED_INTERFACE_MASS_SOLVER" => "cholmod",),
+            ("BLAB_COUPLED_INTERFACE_BLOCKS" => "1",),
+            ("BLAB_COUPLED_INTERFACE_MASS_OVERLAP" => "1", "BLAB_COUPLED_STAGE_OVERLAP" => "on"),
+            ("BLAB_COUPLED_INTERFACE_MASS_OVERLAP" => "1", "BLAB_COUPLED_STAGE_OVERLAP" => "off"),
+            (
+                "BLAB_COUPLED_INTERFACE_MASS_SOLVER" => "cholmod",
+                "BLAB_COUPLED_INTERFACE_BLOCKS" => "1",
+                "BLAB_COUPLED_INTERFACE_MASS_OVERLAP" => "1",
+                "BLAB_COUPLED_STAGE_OVERLAP" => "on",
+            ),
+        )
+        specialized_excitations = [
+            voltage_excitation,
+            velocity_excitation,
+            (kind=:voltage, radiator_tag=0, transducer_index=1, amplitude=ComplexF64(-0.4, 1.3)),
+        ]
+        specialized_reference = monolithic_system(Float64, 700.0; transducers=[transducer])
+        specialized_baseline = withenv(lever_one, flux_switch) do
+            condensed_system_at(Float64, 700.0; transducers=[transducer])
+        end
+        try
+            references = solve_coupled_excitations(specialized_reference, specialized_excitations)
+            baselines = solve_condensed_coupled_excitations(specialized_baseline, specialized_excitations)
+            @test !hasproperty(specialized_baseline.interface_elimination_data, :mass_operator)
+            for switches in specialized_switch_sets
+                candidate_system = withenv(lever_one, flux_switch, switches...) do
+                    condensed_system_at(Float64, 700.0; transducers=[transducer])
+                end
+                try
+                    @test hasproperty(candidate_system.interface_elimination_data, :mass_operator)
+                    operator = candidate_system.interface_elimination_data.mass_operator
+                    @test operator.count == interface_count
+                    @test all(isnothing(block.fallback_reason) for block in operator.blocks)
+                    @test operator.solver == (("BLAB_COUPLED_INTERFACE_MASS_SOLVER" => "cholmod") in switches ? :cholmod : :lu)
+                    diagnostics = BeatEngineCoupledCondensed.interface_mass_diagnostics(candidate_system)
+                    @test diagnostics["interface_mass_solver_requested"] == String(operator.solver)
+                    @test diagnostics["interface_mass_solver"] == String(operator.solver)
+                    @test diagnostics["interface_mass_block_count"] == length(operator.blocks)
+                    @test isempty(diagnostics["interface_mass_fallback_reasons"])
+                    in_stage = ("BLAB_COUPLED_INTERFACE_MASS_OVERLAP" => "1") in switches
+                    split = candidate_system.timings.interface_elimination_split
+                    @test haskey(split, :fem_stage_mass_solve) == in_stage
+                    @test haskey(split, :mass_solve) == !in_stage
+                    candidates = solve_condensed_coupled_excitations(candidate_system, specialized_excitations)
+                    skipped = solve_condensed_coupled_excitations(
+                        candidate_system, specialized_excitations; reconstruct_interior=false,
+                    )
+                    interior = candidate_system.condensation.interior_vertices
+                    retained = candidate_system.condensation.retained_vertices
+                    for (reference, baseline, candidate, lean) in zip(references, baselines, candidates, skipped)
+                        for field in elimination_fields
+                            @test relative_error(getproperty(reference, field), getproperty(candidate, field)) < 1e-9
+                            @test relative_error(getproperty(baseline, field), getproperty(candidate, field)) < 1e-9
+                        end
+                        @test candidate.fem_interior_residual < 1e-10
+                        @test candidate.flux_conservation_error < 1e-10
+                        # Skipped reconstruction: interior not evaluated, everything else identical.
+                        @test all(isnan, lean.fem_pressure[interior])
+                        @test lean.fem_pressure[retained] == candidate.fem_pressure[retained]
+                        @test isnan(lean.fem_interior_residual)
+                        for field in (:bem_pressure, :interface_flux, :bem_neumann, :diaphragm_velocity, :voice_coil_current)
+                            @test getproperty(lean, field) == getproperty(candidate, field)
+                        end
+                        @test lean.pressure_continuity_error == candidate.pressure_continuity_error
+                    end
+                    # The operator is geometry-only and reused by the next frequency.
+                    @test !candidate_system.timings.interface_mass_cached
+                    next_system = withenv(lever_one, flux_switch, switches...) do
+                        build_condensed_coupled_system(
+                            fem_mesh, bem_mesh, interface_map, 900.0, 343.0, 1.21;
+                            quadrature_order=CONDENSED_QUADRATURE_ORDER,
+                            singular_order=CONDENSED_SINGULAR_ORDER,
+                            transducers=[transducer],
+                            cache=candidate_system.cache,
+                        )
+                    end
+                    next_baseline = withenv(lever_one, flux_switch) do
+                        condensed_system_at(Float64, 900.0; transducers=[transducer])
+                    end
+                    try
+                        @test next_system.timings.interface_mass_cached
+                        @test next_system.interface_elimination_data.mass_operator === operator
+                        for (baseline, candidate) in zip(
+                            solve_condensed_coupled_excitations(next_baseline, specialized_excitations),
+                            solve_condensed_coupled_excitations(next_system, specialized_excitations),
+                        )
+                            for field in elimination_fields
+                                @test relative_error(getproperty(baseline, field), getproperty(candidate, field)) < 1e-9
+                            end
+                        end
+                    finally
+                        release_condensed_coupled_system!(next_system)
+                        release_condensed_coupled_system!(next_baseline)
+                    end
+                finally
+                    release_condensed_coupled_system!(candidate_system)
+                end
+            end
+        finally
+            release_coupled_system!(specialized_reference)
+            release_condensed_coupled_system!(specialized_baseline)
+        end
+        @test_throws "BLAB_COUPLED_INTERFACE_MASS_SOLVER" withenv(
+            BeatEngineCoupledCondensed._interface_mass_solver_selection,
+            "BLAB_COUPLED_INTERFACE_MASS_SOLVER" => "dense",
+        )
+
+        # Retained transducer surfaces make Γ wider than the interface: refuse, do not guess.
+        for switch in (pressure_switch, flux_switch)
+            @test_throws ErrorException withenv(switch) do
+                condensed_system_at(Float64, 700.0; transducers=[transducer])
+            end
+        end
+
+        # Without transducers Γ is the interface already; both eliminations apply directly.
+        # A prescribed-velocity load on the radiator exercises the g term with a nonzero f.
+        plain_reference = monolithic_system(Float64, 650.0)
+        plain_eliminated = [
+            withenv(switch) do
+                condensed_system_at(Float64, 650.0)
+            end
+            for switch in (pressure_switch, flux_switch)
+        ]
+        try
+            reference = only(solve_coupled_systems(plain_reference, [radiator_tag]))
+            for candidate_system in plain_eliminated
+                @test candidate_system.solved_system_order < plain_reference.full_system_order
+                candidate = only(solve_condensed_coupled_systems(candidate_system, [radiator_tag]))
+                for field in (:fem_pressure, :bem_pressure, :interface_flux, :bem_neumann)
+                    @test relative_error(getproperty(reference, field), getproperty(candidate, field)) < 1e-9
+                end
+            end
+        finally
+            release_coupled_system!(plain_reference)
+            foreach(release_condensed_coupled_system!, plain_eliminated)
+        end
+
+        # A multi-interface request concatenates per-interface maps, so interface-dof order need
+        # not be sorted FEM vertex order. Shuffle the map to exercise the Γ-to-dof permutation.
+        shuffle_order = randperm(Random.MersenneTwister(20260916), interface_count)
+        shuffled_map = ConformingInterfaceMap(
+            interface_map.fem_vertex_indices[shuffle_order],
+            interface_map.fem_to_bem_vertex_indices[shuffle_order],
+            interface_map.fem_face_indices,
+            interface_map.bem_face_indices,
+            interface_map.normal_sign,
+        )
+        @test shuffled_map.fem_vertex_indices != sort(shuffled_map.fem_vertex_indices)
+        shuffled_options = (
+            quadrature_order=CONDENSED_QUADRATURE_ORDER,
+            singular_order=CONDENSED_SINGULAR_ORDER,
+        )
+        shuffled_reference = build_coupled_system(
+            fem_mesh, bem_mesh, shuffled_map, 650.0, 343.0, 1.21;
+            shuffled_options..., validation_diagnostics=false, bem_backend=:cpu,
+        )
+        shuffled_eliminated = [
+            withenv(switch) do
+                build_condensed_coupled_system(
+                    fem_mesh, bem_mesh, shuffled_map, 650.0, 343.0, 1.21; shuffled_options...,
+                )
+            end
+            for switch in (pressure_switch, flux_switch)
+        ]
+        push!(shuffled_eliminated, withenv(
+            flux_switch,
+            "BLAB_COUPLED_INTERFACE_MASS_SOLVER" => "cholmod",
+            "BLAB_COUPLED_INTERFACE_BLOCKS" => "1",
+            "BLAB_COUPLED_INTERFACE_MASS_OVERLAP" => "1",
+        ) do
+            build_condensed_coupled_system(
+                fem_mesh, bem_mesh, shuffled_map, 650.0, 343.0, 1.21; shuffled_options...,
+            )
+        end)
+        try
+            @test hasproperty(last(shuffled_eliminated).interface_elimination_data, :mass_operator)
+            # One block always spans every dof; the shuffled map makes its Γ row order non-trivial.
+            @test only(last(shuffled_eliminated).interface_elimination_data.mass_operator.blocks).rows != 1:interface_count
+            reference = only(solve_coupled_systems(shuffled_reference, [radiator_tag]))
+            for candidate_system in shuffled_eliminated
+                candidate = only(solve_condensed_coupled_systems(candidate_system, [radiator_tag]))
+                for field in (:fem_pressure, :bem_pressure, :interface_flux, :bem_neumann)
+                    @test relative_error(getproperty(reference, field), getproperty(candidate, field)) < 1e-9
+                end
+            end
+        finally
+            release_coupled_system!(shuffled_reference)
+            foreach(release_condensed_coupled_system!, shuffled_eliminated)
+        end
+
+        # Composes with the single-precision operators and the double-precision dense LU.
+        transducer32 = ElectrodynamicTransducer{Float32}(
+            "component:test",
+            [physical_tag(fem_mesh32, 2, "Radiator")],
+            Float32[1],
+            [1],
+            Float32[-1],
+            SVector(0f0, 0f0, 1f0),
+            2f0,
+            1,
+            6f0,
+            0.0005f0,
+            7f0,
+            0.015f0,
+            0.0005f0,
+            1f0,
+        )
+        composed_baseline = withenv(lever_one, "BLAB_COUPLED_DENSE_FLOAT64" => "1") do
+            condensed_system_at(Float32, 700.0; transducers=[transducer32])
+        end
+        composed_flux = withenv(lever_one, flux_switch, "BLAB_COUPLED_DENSE_FLOAT64" => "1") do
+            condensed_system_at(Float32, 700.0; transducers=[transducer32])
+        end
+        composed_fem64 = withenv(lever_one, flux_switch, "BLAB_COUPLED_DENSE_FLOAT64" => "1",
+                                 "BLAB_COUPLED_FEM_FLOAT64" => "1") do
+            condensed_system_at(Float32, 700.0; transducers=[transducer32])
+        end
+        try
+            @test composed_flux.fem_scalar_type == Float32
+            @test composed_fem64.fem_scalar_type == Float64
+            fem64_solution = only(solve_condensed_coupled_excitations(
+                composed_fem64, [(kind=:voltage, radiator_tag=0, transducer_index=1, amplitude=ComplexF32(1, 0))],
+            ))
+            flux_solution = only(solve_condensed_coupled_excitations(
+                composed_flux, [(kind=:voltage, radiator_tag=0, transducer_index=1, amplitude=ComplexF32(1, 0))],
+            ))
+            @test eltype(fem64_solution.bem_pressure) == ComplexF32
+            for field in elimination_fields
+                @test relative_error(getproperty(flux_solution, field), getproperty(fem64_solution, field)) < 1e-5
+            end
+        finally
+            release_condensed_coupled_system!(composed_fem64)
+        end
+        composed_refined = withenv(lever_one, flux_switch, "BLAB_COUPLED_DENSE_REFINEMENT" => "1") do
+            condensed_system_at(Float32, 700.0; transducers=[transducer32])
+        end
+        try
+            @test composed_refined.dense_scalar_type == Float64
+            @test composed_refined.factorization isa BeatEngineCoupledCondensed.RefinedDenseLU
+            @test eltype(composed_refined.condensation.schur) == ComplexF64
+            # The mechanical block (mechanical impedance minus the condensed air spring) is formed
+            # in Float64 and must reach the Float64 dense matrix unrounded.
+            mechanical = composed_refined.factorization.matrix[composed_refined.mechanical_range, composed_refined.mechanical_range]
+            @test any(value -> ComplexF64(ComplexF32(value)) != value, mechanical)
+            @test composed_flux.factorization isa LinearAlgebra.LU{ComplexF64}
+            excitations_refined = [(kind=:voltage, radiator_tag=0, transducer_index=1, amplitude=ComplexF32(1, 0))]
+            refined_solution = only(solve_condensed_coupled_excitations(composed_refined, excitations_refined))
+            dense64_solution = only(solve_condensed_coupled_excitations(composed_flux, excitations_refined))
+            for field in elimination_fields
+                @test relative_error(getproperty(dense64_solution, field), getproperty(refined_solution, field)) < 1e-6
+            end
+            @test BeatEngineCoupledCondensed.dense_solver_diagnostics(composed_refined)["dense_solver"] == "lu_float32_refined"
+            @test composed_refined.factorization.iterations >= 1
+        finally
+            release_condensed_coupled_system!(composed_refined)
+        end
+        refined_double = withenv(lever_one, flux_switch, "BLAB_COUPLED_DENSE_REFINEMENT" => "1") do
+            condensed_system_at(Float64, 700.0; transducers=[transducer])
+        end
+        try
+            @test refined_double.factorization isa LinearAlgebra.LU{ComplexF64}
+        finally
+            release_condensed_coupled_system!(refined_double)
+        end
+        # `auto` optimizations fall back to the established path, with a reason, where the model's
+        # structure does not allow them; `on` refuses (tested above). All results must equal the
+        # established path exactly, since the fallback *is* that path.
+        voltage_auto = [(kind=:voltage, radiator_tag=0, transducer_index=1, amplitude=ComplexF64(1, 0))]
+        auto_names = ("BLAB_COUPLED_TRANSDUCER_CONDENSATION", "BLAB_COUPLED_INTERFACE_FLUX_ELIMINATION")
+        plain_retained = withenv(lever_one.first => "0") do
+            condensed_system_at(Float64, 700.0; transducers=[transducer])
+        end
+        flux_without_condensation = withenv(lever_one.first => "0", flux_switch.first => "auto") do
+            condensed_system_at(Float64, 700.0; transducers=[transducer])
+        end
+        rom_request = withenv(lever_one.first => "auto", flux_switch.first => "auto") do
+            condensed_system_at(Float64, 700.0; transducers=[transducer], allow_transducer_condensation=false)
+        end
+        try
+            @test flux_without_condensation.interface_elimination == :none
+            @test only(flux_without_condensation.optimization_fallback_reasons) |> r -> startswith(r, "interface elimination not used")
+            @test !rom_request.transducer_condensation && rom_request.interface_elimination == :none
+            @test length(rom_request.optimization_fallback_reasons) == 2
+            @test any(r -> occursin("speaker ROM", r), rom_request.optimization_fallback_reasons)
+            @test isempty(plain_retained.optimization_fallback_reasons)
+            plain = only(solve_condensed_coupled_excitations(plain_retained, voltage_auto))
+            for candidate_system in (flux_without_condensation, rom_request)
+                candidate = only(solve_condensed_coupled_excitations(candidate_system, voltage_auto))
+                @test candidate.bem_pressure == plain.bem_pressure
+                @test candidate.diaphragm_velocity == plain.diaphragm_velocity
+            end
+        finally
+            foreach(release_condensed_coupled_system!, (plain_retained, flux_without_condensation, rom_request))
+        end
+        # Every optimization `auto` on the CPU backend reproduces what an unset environment selects on
+        # Metal (MUMPS aside, which julia_local does not ship): exact in Float64, and in Float32 the
+        # precision fixes engage.
+        metal_like = ("BLAB_COUPLED_TRANSDUCER_CONDENSATION" => "auto", "BLAB_COUPLED_INTERFACE_FLUX_ELIMINATION" => "auto",
+                      "BLAB_COUPLED_INTERFACE_MASS_SOLVER" => "cholmod", "BLAB_COUPLED_INTERFACE_MASS_OVERLAP" => "auto",
+                      "BLAB_COUPLED_INTERFACE_BLOCKS" => "auto", "BLAB_COUPLED_DENSE_REFINEMENT" => "auto",
+                      "BLAB_COUPLED_FEM_FLOAT64" => "auto")
+        metal_like_reference = monolithic_system(Float64, 700.0; transducers=[transducer])
+        metal_like64 = withenv(() -> condensed_system_at(Float64, 700.0; transducers=[transducer]), metal_like...)
+        metal_like32 = withenv(() -> condensed_system_at(Float32, 700.0; transducers=[transducer32]), metal_like...)
+        try
+            @test metal_like64.transducer_condensation && metal_like64.interface_elimination == :flux
+            @test isempty(metal_like64.optimization_fallback_reasons)
+            reference_solution = only(solve_coupled_excitations(metal_like_reference, voltage_auto))
+            metal_like_solution = only(solve_condensed_coupled_excitations(metal_like64, voltage_auto))
+            for field in elimination_fields
+                @test relative_error(getproperty(reference_solution, field), getproperty(metal_like_solution, field)) < 1e-9
+            end
+            @test metal_like32.factorization isa BeatEngineCoupledCondensed.RefinedDenseLU
+            @test metal_like32.fem_scalar_type == Float64
+            @test BeatEngineCoupledCondensed.interface_mass_diagnostics(metal_like32)["interface_mass_solver"] == "cholmod"
+        finally
+            release_coupled_system!(metal_like_reference)
+            release_condensed_coupled_system!(metal_like64)
+            release_condensed_coupled_system!(metal_like32)
+        end
+        # Under precision=float64 the switch changes nothing.
+        fem64_double = withenv(lever_one, flux_switch, "BLAB_COUPLED_FEM_FLOAT64" => "1") do
+            condensed_system_at(Float64, 700.0; transducers=[transducer])
+        end
+        fem64_plain = withenv(lever_one, flux_switch) do
+            condensed_system_at(Float64, 700.0; transducers=[transducer])
+        end
+        try
+            voltage64 = [(kind=:voltage, radiator_tag=0, transducer_index=1, amplitude=ComplexF64(1, 0))]
+            @test only(solve_condensed_coupled_excitations(fem64_double, voltage64)).bem_pressure ==
+                  only(solve_condensed_coupled_excitations(fem64_plain, voltage64)).bem_pressure
+        finally
+            release_condensed_coupled_system!(fem64_double)
+            release_condensed_coupled_system!(fem64_plain)
+        end
+        try
+            @test composed_flux.dense_scalar_type == Float64
+            excitations32 = [(kind=:voltage, radiator_tag=0, transducer_index=1, amplitude=ComplexF32(1, 0))]
+            baseline = only(solve_condensed_coupled_excitations(composed_baseline, excitations32))
+            candidate = only(solve_condensed_coupled_excitations(composed_flux, excitations32))
+            @test eltype(candidate.bem_pressure) == ComplexF32
+            for field in elimination_fields
+                @test relative_error(getproperty(baseline, field), getproperty(candidate, field)) < 1e-5
+            end
+        finally
+            release_condensed_coupled_system!(composed_baseline)
+            release_condensed_coupled_system!(composed_flux)
         end
 
         # Precision switches on the fixture with a transducer. Unset on the CPU backend nothing
@@ -873,6 +1337,66 @@ end
     @test_throws "BLAB_COUPLED_FEM_FLOAT64" withenv(() -> CC._fem_float64_enabled(:metal), "BLAB_COUPLED_FEM_FLOAT64" => "maybe")
 end
 
+@testset "Condensed coupled optimization switches: Metal defaults, auto and on" begin
+    CC = BeatEngineCoupledCondensed
+    names = ("BLAB_COUPLED_TRANSDUCER_CONDENSATION", "BLAB_COUPLED_DENSE_FLOAT64", "BLAB_COUPLED_DENSE_REFINEMENT",
+             "BLAB_COUPLED_FEM_FLOAT64", "BLAB_COUPLED_INTERFACE_PRESSURE_ELIMINATION",
+             "BLAB_COUPLED_INTERFACE_FLUX_ELIMINATION", "BLAB_COUPLED_FEM_SOLVER", "BLAB_COUPLED_INTERFACE_MASS_SOLVER",
+             "BLAB_COUPLED_INTERFACE_MASS_OVERLAP", "BLAB_COUPLED_INTERFACE_BLOCKS", "BLAB_COUPLED_DEMAND_RECONSTRUCTION")
+    withenv((name => nothing for name in names)...) do
+        # Unset: everything off on every non-Metal backend, which is the 0.1.4 behaviour.
+        for backend in (:cpu, :cuda, :rocm)
+            @test CC._transducer_condensation_mode(backend) == :off
+            @test CC._interface_elimination_request(backend) == (:none, false)
+            @test !CC._dense_double_assembly(backend) && !CC._dense_refinement_enabled(backend)
+            @test !CC._fem_float64_enabled(backend) && !CC._demand_reconstruction_enabled(backend)
+            @test CC._fem_solver_selection(backend) == :umfpack
+            @test CC._interface_mass_solver_selection(backend) == :lu
+            @test !CC._interface_mass_specialized(backend)
+        end
+        @test CC._fem_solver_selection() == :umfpack && CC._transducer_condensation_mode() == :off
+        # Unset on Metal: the optimized configuration, each switch in `auto`.
+        @test CC._transducer_condensation_mode(:metal) == :auto
+        @test CC._interface_elimination_request(:metal) == (:flux, false)
+        @test CC._interface_pressure_elimination_mode(:metal) == :off
+        @test CC._dense_refinement_enabled(:metal) && !CC._dense_float64_enabled(:metal) && CC._dense_double_assembly(:metal)
+        @test CC._fem_float64_enabled(:metal) && CC._demand_reconstruction_enabled(:metal)
+        @test CC._fem_solver_selection(:metal) == :mumps
+        @test CC._interface_mass_solver_selection(:metal) == :cholmod
+        @test CC._interface_mass_overlap_enabled(:metal) && CC._interface_blocks_mode(:metal) == :auto
+    end
+    # Explicit values win on every backend.
+    withenv("BLAB_COUPLED_INTERFACE_FLUX_ELIMINATION" => "1", "BLAB_COUPLED_FEM_SOLVER" => "umfpack",
+            "BLAB_COUPLED_DENSE_REFINEMENT" => "off", "BLAB_COUPLED_TRANSDUCER_CONDENSATION" => "AUTO") do
+        @test CC._interface_elimination_request(:cpu) == (:flux, true)
+        @test CC._interface_elimination_request(:metal) == (:flux, true)
+        @test CC._fem_solver_selection(:metal) == :umfpack
+        @test !CC._dense_refinement_enabled(:metal)
+        @test CC._transducer_condensation_mode(:cpu) == :auto
+    end
+    @test_throws "BLAB_COUPLED_INTERFACE_BLOCKS" withenv(() -> CC._interface_blocks_mode(:metal), "BLAB_COUPLED_INTERFACE_BLOCKS" => "maybe")
+    @test_throws "BLAB_COUPLED_FEM_SOLVER" withenv(() -> CC._fem_solver_selection(:metal), "BLAB_COUPLED_FEM_SOLVER" => "pardiso")
+
+    # Blocks: a mass matrix coupling two components is one block under `auto`, refused under `on`.
+    load = sparse([2.0 0.1 0.01 0.0; 0.1 2.0 0.0 0.0; 0.01 0.0 2.0 0.1; 0.0 0.0 0.1 2.0])
+    operators = InterfaceOperators(load, spzeros(1, 4), spzeros(4, 4), spzeros(4, 1))
+    labels = [1, 1, 2, 2]
+    fallbacks = String[]
+    operator, _ = CC._interface_mass_operator_or_single_block(nothing, operators, 1:4, collect(1:4), labels, :lu, :auto, fallbacks)
+    @test length(operator.blocks) == 1
+    @test startswith(only(fallbacks), "interface blocks not used")
+    rhs = randn(ComplexF64, 4, 2)
+    @test norm(CC._interface_mass_apply(operator, rhs) - Matrix(load) \ rhs) < 1e-12
+    @test_throws "different FEM components" CC._interface_mass_operator_or_single_block(
+        nothing, operators, 1:4, collect(1:4), labels, :lu, :on, String[],
+    )
+    decoupled = copy(load); decoupled[1, 3] = decoupled[3, 1] = 0
+    kept = String[]
+    two, _ = CC._interface_mass_operator_or_single_block(nothing, InterfaceOperators(dropzeros(decoupled), spzeros(1, 4), spzeros(4, 4), spzeros(4, 1)),
+                                                         1:4, collect(1:4), labels, :lu, :auto, kept)
+    @test length(two.blocks) == 2 && isempty(kept)
+end
+
 @testset "Float32 dense LU with Float64 refinement (BLAB_COUPLED_DENSE_REFINEMENT)" begin
     Random.seed!(20260917)
     n = 240
@@ -1016,4 +1540,203 @@ end
     double = air_spring(BeatEngineCoupledCondensed._fem_system_float64(nothing, mesh32, lossless, frequency, sound_speed, density))
     @test norm(single - reference) / norm(reference) > 1e-4
     @test norm(double - reference) / norm(reference) < 1e-12
+end
+
+@testset "Specialized interface flux elimination algebra" begin
+    Random.seed!(20260916)
+    # Three FEM components with interleaved vertex numbering.
+    vertex_count = 90
+    labels = rand(1:3, vertex_count)
+    labels[1:3] = [1, 2, 3]
+    fem_rows, fem_columns = Int[], Int[]
+    for component in 1:3
+        members = findall(==(component), labels)
+        for (a, b) in zip(members[1:(end - 1)], members[2:end])
+            push!(fem_rows, a, b); push!(fem_columns, b, a)
+        end
+        for _ in 1:length(members)
+            a, b = rand(members, 2)
+            push!(fem_rows, a); push!(fem_columns, b)
+        end
+    end
+    fem_graph = sparse(vcat(fem_rows, 1:vertex_count), vcat(fem_columns, 1:vertex_count), ones(ComplexF64, length(fem_rows) + vertex_count))
+    computed = BeatEngineCoupledCondensed._fem_component_labels(fem_graph)
+    @test length(unique(computed)) == 3
+    @test all((computed[a] == computed[b]) == (labels[a] == labels[b]) for a in 1:vertex_count, b in 1:vertex_count)
+
+    # Γ: a sorted subset; interface dofs a shuffled numbering of it. Components 1 and 3 carry Γ.
+    gamma = sort(vcat(findall(==(1), labels)[1:14], findall(==(3), labels)[1:9]))
+    n = length(gamma)
+    gamma_labels = computed[gamma]
+    gamma_dof = randperm(n)
+    # Symmetric positive definite mass, block diagonal between components, in dof space.
+    mass_dof = zeros(n, n)
+    for i in 1:n, j in 1:n
+        gamma_labels[i] == gamma_labels[j] || continue
+        a, b = gamma_dof[i], gamma_dof[j]
+        mass_dof[a, b] = i == j ? 2.0 + rand() : (rand() < 0.3 ? 0.2 * rand() : 0.0)
+    end
+    mass_dof = (mass_dof + mass_dof') / 2 + n * 0.05 * I
+    fem_load = spzeros(Float64, vertex_count, n)
+    for (index, vertex) in enumerate(gamma)
+        fem_load[vertex, :] = mass_dof[gamma_dof[index], :]
+    end
+    operators = InterfaceOperators(fem_load, spzeros(4, n), spzeros(n, vertex_count), spzeros(n, 4))
+    mass_gamma = Matrix(fem_load[gamma, :])
+    schur = zeros(ComplexF64, n, n)
+    for i in 1:n, j in 1:i
+        gamma_labels[i] == gamma_labels[j] || continue
+        schur[i, j] = schur[j, i] = complex(randn(), randn())
+    end
+    motion = randn(ComplexF64, n, 2)
+    coupling = randn(ComplexF64, 7, n)
+    reference_w = mass_gamma \ schur
+    reference_v = mass_gamma \ motion
+    # Also a dof numbering with each component contiguous, the layout the strided view serves.
+    contiguous_dof = invperm(sortperm(collect(zip(gamma_labels, randperm(n)))))
+    layouts = ((gamma_dof, fem_load), (contiguous_dof, begin
+        load = spzeros(Float64, vertex_count, n)
+        permuted = zeros(n, n)
+        for i in 1:n, j in 1:n
+            permuted[contiguous_dof[i], contiguous_dof[j]] = mass_dof[gamma_dof[i], gamma_dof[j]]
+        end
+        for (index, vertex) in enumerate(gamma)
+            load[vertex, :] = permuted[contiguous_dof[index], :]
+        end
+        load
+    end))
+    for (layout_dof, layout_load) in layouts, solver in (:lu, :cholmod), block_labels in (nothing, gamma_labels)
+    gamma_dof = layout_dof
+    operators = InterfaceOperators(layout_load, spzeros(4, n), spzeros(n, vertex_count), spzeros(n, 4))
+    mass_gamma = Matrix(layout_load[gamma, :])
+    reference_w = mass_gamma \ schur
+    reference_v = mass_gamma \ motion
+        store = Dict{Symbol,Any}()
+        operator, cached = BeatEngineCoupledCondensed._interface_mass_operator(store, operators, gamma, gamma_dof, block_labels, solver)
+        @test !cached
+        @test length(operator.blocks) == (isnothing(block_labels) ? 1 : 2)
+        @test all(block.kind == solver && isnothing(block.fallback_reason) for block in operator.blocks)
+        diagnostics = BeatEngineCoupledCondensed.interface_mass_diagnostics((interface_elimination=:flux, interface_elimination_data=(mass_operator=operator,)))
+        @test diagnostics["interface_mass_solver_requested"] == String(solver)
+        @test diagnostics["interface_mass_solver"] == String(solver)
+        @test diagnostics["interface_mass_block_count"] == length(operator.blocks)
+        @test isempty(diagnostics["interface_mass_fallback_reasons"])
+        @test sort(vcat([block.rows for block in operator.blocks]...)) == 1:n
+        @test all(issorted(block.dofs) && block.dofs == gamma_dof[block.rows] for block in operator.blocks)
+        again, cached_again = BeatEngineCoupledCondensed._interface_mass_operator(store, operators, gamma, gamma_dof, block_labels, solver)
+        @test cached_again && again === operator
+        other = solver == :lu ? :cholmod : :lu
+        @test !last(BeatEngineCoupledCondensed._interface_mass_operator(store, operators, gamma, gamma_dof, block_labels, other))
+
+        presolve = BeatEngineCoupledCondensed._flux_mass_presolve(operator, schur, motion)
+        assembled = zeros(ComplexF64, n, n)
+        for (block, w) in zip(operator.blocks, presolve.schur_blocks)
+            assembled[block.dofs, block.rows] = w
+        end
+        @test norm(assembled - reference_w) / norm(reference_w) < 1e-12
+        @test norm(presolve.motion_solution - reference_v) / norm(reference_v) < 1e-12
+        rhs = randn(ComplexF64, n, 3)
+        @test norm(BeatEngineCoupledCondensed._interface_mass_apply(operator, rhs) - mass_gamma \ rhs) / norm(mass_gamma \ rhs) < 1e-12
+        # Per-block products scattered into Γ columns reproduce the full product.
+        product = zeros(ComplexF64, 7, n)
+        for (block, w) in zip(operator.blocks, presolve.schur_blocks)
+            product[:, block.rows] .+= coupling[:, block.dofs] * w
+        end
+        @test norm(product - coupling * reference_w) / norm(coupling * reference_w) < 1e-12
+        @test haskey(presolve.split, :block_check) == !isnothing(block_labels)
+        # The engine's block products and scatter: Γ column j lands on column target[j] (with a
+        # shared target summing), next to an untouched offset row range.
+        targets = vcat(randperm(n + 2)[1:(n - 1)], 0)
+        targets[end] = targets[1]
+        dense = zeros(ComplexF64, 9, n + 2)
+        BeatEngineCoupledCondensed._flux_block_products!(
+            dense, 2:8, targets, operator, presolve.schur_blocks, coupling, Dict{Symbol,Float64}(),
+        )
+        expected = zeros(ComplexF64, 9, n + 2)
+        full_product = coupling * reference_w
+        for j in 1:n
+            expected[2:8, targets[j]] .+= full_product[:, j]
+        end
+        @test norm(dense - expected) / norm(expected) < 1e-12
+        @test all(block.contiguous for block in operator.blocks) == (layout_dof === contiguous_dof || isnothing(block_labels))
+    end
+    gamma_dof = first(first(layouts))
+    operators = InterfaceOperators(fem_load, spzeros(4, n), spzeros(n, vertex_count), spzeros(n, 4))
+    mass_gamma = Matrix(fem_load[gamma, :])
+    reference_w = mass_gamma \ schur
+    reference_v = mass_gamma \ motion
+    # Structure violations are refused, not averaged away.
+    blocks_operator, _ = BeatEngineCoupledCondensed._interface_mass_operator(nothing, operators, gamma, gamma_dof, gamma_labels, :cholmod)
+    cross = findfirst(j -> gamma_labels[j] != gamma_labels[1], 1:n)
+    coupled_schur = copy(schur); coupled_schur[1, cross] = coupled_schur[cross, 1] = 1e-30
+    @test_throws "different FEM components" BeatEngineCoupledCondensed._flux_mass_presolve(blocks_operator, coupled_schur, motion)
+    cross_load = copy(fem_load); cross_load[gamma[1], gamma_dof[cross]] = 0.01
+    cross_operators = InterfaceOperators(cross_load, spzeros(4, n), spzeros(n, vertex_count), spzeros(n, 4))
+    @test_throws "different FEM components" BeatEngineCoupledCondensed._interface_mass_operator(nothing, cross_operators, gamma, gamma_dof, gamma_labels, :lu)
+    # An explicitly stored zero between components couples nothing: the check reads values, as
+    # the Schur check does, not the stored pattern.
+    stored_zero_load = copy(fem_load)
+    stored_zero_load[gamma[1], gamma_dof[cross]] = 1.0
+    stored_zero_column = nzrange(stored_zero_load, gamma_dof[cross])
+    stored_zero_load.nzval[stored_zero_column[findfirst(==(gamma[1]), rowvals(stored_zero_load)[stored_zero_column])]] = 0.0
+    @test nnz(stored_zero_load) == nnz(fem_load) + 1
+    @test stored_zero_load == fem_load
+    stored_zero_operators = InterfaceOperators(stored_zero_load, spzeros(4, n), spzeros(n, vertex_count), spzeros(n, 4))
+    for solver in (:lu, :cholmod)
+        stored_zero, _ = BeatEngineCoupledCondensed._interface_mass_operator(nothing, stored_zero_operators, gamma, gamma_dof, gamma_labels, solver)
+        @test length(stored_zero.blocks) == 2
+        @test all(block.kind == solver && isnothing(block.fallback_reason) for block in stored_zero.blocks)
+        @test norm(BeatEngineCoupledCondensed._interface_mass_apply(stored_zero, motion) - reference_v) / norm(reference_v) < 1e-12
+    end
+    # An indefinite block cannot be Cholesky-factored: LU takes over and says why.
+    indefinite_load = copy(fem_load); indefinite_load[gamma, :] .*= -1
+    indefinite_operators = InterfaceOperators(indefinite_load, spzeros(4, n), spzeros(n, vertex_count), spzeros(n, 4))
+    fallback, _ = BeatEngineCoupledCondensed._interface_mass_operator(nothing, indefinite_operators, gamma, gamma_dof, nothing, :cholmod)
+    @test only(fallback.blocks).kind == :lu
+    @test occursin("CHOLMOD", only(fallback.blocks).fallback_reason)
+    @test norm(BeatEngineCoupledCondensed._interface_mass_apply(fallback, motion) + reference_v) / norm(reference_v) < 1e-12
+    diagnostics = BeatEngineCoupledCondensed.interface_mass_diagnostics((interface_elimination=:flux, interface_elimination_data=(mass_operator=fallback,)))
+    @test diagnostics["interface_mass_solver_requested"] == "cholmod"
+    @test diagnostics["interface_mass_solver"] == "lu"
+    @test diagnostics["interface_mass_block_count"] == 1
+    @test only(diagnostics["interface_mass_fallback_reasons"]) == only(fallback.blocks).fallback_reason
+    # One indefinite block of two: that block falls back, the other keeps Cholesky, and the
+    # diagnostics say both.
+    first_block = findall(==(gamma_labels[1]), gamma_labels)
+    partial_load = copy(fem_load); partial_load[gamma[first_block], :] .*= -1; dropzeros!(partial_load)
+    partial_operators = InterfaceOperators(partial_load, spzeros(4, n), spzeros(n, vertex_count), spzeros(n, 4))
+    partial, _ = BeatEngineCoupledCondensed._interface_mass_operator(nothing, partial_operators, gamma, gamma_dof, gamma_labels, :cholmod)
+    @test sort([String(block.kind) for block in partial.blocks]) == ["cholmod", "lu"]
+    partial_diagnostics = BeatEngineCoupledCondensed.interface_mass_diagnostics((interface_elimination=:flux, interface_elimination_data=(mass_operator=partial,)))
+    @test partial_diagnostics["interface_mass_solver"] == "mixed"
+    @test partial_diagnostics["interface_mass_block_count"] == 2
+    @test length(partial_diagnostics["interface_mass_fallback_reasons"]) == 1
+    @test occursin("CHOLMOD", only(partial_diagnostics["interface_mass_fallback_reasons"]))
+    # An operator over no interface vertices has no blocks and solved nothing.
+    empty_operator = (count=0, blocks=NamedTuple[], solver=:cholmod)
+    empty_diagnostics = BeatEngineCoupledCondensed.interface_mass_diagnostics((interface_elimination=:flux, interface_elimination_data=(mass_operator=empty_operator,)))
+    @test isnothing(empty_diagnostics["interface_mass_solver"])
+    @test empty_diagnostics["interface_mass_block_count"] == 0
+    # Pressure elimination never solves with M_Γ, whatever data it carries.
+    @test isnothing(BeatEngineCoupledCondensed.interface_mass_diagnostics((interface_elimination=:pressure, interface_elimination_data=(mass_operator=partial,)))["interface_mass_solver"])
+end
+
+# MUMPS ships only with the macOS Metal environment (see BeatEngineMumps), and its tests run there
+# through mumps_tests.jl. Anywhere else the switch has to fall back to UMFPACK and say why.
+if isnothing(Base.locate_package(BeatEngineCoupledCondensed.BeatEngineMumps.MUMPS_SEQ_PKGID))
+    @testset "MUMPS absent from the environment falls back to UMFPACK" begin
+        base, operators, retained = condensed_synthetic_case(Float64)
+        symmetric = SparseMatrixCSC{ComplexF64,Int}(base + transpose(base))
+        library = BeatEngineCoupledCondensed.BeatEngineMumps.mumps_library()
+        @test !library.available
+        @test occursin("MUMPS_seq_jll is not in this Julia environment", library.reason)
+        umfpack = BeatEngineCoupledCondensed._build_condensation(symmetric, operators, retained)
+        fallback = BeatEngineCoupledCondensed._build_condensation(symmetric, operators, retained; fem_solver=:mumps)
+        @test fallback.backend == :cpu_umfpack
+        @test fallback.fem_solver_requested == :mumps
+        @test startswith(fallback.fem_solver_fallback_reason, "MUMPS unavailable: MUMPS_seq_jll is not in this Julia environment")
+        @test fallback.schur == umfpack.schur
+    end
+else
+    include(joinpath(@__DIR__, "coupled_mumps_tests.jl"))
 end
