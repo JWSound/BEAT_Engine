@@ -20,6 +20,9 @@
     ],
     "field_array": [
       1
+    ],
+    "mesh_data": [
+      1
     ]
   },
   "operations": [
@@ -51,5 +54,9 @@
   ],
   "optional_output_quantities": [
     "interface_average_normal_velocity"
+  ],
+  "request_transports": [
+    "file",
+    "inline_json"
   ]
 }

@@ -1,6 +1,8 @@
 module BeatEngineContract
 
 using JSON
+include(joinpath(@__DIR__, "BeatEngineMeshData.jl"))
+using .BeatEngineMeshData
 include(joinpath(@__DIR__, "BeatEngineProvenance.jl"))
 using .BeatEngineProvenance
 
@@ -29,7 +31,12 @@ function validate_worker_submission(submission)
     (operation == "reclaim" || operation in WORKER["operations"]) || error("Unsupported BEAT worker operation: $operation")
     operation == "reclaim" && return nothing
     request = get(submission, "request", nothing)
-    request isa AbstractString && !isempty(request) || error("BEAT worker command requires a request filename.")
+    inline = get(submission, "request_inline", nothing)
+    if inline !== nothing
+        operation == "solve" && request === nothing && inline isa AbstractDict || error("Invalid inline worker submission.")
+    else
+        request isa AbstractString && !isempty(request) || error("BEAT worker command requires a request filename.")
+    end
     field, contract = operation == "solve" ? ("result_schema_version", "system_result") : ("field_array_schema_version", "field_array")
     selected = get(submission, field, nothing)
     selected isa Integer && !(selected isa Bool) && selected in WORKER["contracts"][contract] ||
@@ -116,6 +123,7 @@ function references(values, available, path)
 end
 
 function graph(system)
+    validate_mesh_sources(system)
     collections = Dict()
     for name in ("meshes", "regions", "boundaries", "interfaces", "components", "excitation_ports")
         unique_ids([item["id"] for item in system[name]], "compiled_system.$name")

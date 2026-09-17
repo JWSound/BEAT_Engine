@@ -183,7 +183,9 @@ class WorkerProcess(IdleCleanupMixin):
     def _accept_ready(self, event: dict) -> None:
         self._worker_info = copy.deepcopy(event)
 
-    def _prepare_submission(self, request_path: Path, operation: str) -> dict:
+    def _prepare_submission(self, request_path: Path | Mapping, operation: str) -> dict:
+        if isinstance(request_path, Mapping):
+            return {"request_inline": dict(request_path), "operation": str(operation)}
         return {"request": str(request_path), "operation": str(operation)}
 
     def _accept_event(self, event: dict) -> None:
@@ -192,7 +194,7 @@ class WorkerProcess(IdleCleanupMixin):
     @reserve_idle_during_call
     def submit(
         self,
-        request_path: Path,
+        request_path: Path | Mapping,
         *,
         status_callback: Callable[[str], None] | None = None,
         operation: str = "solve",
@@ -626,7 +628,7 @@ def resolve_julia_threads(julia_threads: str | int = "auto") -> str:
 def julia_command(
     julia_executable: str,
     solver_script: Path,
-    request_path: Path,
+    request_path: Path | Mapping,
     *,
     julia_project: Path | None,
     julia_sysimage: Path | None = None,

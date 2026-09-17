@@ -1,6 +1,7 @@
 """Model-independent physical-system worker with version/capability negotiation."""
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 from .beat_contract.worker import negotiate_submission, validate_worker_event, validate_worker_ready
@@ -15,10 +16,13 @@ class EngineWorker(WorkerProcess):
             validate_worker_ready(event)
         super()._accept_ready(event)
 
-    def _prepare_submission(self, request_path: Path, operation: str) -> dict:
+    def _prepare_submission(self, request_path: Path | Mapping, operation: str) -> dict:
         command = super()._prepare_submission(request_path, operation)
-        request = json.loads(request_path.read_text(encoding="utf-8"))
+        inline = isinstance(request_path, Mapping)
+        request = dict(request_path) if inline else json.loads(request_path.read_text(encoding="utf-8"))
         info = self._worker_info or {}
+        if inline and (operation != "solve" or "inline_json" not in info.get("request_transports", [])):
+            raise RuntimeError("BEAT worker does not support inline solve requests; update the engine.")
         self._expected_phasor = request.get("solver_options", request).get("phasor_convention", "exp(-i omega t)")
         protocol = info.get("protocol")
         negotiated = isinstance(protocol, dict) and protocol.get("name") == "beat-worker"
