@@ -3614,6 +3614,7 @@ end
 function run_worker()
     ready = worker_ready(worker_backend_availability())
     ready["worker_cleanup_policies"] = ["aggressive", "cuda_reuse"]
+    push!(ready["operations"], "reclaim")
     println(JSON.json(ready))
     flush(stdout)
     requests_since_cleanup = 0
@@ -3622,6 +3623,16 @@ function run_worker()
         try
             submission = JSON.parse(line)
             validate_worker_submission(submission)
+            if get(submission, "operation", "solve") == "reclaim"
+                cleanup_started = time_ns()
+                reclaim_accelerator_memory!()
+                requests_since_cleanup = 0
+                println(JSON.json(Dict("type" => "completed", "worker_cleanup" => Dict(
+                    "policy" => "cuda_reuse", "reason" => "idle", "requests_since_cleanup" => 0,
+                    "seconds" => (time_ns() - cleanup_started) / 1e9))))
+                flush(stdout)
+                continue
+            end
             request_path = String(submission["request"])
             request = JSON.parse(read(request_path, String))
             operation = String(get(submission, "operation", "solve"))

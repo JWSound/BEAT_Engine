@@ -55,3 +55,36 @@ Run the standalone decision tests with:
 ```powershell
 julia src/beat_engine/julia_local/tests/worker_cleanup_tests.jl
 ```
+
+
+## Idle reclamation
+
+Compiled-system workers with this extension additionally advertise `reclaim` in
+`operations`. After validating the ready announcement, a client may send
+`{"protocol_version":1,"operation":"reclaim"}` without a request filename or
+result-schema selection. The worker performs full reclamation, resets
+`requests_since_cleanup`, and replies with `completed` and `worker_cleanup`
+diagnostics (`reason: "idle"`, counter zero, duration). The worker remains alive.
+Solves and reclamation execute serially on the worker's command loop.
+
+The Python worker exposes `configure_idle_cleanup(idle_ms=5000)`. It is disabled
+until explicitly configured. After a terminal solve event reports `reason=reuse`,
+the transport schedules one daemon timer. New submissions cancel the pending
+timer; after field activity it is restarted if retained solve caches still need
+cleanup. A full cleanup clears that state, so there is no repeating idle loop.
+Older workers without the `reclaim` capability do not receive cleanup commands.
+
+`worker.hold_idle_cleanup()` and `pool.hold_idle_cleanup()` return idempotent
+release callbacks. Clients should acquire a hold as soon as a user requests work,
+before expensive preparation, and release it after submission or abandonment.
+Pool holds also cover workers created during preparation. Acquiring a hold never
+waits for active reclamation; subsequent submission waits normally. Cancelled,
+superseded and failed preparation must release its hold.
+
+The timer atomically acquires submission ownership only if still current and
+idle, with no reservation or pending submission. If it already owns the worker,
+new requests wait until it consumes the terminal event. A failed reclamation
+discards the process before allowing queued work to proceed. Termination cancels
+pending timers. `last_worker_cleanup` contains the latest cleanup diagnostic,
+including idle cleanup; the transport also logs it. Disabling the timer with
+`configure_idle_cleanup(None)` does not interrupt reclamation already in flight.

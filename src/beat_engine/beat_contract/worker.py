@@ -63,6 +63,8 @@ def negotiate_submission(info: dict, request: dict, operation: str) -> dict:
     _require(operation in info["operations"], f"operation {operation!r} is unavailable.")
     contracts = info["contracts"]
     command = {"protocol_version": WORKER_PROTOCOL_VERSION}
+    if operation == "reclaim":
+        return command
     if operation == "solve":
         validate_solve_request(request)
         for name, version in (
