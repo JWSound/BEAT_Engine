@@ -1,4 +1,5 @@
 """Packed meshes and inline worker requests have an independent public contract."""
+
 import base64
 import copy
 import json
@@ -17,13 +18,26 @@ CONTRACT = Path(__file__).resolve().parents[1] / "src/beat_engine/beat_contract"
 
 def packed(dtype, shape, values):
     fmt = "d" if dtype == "<f8" else "q"
-    return {"dtype": dtype, "shape": shape, "data": base64.b64encode(struct.pack("<" + fmt * len(values), *values)).decode()}
+    return {
+        "dtype": dtype,
+        "shape": shape,
+        "data": base64.b64encode(struct.pack("<" + fmt * len(values), *values)).decode(),
+    }
 
 
 def mesh_payload():
-    return {"schema_version": 1, "points": packed("<f8", [3, 3], [0., 0, 0, 1, 0, 0, 0, 1, 0]),
-            "cells": [{"type": "triangle", "connectivity": packed("<i8", [1, 3], [0, 1, 2]),
-                       "physical_tags": packed("<i8", [1], [2])}], "physical_names": {"radiator": [2, 2]}}
+    return {
+        "schema_version": 1,
+        "points": packed("<f8", [3, 3], [0.0, 0, 0, 1, 0, 0, 0, 1, 0]),
+        "cells": [
+            {
+                "type": "triangle",
+                "connectivity": packed("<i8", [1, 3], [0, 1, 2]),
+                "physical_tags": packed("<i8", [1], [2]),
+            }
+        ],
+        "physical_names": {"radiator": [2, 2]},
+    }
 
 
 def request_and_ready():

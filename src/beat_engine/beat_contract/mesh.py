@@ -13,8 +13,12 @@ def decode_array(raw, dtype, tail):
     if not isinstance(raw, dict) or set(raw) != {"dtype", "shape", "data"} or raw["dtype"] != dtype:
         raise ValueError("Invalid packed mesh array descriptor.")
     shape = raw["shape"]
-    if (not isinstance(shape, list) or len(shape) != len(tail) + 1
-            or shape[1:] != list(tail) or any(type(n) is not int or n <= 0 for n in shape)):
+    if (
+        not isinstance(shape, list)
+        or len(shape) != len(tail) + 1
+        or shape[1:] != list(tail)
+        or any(type(n) is not int or n <= 0 for n in shape)
+    ):
         raise ValueError("Invalid packed mesh array shape.")
     expected = math.prod(shape) * 8
     data = raw["data"]
@@ -43,8 +47,15 @@ def validate_mesh_data(raw):
         raise ValueError("physical_names must be an object.")
     groups = set()
     for name, value in names.items():
-        if (not isinstance(name, str) or not name or not isinstance(value, list) or len(value) != 2
-                or any(type(n) is not int for n in value) or value[0] <= 0 or value[1] not in (2, 3)):
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(value, list)
+            or len(value) != 2
+            or any(type(n) is not int for n in value)
+            or value[0] <= 0
+            or value[1] not in (2, 3)
+        ):
             raise ValueError("Invalid physical group.")
         groups.add(tuple(value))
     cells = raw["cells"]
