@@ -216,6 +216,37 @@ end
 function load_deploy_speaker_rom(request, ::Type{T}, node_count::Int, face_count::Int) where {T<:AbstractFloat}
     raw = get_value(request, "rom", nothing)
     raw isa AbstractDict || error("Deploy Level 3 ROM request is missing its rom object.")
+    raw_models = get_value(raw, "models", nothing)
+    if raw_models isa AbstractDict
+        isempty(raw_models) && error("Deploy ROM model collection must not be empty.")
+        models = Dict(String(id) => load_deploy_speaker_rom(
+            Dict("rom" => value), T, node_count, face_count,
+        ) for (id, value) in raw_models)
+        instances = get_value(raw, "instances", Any[])
+        locations = Dict(instance.id => (String(id), index)
+            for (id, model) in models for (index, instance) in enumerate(model.instances))
+        length(locations) == sum(length(model.instances) for model in values(models)) ||
+            error("Deploy ROM instance IDs must be unique across models.")
+        ids = [String(get_value(instance, "id", "")) for instance in instances]
+        length(unique(ids)) == length(locations) == length(ids) ||
+            error("Deploy ROM scene instances do not match model instances.")
+        order = Tuple{String,Int}[]
+        for instance in instances
+            id = String(get_value(instance, "id", ""))
+            haskey(locations, id) || error("Deploy ROM scene references an unknown instance.")
+            location = locations[id]
+            location[1] == String(get_value(instance, "model_id", "")) ||
+                error("Deploy ROM instance references the wrong model.")
+            push!(order, location)
+        end
+        return (
+            models=models, order=order, face_count=face_count, node_count=node_count,
+            rank=maximum(model.rank for model in values(models)),
+            sector_count=maximum(model.sector_count for model in values(models)), symmetry=:mixed,
+            tolerance=T(get_value(raw, "gmres_tolerance", 1e-4)),
+            max_iterations=Int(get_value(raw, "gmres_max_iterations", 30)),
+        )
+    end
     String(get_value(raw, "representation", "")) == "parity_petrov_galerkin_rom" || error(
         "Deploy Level 3 request uses an unsupported reduced representation.",
     )
@@ -336,6 +367,19 @@ function load_deploy_speaker_rom(request, ::Type{T}, node_count::Int, face_count
 end
 
 function deploy_speaker_rom_response(model, pressure::AbstractVector; include_drive::Bool)
+    if hasproperty(model, :models)
+        responses = Dict(id => deploy_speaker_rom_response(local_model, pressure; include_drive=include_drive)
+            for (id, local_model) in model.models)
+        q = zeros(eltype(pressure), model.face_count)
+        for response in values(responses)
+            q .+= response.q
+        end
+        return (
+            q=q,
+            velocities=[responses[id].velocities[index] for (id, index) in model.order],
+            currents=[responses[id].currents[index] for (id, index) in model.order],
+        )
+    end
     T = typeof(real(zero(eltype(pressure))))
     q = zeros(eltype(pressure), model.face_count)
     velocities = [zeros(eltype(pressure), size(model.arrays["velocity"], 2)) for _ in model.instances]
@@ -505,7 +549,7 @@ function solve_deploy_request_impl(
         "Unsupported Deploy boundary solve schema $request_schema.",
     )
     schema_version = Int(get_value(request, "schema_version", 1))
-    schema_version in (1, 2) || error("Unsupported Deploy solve schema_version $(schema_version).")
+    schema_version in (1, 2, 3) || error("Unsupported Deploy solve schema_version $(schema_version).")
     beat_backend = beat_backend_from_request(request)
     beat_backend in (:cuda, :cpu) || error("Deploy Level 2 currently supports BEAT CUDA or CPU.")
     requested_assembly_mode = lowercase(String(get_value(request, "burton_miller_assembly", "direct_system")))
@@ -1122,6 +1166,12 @@ function solve_deploy_request_impl(
                 result["diagnostics"]["rom_rank_per_sector"] = speaker_rom.rank
                 result["diagnostics"]["rom_sector_count"] = speaker_rom.sector_count
                 result["diagnostics"]["rom_symmetry"] = String(speaker_rom.symmetry)
+                if hasproperty(speaker_rom, :models)
+                    result["diagnostics"]["rom_models"] = Dict(id => Dict(
+                        "rank_per_sector" => model.rank, "sector_count" => model.sector_count,
+                        "symmetry" => String(model.symmetry),
+                    ) for (id, model) in speaker_rom.models)
+                end
                 result["diagnostics"]["schur_gmres_iterations"] = rom_iterations
                 result["diagnostics"]["schur_operator_applications"] = rom_operator_applications
                 result["diagnostics"]["schur_gmres_warm_started"] = rom_initial_pressure !== nothing
@@ -1270,7 +1320,7 @@ function solve_deploy_microphone_sweep_request_impl(request)
             frequency_request["schema"] = rom_sweep isa AbstractDict ?
                                           "boundary_lab_deploy_rom" :
                                           "boundary_lab_deploy_solve"
-            frequency_request["schema_version"] = 2
+            frequency_request["schema_version"] = Int(get_value(request, "schema_version", 2))
             frequency_request["frequency_hz"] = frequencies[index]
             if rom_sweep isa AbstractDict
                 entry = rom_frequency_entries[index]
@@ -1278,6 +1328,10 @@ function solve_deploy_microphone_sweep_request_impl(request)
                 delete!(frequency_rom, "frequencies")
                 frequency_rom["binary_arrays"] = get_value(entry, "binary_arrays", nothing)
                 frequency_rom["instances"] = get_value(entry, "instances", nothing)
+                if get_value(rom_sweep, "models", nothing) isa AbstractDict
+                    frequency_rom["models"] = Dict(id => merge(model, entry["models"][id])
+                        for (id, model) in rom_sweep["models"])
+                end
                 frequency_request["rom"] = frequency_rom
                 delete!(frequency_request, "rom_sweep")
             else
