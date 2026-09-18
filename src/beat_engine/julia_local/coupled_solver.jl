@@ -2732,6 +2732,9 @@ function solve_request_impl(request; event_mode=false)
         cache_setup_s = (time_ns() - cache_setup_started) / 1.0e9
     end
     outputs = get(request, "outputs", Any[])
+    rom_requested = any(
+        String(output["quantity"]) in SPEAKER_ROM_QUANTITIES for output in outputs
+    )
     coupled_system = nothing
     try
         for (frequency_index, frequency_value) in enumerate(request["frequencies_hz"])
@@ -2761,8 +2764,9 @@ function solve_request_impl(request; event_mode=false)
                     transducers=transducers,
                     transducer_operators=transducer_operators,
                     prescribed_bem_normal_velocity=prescribed_bem_normal_velocity,
-                    # The speaker ROM experiment reads transducer surfaces from the Schur block.
-                    allow_transducer_condensation=isnothing(get(solver_options, "speaker_rom_rank_experiment", nothing)),
+                    # ROM exports and the rank experiment read transducer surfaces from the Schur block.
+                    allow_transducer_condensation=!rom_requested &&
+                        isnothing(get(solver_options, "speaker_rom_rank_experiment", nothing)),
                 )
             else
                 build_coupled_system(
@@ -2829,9 +2833,6 @@ function solve_request_impl(request; event_mode=false)
             ]
             field_s = 0.0
             quantities = Dict{String,Any}[]
-            rom_requested = any(
-                String(output["quantity"]) in SPEAKER_ROM_QUANTITIES for output in outputs
-            )
             rom_options = get(solver_options, "speaker_rom", Dict{String,Any}())
             rom_matrices = if rom_requested
                 rom_k, rom_layout = speaker_interior_state_matrix(coupled_system)
