@@ -372,6 +372,46 @@ than its work required. The width used is reported as `fem_schur_block_size`
 (26 on `S218BP` with eight threads). `BLAB_SCHUR_BLOCK` pins the width for
 measurement.
 
+### Precision of coupled Float32 solves
+
+Coupled Metal solves run at `precision=float32`. Two host stages lose more than
+single precision should, and both are now kept in double precision on Metal by
+default:
+
+- **Dense coupled LU.** A Float32 LU of the dense condensed system cannot carry
+  its condition number. Against a CPU Float64 reference (every other setting
+  equal, ten frequencies from 20 Hz to 20 kHz, 5e-4 relative / 0.01 dB gate),
+  the Float32 dense LU missed on every Boundary Lab example tried:
+  Multi_region_SAWMOD 0.28 dB, Simple_Sealed 0.71 dB, Vented_Sub 4.4 dB,
+  S218BP 1.8 dB, F2B_FLH 0.027 dB, SKRAM 8.9 dB. The system is now assembled in
+  `ComplexF64`, factored in `ComplexF32` and solved by iterative refinement
+  against the double-precision matrix (`RefinedDenseLU`, LAPACK `zcgesv`'s
+  backward-error test). On these examples every frequency converged in one or
+  two steps and matched a `ComplexF64` LU. A solve that stalls, a matrix outside
+  the Float32 range, or a failed Float32 factorization falls back to a
+  `ComplexF64` LU with the reason in `dense_refinement_fallback_reason`.
+- **FEM matrices at low frequency.** A sealed cavity with no retained vertices
+  has a near-constant pressure mode whose eigenvalue scales like `k²` (the air
+  spring). A Float32 stiffness matrix annihilates constants only to about
+  `eps(Float32)‖K‖`, and that mode amplifies the defect by about `1/(kh)²`, so
+  the transducer's mechanical impedance loses digits at low frequency even
+  though `A_II` is factored in `ComplexF64`. On Multi_region_SAWMOD at 20 Hz
+  every output was off by 1.2e-4; on S218BP by 1.3e-3 (a gate failure). The
+  stiffness, mass and bulk-loss matrices are now assembled in `Float64` (once
+  per mesh, on the mesh's own coordinates) and the condensation reads a
+  `ComplexF64` dynamic stiffness. The 20 Hz errors drop to 9e-7 and 5e-6.
+
+Neither changes a `precision=float64` solve, and neither applies to `beat_cpu`,
+CUDA or ROCm unless the variable is set explicitly. Results stay `Complex{T}`.
+Result diagnostics report `dense_solver` (`lu_float32`, `lu_float64`,
+`lu_float32_refined`, `lu_float64_fallback`), `dense_refinement_iterations`,
+`dense_refinement_backward_error` and `fem_matrix_precision`.
+
+Cost on Multi_region_SAWMOD (4 frequencies, 3 interleaved rounds, M1 Max),
+median assembly per frequency: Float32 LU 7.36 s, Float64 LU 10.38 s,
+refinement 8.79 s: refinement recovers about half of what a plain Float64 LU
+costs.
+
 ### Interior solver: UMFPACK, and the Accelerate path that was removed
 
 The condensation factors the FEM interior and then solves it against roughly one
@@ -453,6 +493,9 @@ Normal application use does not require these environment variables.
 | `BLAB_METAL_OVERLAP_HOST_SLOWDOWN` | `0.1` | |
 | `BLAB_METAL_ATOMIC_SCATTER` | `1` | Diagnostic for `pair_atomic` only: `0` skips the atomic scatter to time the pair arithmetic (the operators are then wrong). |
 | `BLAB_COUPLED_STAGE_OVERLAP` | `auto` | Coupled solves: `auto` runs the FEM condensation on its own thread while the GPU assembles the BEM operators; `off` runs them in sequence; `on` forces the overlap on `beat_cpu` too. Needs more than one Julia thread. |
+| `BLAB_COUPLED_DENSE_REFINEMENT` | `auto` on Metal, `off` elsewhere | Coupled Float32 solves: assemble the dense system in `ComplexF64`, factor in `ComplexF32`, refine to the Float64 backward error (falls back to a `ComplexF64` LU with a reason). `1`/`auto`/`0`. |
+| `BLAB_COUPLED_DENSE_FLOAT64` | `off` | Coupled Float32 solves: plain `ComplexF64` dense LU instead (refinement takes precedence when both are on). |
+| `BLAB_COUPLED_FEM_FLOAT64` | `auto` on Metal, `off` elsewhere | Coupled Float32 solves: assemble the FEM stiffness, mass and bulk-loss matrices in `Float64`. |
 | `BLAB_SCHUR_BLOCK` | unset | Coupled solves: pins the Schur complement right-hand-side block width, bypassing the thread-count balancing. For measurement only. |
 | `BLAB_BEAT_FUSED_BM` | `1` | Set to `0` to assemble the four operators and combine them on the host for exterior solves. Coupled solves, `host_staged` assembly and the `host` singular mode always take the four-operator path. |
 

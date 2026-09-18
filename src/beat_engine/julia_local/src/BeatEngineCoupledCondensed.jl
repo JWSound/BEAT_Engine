@@ -101,6 +101,283 @@ function _schur_block_width(requested::Int, retained_count::Int)
 end
 
 """
+    _coupled_mode(name, bem_backend=:cpu; metal_default=:auto) -> :off | :on | :auto
+
+Resolve a condensed-coupled precision/optimization switch.
+
+- **Unset:** `metal_default` on the Metal backend, `:off` everywhere else, so CPU requests keep
+  the 0.1.4 behaviour unless a switch is set explicitly.
+- **`auto`:** use it where the model allows; otherwise the established path.
+- **`1`/`on`/`true`/`yes`:** require it and raise when the structure does not allow it.
+- **`0`/`off`/`false`/`no`:** don't use it.
+
+Anything else is an error rather than a silent default. The precision switches have no structural
+precondition, so for them `auto` and `on` behave the same.
+"""
+function _coupled_mode(name::AbstractString, bem_backend::Symbol=:cpu; metal_default::Symbol=:auto)
+    value = lowercase(strip(get(ENV, name, "")))
+    isempty(value) && return bem_backend == :metal ? metal_default : :off
+    value in ("1", "on", "true", "yes") && return :on
+    value in ("0", "off", "false", "no") && return :off
+    value == "auto" && return :auto
+    error("Unsupported $name value: $value. Expected 1/on, 0/off or auto.")
+end
+
+_coupled_switch(name::AbstractString, bem_backend::Symbol=:cpu; metal_default::Symbol=:auto) =
+    _coupled_mode(name, bem_backend; metal_default=metal_default) != :off
+
+"""
+`BLAB_COUPLED_DENSE_FLOAT64=1`: assemble and factor the dense coupled system in `ComplexF64`
+whatever `T` is, keeping the Schur block in double precision. Off by default on every backend
+(on Metal, `BLAB_COUPLED_DENSE_REFINEMENT` gives the same accuracy for less time).
+"""
+_dense_float64_enabled(bem_backend::Symbol=:cpu) =
+    _coupled_switch("BLAB_COUPLED_DENSE_FLOAT64", bem_backend; metal_default=:off)
+
+"""
+`BLAB_COUPLED_DENSE_REFINEMENT=1`: assemble the dense coupled system in `ComplexF64` as
+`BLAB_COUPLED_DENSE_FLOAT64` does, but factor a `ComplexF32` copy and recover the double-precision
+solution by iterative refinement against the `ComplexF64` matrix (`RefinedDenseLU`). A solve that
+stalls or does not reach the Float64 backward error within `DENSE_REFINEMENT_MAX_ITERATIONS` steps is redone with a
+`ComplexF64` LU and says why. Takes precedence over `BLAB_COUPLED_DENSE_FLOAT64` for the factorization.
+"""
+_dense_refinement_enabled(bem_backend::Symbol=:cpu) = _coupled_switch("BLAB_COUPLED_DENSE_REFINEMENT", bem_backend)
+_dense_double_assembly(bem_backend::Symbol=:cpu) =
+    _dense_float64_enabled(bem_backend) || _dense_refinement_enabled(bem_backend)
+
+const DENSE_REFINEMENT_MAX_ITERATIONS = 10
+
+"""
+    RefinedDenseLU(matrix)
+
+Single-precision LU of a double-precision dense system, solved by iterative refinement:
+`x ← x + F32⁻¹ (b - A x)` with the residual in `ComplexF64`. Each step contracts the error by
+about `κ(A) eps(Float32)`; the Multi_region_SAWMOD systems (κ ≈ 5e6) converge in two steps.
+The stopping test is LAPACK `zcgesv`'s backward error, `‖r‖∞ ≤ ‖x‖∞ ‖A‖∞ eps(Float64) √n` per
+column (`‖A‖∞` the operator norm, `opnorm`), which is what a `ComplexF64` LU attains, whatever `κ`.
+Convergence is tested before the stall rule, so a solve already at that level is accepted.
+
+The `ComplexF64` LU is used instead, with the reason in `fallback_reason`, when
+- an entry is outside the `Float32` range (narrowing would overflow),
+- the `Float32` factorization is singular or not finite, or
+- a solve stalls (the backward-error ratio fails to halve), produces a non-finite residual, or has
+  not converged after `DENSE_REFINEMENT_MAX_ITERATIONS` steps.
+The fallback factor is built once and serves every later solve. A matrix that is singular in
+`Float64` too throws `SingularException`; non-finite matrices or right-hand sides throw
+`ArgumentError`.
+
+`matrix` is kept, not copied: the caller hands over ownership and must not modify it while the
+factorization is in use (the coupled builder allocates it per system and never writes it again).
+`iterations` is the most refinement steps any solve needed; `backward_error` is the worst accepted
+column's ratio to the Float64 attainable backward error in the last solve (≤ 1 unless it came
+from the fallback, whose ratio is recorded as computed).
+"""
+mutable struct RefinedDenseLU
+    matrix::Matrix{ComplexF64}
+    matrix_norm::Float64
+    factor::Union{Nothing,LinearAlgebra.LU{ComplexF32,Matrix{ComplexF32},Vector{LinearAlgebra.BlasInt}}}
+    fallback::Union{Nothing,LinearAlgebra.LU{ComplexF64,Matrix{ComplexF64},Vector{LinearAlgebra.BlasInt}}}
+    iterations::Int
+    fallback_reason::Union{Nothing,String}
+    backward_error::Float64
+end
+
+function RefinedDenseLU(matrix::Matrix{ComplexF64})
+    all(isfinite, matrix) || throw(ArgumentError("dense coupled matrix has non-finite entries"))
+    refined = RefinedDenseLU(matrix, opnorm(matrix, Inf), nothing, nothing, 0, nothing, NaN)
+    if maximum(abs, matrix; init=0.0) > floatmax(Float32)
+        _dense_fall_back!(refined, "an entry is outside the Float32 range")
+    else
+        candidate = lu!(ComplexF32.(matrix); check=false)
+        if issuccess(candidate) && all(isfinite, candidate.factors)
+            refined.factor = candidate
+        else
+            _dense_fall_back!(refined, "the Float32 factorization is singular or not finite")
+        end
+    end
+    return refined
+end
+
+function _dense_fall_back!(factorization::RefinedDenseLU, reason::AbstractString)
+    factorization.fallback_reason = "Float32 LU with refinement fell back to a Float64 LU: " * reason
+    @warn factorization.fallback_reason
+    factorization.factor = nothing
+    factorization.fallback = lu(factorization.matrix)
+    return factorization
+end
+
+Base.size(factorization::RefinedDenseLU, dims...) = size(factorization.matrix, dims...)
+
+# Worst column's backward error, in units of the double-precision attainable one.
+function _dense_backward_error_ratio(factorization::RefinedDenseLU, residual, solution)
+    threshold = factorization.matrix_norm * eps(Float64) * sqrt(size(factorization.matrix, 1))
+    return maximum(
+        column -> norm(view(residual, :, column), Inf) /
+                  max(norm(view(solution, :, column), Inf) * threshold, floatmin(Float64)),
+        axes(solution, 2);
+        init=0.0,
+    )
+end
+
+function _dense_residual!(residual, factorization::RefinedDenseLU, target, solution)
+    copyto!(residual, target)
+    mul!(residual, factorization.matrix, solution, -one(ComplexF64), one(ComplexF64))
+    return residual
+end
+
+function Base.:\(factorization::RefinedDenseLU, rhs::AbstractVecOrMat)
+    all(isfinite, rhs) || throw(ArgumentError("dense coupled right-hand side has non-finite entries"))
+    target = ComplexF64.(rhs)
+    residual = similar(target)
+    if isnothing(factorization.fallback)
+        solution = ComplexF64.(factorization.factor \ ComplexF32.(target))
+        previous = Inf
+        reason = nothing
+        for iteration in 0:DENSE_REFINEMENT_MAX_ITERATIONS
+            ratio = _dense_backward_error_ratio(factorization, _dense_residual!(residual, factorization, target, solution), solution)
+            if !isfinite(ratio)
+                reason = "non-finite residual after $iteration refinement steps"
+                break
+            end
+            if ratio <= 1
+                factorization.backward_error = ratio
+                return solution
+            end
+            iteration == DENSE_REFINEMENT_MAX_ITERATIONS && break
+            if ratio > previous / 2
+                reason = "refinement stalled at $(ratio)x the Float64 backward error after $iteration steps"
+                break
+            end
+            previous = ratio
+            solution .+= ComplexF64.(factorization.factor \ ComplexF32.(residual))
+            factorization.iterations = max(factorization.iterations, iteration + 1)
+        end
+        isnothing(reason) &&
+            (reason = "refinement did not reach the Float64 backward error in $(DENSE_REFINEMENT_MAX_ITERATIONS) steps")
+        _dense_fall_back!(factorization, reason)
+    end
+    solution = factorization.fallback \ target
+    factorization.backward_error =
+        _dense_backward_error_ratio(factorization, _dense_residual!(residual, factorization, target, solution), solution)
+    return solution
+end
+
+"""
+    dense_solver_diagnostics(system) -> Dict{String,Any}
+
+The dense coupled factorization that ran: `dense_solver` (`lu_float32`, `lu_float64`,
+`lu_float32_refined`, or `lu_float64_fallback` after a refinement fallback),
+`dense_refinement_iterations`, `dense_refinement_fallback_reason` and `dense_refinement_backward_error`
+(the last solve's worst column, in units of the Float64 attainable backward error).
+"""
+function dense_solver_diagnostics(system)
+    factorization = hasproperty(system, :factorization) ? system.factorization : nothing
+    if factorization isa RefinedDenseLU
+        return Dict{String,Any}(
+            "dense_solver" => isnothing(factorization.fallback) ? "lu_float32_refined" : "lu_float64_fallback",
+            "dense_refinement_iterations" => factorization.iterations,
+            "dense_refinement_fallback_reason" => factorization.fallback_reason,
+            "dense_refinement_backward_error" => isnan(factorization.backward_error) ? nothing : factorization.backward_error,
+        )
+    end
+    kind = factorization isa LinearAlgebra.LU ? "lu_" * lowercase(string(real(eltype(factorization)))) : nothing
+    return Dict{String,Any}(
+        "dense_solver" => kind,
+        "dense_refinement_iterations" => 0,
+        "dense_refinement_fallback_reason" => nothing,
+        "dense_refinement_backward_error" => nothing,
+    )
+end
+
+"""
+`BLAB_COUPLED_FEM_FLOAT64=1`: under `precision=float32`, assemble the FEM stiffness, mass and
+bulk-loss matrices in `Float64` (once per mesh) and hand the condensation a `ComplexF64` dynamic
+stiffness. No effect under `precision=float64`.
+
+`A_II = K - k² M` has a near-constant pressure mode whose eigenvalue scales like `k²`: the air
+spring of an enclosed volume. `K` annihilates constants only up to its round-off, and a `Float32`
+`K` leaves row sums near `eps(Float32) ‖K‖`, which that mode amplifies by `~1/(k h)²`. On
+Multi_region_SAWMOD at 20 Hz this puts a 5e-5 relative error in the transducer mechanical block
+and 1.2e-4 in every output, while the `A_II` factorization is already `Float64`. The matrices are
+sparse and cached, so the double-precision assembly costs little.
+"""
+_fem_float64_enabled(bem_backend::Symbol=:cpu) = _coupled_switch("BLAB_COUPLED_FEM_FLOAT64", bem_backend)
+
+"""
+    _fem_system_float64(store, fem_mesh, prepared, frequency_hz, sound_speed, density)
+
+The `ComplexF64` FEM dynamic stiffness for `BLAB_COUPLED_FEM_FLOAT64`: the same terms as the
+`Complex{T}` one in `build_condensed_coupled_system`, from `Float64` matrices assembled on a
+widened copy of `fem_mesh`.
+
+- **Geometry:** Float64 arithmetic on the mesh's own (possibly Float32-rounded) coordinates, not
+  higher-precision geometry. What matters for the constant mode is that `K` is assembled
+  consistently in Float64, so its row sums vanish to Float64 round-off on that geometry.
+- **Elements:** P1, exactly as `prepare_coupled_cache` assembles the cached system; the Float64
+  stiffness and mass must have the cached stiffness's sparsity pattern, or this refuses.
+- **Walls:** wall-impedance boundary masses are widened, not reassembled: they are positive
+  boundary terms with no cancellation to protect.
+- **Cache:** `store` (the cache's) keeps the matrices across frequencies, keyed by value on what
+  they depend on (vertex coordinates, tetrahedra, per-vertex bulk-loss factors, wall matrices), so
+  a mesh or loss change made in place is picked up.
+"""
+function _fem_system_float64(store, fem_mesh::VolumeMesh, prepared, frequency_hz, sound_speed, density)
+    walls = [operator.matrix for operator in prepared.wall_impedance_operators]
+    cached = !isnothing(store) && haskey(store, :matrices) &&
+             store[:vertices] == fem_mesh.vertices && store[:tetrahedra] == fem_mesh.tetrahedra &&
+             store[:bulk_loss] == prepared.bulk_loss_factor_by_vertex && store[:walls] == walls
+    matrices = cached ? store[:matrices] : nothing
+    if isnothing(matrices)
+        mesh = VolumeMesh{Float64}(
+            SVector{3,Float64}.(fem_mesh.vertices),
+            fem_mesh.tetrahedra,
+            fem_mesh.tetra_physical_tags,
+            fem_mesh.boundary_faces,
+            fem_mesh.boundary_physical_tags,
+            fem_mesh.physical_names,
+            fem_mesh.quadratic_tetrahedra,
+            fem_mesh.quadratic_boundary_faces,
+        )
+        stiffness, mass = assemble_p1_fem_matrices(mesh)
+        size(stiffness) == size(prepared.stiffness) &&
+            stiffness.colptr == prepared.stiffness.colptr && stiffness.rowval == prepared.stiffness.rowval &&
+            mass.colptr == prepared.stiffness.colptr && mass.rowval == prepared.stiffness.rowval ||
+            error("Double-precision FEM matrices do not have the cached (P1) FEM system's structure.")
+        matrices = (
+            stiffness=stiffness,
+            mass=mass,
+            bulk_loss_mass=spdiagm(0 => Float64.(prepared.bulk_loss_factor_by_vertex)) * mass,
+            walls=[SparseMatrixCSC{Float64,Int}(operator.matrix) for operator in prepared.wall_impedance_operators],
+        )
+        if !isnothing(store)
+            store[:vertices] = copy(fem_mesh.vertices)
+            store[:tetrahedra] = copy(fem_mesh.tetrahedra)
+            store[:bulk_loss] = copy(prepared.bulk_loss_factor_by_vertex)
+            store[:walls] = [copy(matrix) for matrix in walls]
+            store[:matrices] = matrices
+        end
+    end
+    omega = 2pi * Float64(frequency_hz)
+    system = assemble_fem_dynamic_stiffness(
+        matrices.stiffness,
+        matrices.mass,
+        omega / Float64(sound_speed);
+        bulk_loss_mass=matrices.bulk_loss_mass,
+    )
+    for (operator, matrix) in zip(prepared.wall_impedance_operators, matrices.walls)
+        admittance = miki_rigid_backed_surface_admittance(
+            Float64(frequency_hz),
+            Float64(sound_speed),
+            Float64(density),
+            Float64(operator.thickness_m),
+            Float64(operator.flow_resistivity_pa_s_per_m2),
+        )
+        system -= neumann_scale(Float64(density), omega) * admittance .* matrix
+    end
+    return system
+end
+
+"""
     _build_condensation(fem_system, interface_operators, retained_vertices)
 
 Factor the FEM interior with UMFPACK and form the dense Schur complement.
@@ -128,10 +405,11 @@ interface: a 500-node interface under a 256-column block yields two blocks, and 
 threads idle through the phase that dominates condensation.
 """
 function _build_condensation(
-    fem_system::SparseMatrixCSC{Complex{T}},
+    fem_system::SparseMatrixCSC{<:Complex},
     interface_operators::InterfaceOperators{T},
     retained_vertices;
     schur_block_columns::Int=32,
+    schur_float64::Bool=false,
 ) where {T<:AbstractFloat}
     schur_block_columns > 0 || error("Schur block column count must be positive.")
     interior_vertices, retained = _interior_partition(
@@ -164,7 +442,8 @@ function _build_condensation(
         retained_system;
         block_size=schur_block_columns,
     )
-    schur = Complex{T}.(schur_result.schur)
+    # Kept double precision for a double-precision dense system; demoted otherwise.
+    schur = schur_float64 ? schur_result.schur : Complex{T}.(schur_result.schur)
     schur_extraction_s = (time_ns() - schur_started) / 1.0e9
 
     return (
@@ -204,10 +483,15 @@ end
 Reduce a FEM right-hand side onto `Γ`: `g_Γ = f_Γ - A_ΓI * A_II⁻¹ * f_I`. `f_I` is returned
 because the backward substitution needs it and nothing else retains it.
 """
-function _forward_schur(condensation, fem_rhs::AbstractMatrix{Complex{T}}) where {T<:AbstractFloat}
+function _forward_schur(
+    condensation,
+    fem_rhs::AbstractMatrix{Complex{T}};
+    result_type::Type{<:AbstractFloat}=T,
+) where {T<:AbstractFloat}
+    R = Complex{result_type}
     interior_rhs = ComplexF64.(fem_rhs[condensation.interior_vertices, :])
     retained_rhs = ComplexF64.(fem_rhs[condensation.retained_vertices, :])
-    condensation.interior_count == 0 && return Complex{T}.(retained_rhs), interior_rhs
+    condensation.interior_count == 0 && return R.(retained_rhs), interior_rhs
     mul!(
         retained_rhs,
         condensation.retained_interior,
@@ -215,7 +499,7 @@ function _forward_schur(condensation, fem_rhs::AbstractMatrix{Complex{T}}) where
         -one(ComplexF64),
         one(ComplexF64),
     )
-    return Complex{T}.(retained_rhs), interior_rhs
+    return R.(retained_rhs), interior_rhs
 end
 
 """
@@ -504,6 +788,8 @@ function prepare_condensed_coupled_cache(
         base_quadrature_order=quadrature_order,
         singular_order=singular_order,
         timings=timings,
+        # Double-precision FEM matrices for BLAB_COUPLED_FEM_FLOAT64.
+        fem_float64_store=Dict{Symbol,Any}(),
     )
 end
 
@@ -518,6 +804,7 @@ function release_condensed_coupled_cache!(cache)
             release_metal_field_evaluation_cache!(bundle.field_cache)
         end
     end
+    hasproperty(cache, :fem_float64_store) && empty!(cache.fem_float64_store)
     release_coupled_cache!(cache.base)
     return nothing
 end
@@ -682,6 +969,17 @@ function build_condensed_coupled_system(
         error("Prescribed BEM normal velocity must contain one row per BEM face.")
     bem_prescribed_neumann = normal_derivative_scale .* Complex{T}.(resolved_prescribed_bem_velocity)
     prescribed_bem_count = size(bem_prescribed_neumann, 2)
+    # Precision switches resolve against the cache's backend (unset: on for Metal, off elsewhere).
+    bem_backend = prepared.bem_backend
+    if T !== Float64 && _fem_float64_enabled(bem_backend)
+        fem_system = _fem_system_float64(
+            condensed_cache.fem_float64_store, fem_mesh, prepared, frequency_hz, sound_speed, density,
+        )
+    end
+    # Scalar type of the dense coupled system. Under double assembly the Schur block and the condensed
+    # right-hand side stay Float64 up to the dense matrix; inputs that are single precision to begin
+    # with (BEM operators, traces, transducer parameters) are unchanged.
+    dense_type = _dense_double_assembly(bem_backend) ? Float64 : T
     fem_system_s = (time_ns() - fem_stage_started) / 1.0e9
 
     # Everything the condensation reads is final here and nothing below writes
@@ -696,6 +994,7 @@ function build_condensed_coupled_system(
         interface_operators,
         retained_fem_vertices;
         schur_block_columns=schur_block_columns,
+        schur_float64=dense_type === Float64,
     )) : nothing
 
     bem_operator_started = time_ns()
@@ -764,6 +1063,7 @@ function build_condensed_coupled_system(
             interface_operators,
             retained_fem_vertices;
             schur_block_columns=schur_block_columns,
+            schur_float64=dense_type === Float64,
         )
     else
         # `fetch` wraps a task failure in a TaskFailedException, which would
@@ -807,7 +1107,7 @@ function build_condensed_coupled_system(
     ]
     force_factor = T[transducer.bl_n_per_a for transducer in transducers]
 
-    coupled = zeros(Complex{T}, system_count, system_count)
+    coupled = zeros(Complex{dense_type}, system_count, system_count)
     # The Schur complement takes the slot the full FEM block occupies in the monolithic
     # formulation, and the interface coupling is restricted to Γ.
     coupled[gamma_range, gamma_range] = condensation.schur
@@ -841,7 +1141,8 @@ function build_condensed_coupled_system(
     block_assembly_s = (time_ns() - block_assembly_started) / 1.0e9
 
     coupled_factorization_started = time_ns()
-    factorization = lu!(coupled)
+    factorization = dense_type === Float64 && T !== Float64 && _dense_refinement_enabled(bem_backend) ?
+                    RefinedDenseLU(coupled) : lu!(coupled)
     coupled_factorization_s = (time_ns() - coupled_factorization_started) / 1.0e9
 
     return (
@@ -860,6 +1161,9 @@ function build_condensed_coupled_system(
         field_cache=prepared.field_cache,
         coupled=nothing,
         factorization=factorization,
+        dense_scalar_type=dense_type,
+        # Element type of the FEM dynamic stiffness the condensation read (BLAB_COUPLED_FEM_FLOAT64).
+        fem_scalar_type=real(eltype(fem_system)),
         formulation=:fem_interface_condensed,
         # The order the assembly actually used, so diagnostics report what ran, not what was asked.
         regular_quadrature_order=selected_quadrature_order,
@@ -1026,12 +1330,13 @@ function solve_condensed_coupled_excitations(system, excitations)
         end
     end
 
-    rhs = zeros(Complex{T}, size(system.factorization, 1), excitation_count)
+    rhs = zeros(Complex{system.dense_scalar_type}, size(system.factorization, 1), excitation_count)
     rhs[system.bem_range, :] = bem_rhs
     rhs[system.electrical_range, :] = electrical_rhs
-    reduced_rhs, interior_rhs = _forward_schur(system.condensation, fem_rhs)
+    reduced_rhs, interior_rhs = _forward_schur(system.condensation, fem_rhs; result_type=system.dense_scalar_type)
     rhs[system.gamma_range, :] = reduced_rhs
-    solution = system.factorization \ rhs
+    # Results keep the request's precision whatever precision the dense solve used.
+    solution = Complex{T}.(system.factorization \ rhs)
     fem_pressure, fem_interior_residual = _backward_schur(
         system.condensation,
         interior_rhs,
