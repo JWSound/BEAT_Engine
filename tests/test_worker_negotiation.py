@@ -187,3 +187,10 @@ def test_interface_velocity_requires_advertised_output(ready, payload):
     ready.pop("optional_output_quantities")
     with pytest.raises(WorkerCompatibilityError, match="interface-average velocity"):
         negotiate_submission(ready, payload, "solve")
+
+
+def test_reclamation_requires_advertisement_but_no_result_contract(ready):
+    with pytest.raises(WorkerCompatibilityError, match="unavailable"):
+        negotiate_submission(ready, {}, "reclaim")
+    ready["operations"].append("reclaim")
+    assert negotiate_submission(ready, {}, "reclaim") == {"protocol_version": 1}

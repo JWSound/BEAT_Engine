@@ -9,15 +9,137 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
+import math
 import os
 import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
+from functools import wraps
 from pathlib import Path
 
+LOGGER = logging.getLogger(__name__)
 
-class WorkerProcess:
+
+def reserve_idle_during_call(method):
+    @wraps(method)
+    def reserved(self, *args, **kwargs):
+        release = self.hold_idle_cleanup()
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            release()
+
+    return reserved
+
+
+class IdleCleanupMixin:
+    def _init_idle_cleanup(self):
+        self._idle_cleanup_ms = None
+        self._idle_timer = None
+        self._idle_generation = 0
+        self._idle_holds = 0
+        self._idle_dirty = False
+        self.last_worker_cleanup = None
+
+    def configure_idle_cleanup(self, idle_ms=5000):
+        """Enable background reclamation after this idle interval, or disable with None."""
+        if idle_ms is not None and (isinstance(idle_ms, bool) or not math.isfinite(idle_ms) or idle_ms <= 0):
+            raise ValueError("idle_ms must be finite and positive, or None.")
+        with self._available:
+            self._cancel_idle_locked()
+            self._idle_cleanup_ms = idle_ms
+            self._arm_idle_locked()
+
+    def hold_idle_cleanup(self):
+        """Reserve upcoming work without blocking; return an idempotent release callback."""
+        with self._available:
+            self._idle_holds += 1
+            self._cancel_idle_locked()
+        released = False
+
+        def release():
+            nonlocal released
+            with self._available:
+                if not released:
+                    released = True
+                    self._idle_holds -= 1
+                    self._arm_idle_locked()
+
+        return release
+
+    def _cancel_idle_locked(self):
+        self._idle_generation += 1
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+
+    def _observe_cleanup_locked(self, event, token):
+        if token.operation == "reclaim" and event.get("type") == "failed":
+            token.discard_on_close = True
+        cleanup = event.get("worker_cleanup")
+        if isinstance(cleanup, dict):
+            self.last_worker_cleanup = copy.deepcopy(cleanup)
+            self._idle_dirty = cleanup.get("reason") == "reuse"
+            LOGGER.info("BEAT worker cleanup: %s", cleanup)
+        elif event.get("type") in {"failed", "cancelled"} or (
+            event.get("type") == "completed" and token.operation == "solve"
+        ):
+            self._idle_dirty = False
+
+    def _arm_idle_locked(self):
+        if (
+            self._idle_cleanup_ms is None
+            or not self._idle_dirty
+            or self._idle_holds
+            or self._active_submission is not None
+            or self._starting is not None
+            or self._terminating
+            or self._process is None
+            or self._idle_timer is not None
+            or "reclaim" not in (self._worker_info or {}).get("operations", [])
+        ):
+            return
+        generation = self._idle_generation
+        timer = threading.Timer(self._idle_cleanup_ms / 1000, self._run_idle_cleanup, args=(generation,))
+        timer.daemon = True
+        self._idle_timer = timer
+        timer.start()
+
+    def _run_idle_cleanup(self, generation):
+        with self._available:
+            if generation != self._idle_generation:
+                return
+            self._idle_timer = None
+            if (
+                self._idle_holds
+                or not self._idle_dirty
+                or self._active_submission is not None
+                or self._starting is not None
+                or self._terminating
+                or self._process is None
+            ):
+                return
+            process = self._process
+            token = _SubmissionToken("reclaim")
+            self._active_submission = token
+            self._status_callback = None
+        try:
+            # Ownership was claimed atomically. New submissions wait until the
+            # terminal event; no GC or allocator operation overlaps a solve.
+            process.stdin.write(json.dumps({"operation": "reclaim", "protocol_version": 1}) + "\n")
+            process.stdin.flush()
+            for event in _SubmissionEvents(self, process, token):
+                if event.get("type") == "failed":
+                    raise RuntimeError(str(event.get("error", "Idle reclamation failed")))
+        except Exception:
+            if not token.invalidated:
+                LOGGER.exception("BEAT idle reclamation failed; discarding this worker")
+            self._finish_submission(token, discard=True)
+
+
+class WorkerProcess(IdleCleanupMixin):
     def __init__(
         self,
         *,
@@ -51,6 +173,7 @@ class WorkerProcess:
         self._stderr_thread: threading.Thread | None = None
         self._status_callback: Callable[[str], None] | None = None
         self._worker_info: dict | None = None
+        self._init_idle_cleanup()
 
     @property
     def worker_info(self) -> dict | None:
@@ -60,20 +183,24 @@ class WorkerProcess:
     def _accept_ready(self, event: dict) -> None:
         self._worker_info = copy.deepcopy(event)
 
-    def _prepare_submission(self, request_path: Path, operation: str) -> dict:
+    def _prepare_submission(self, request_path: Path | Mapping, operation: str) -> dict:
+        if isinstance(request_path, Mapping):
+            return {"request_inline": dict(request_path), "operation": str(operation)}
         return {"request": str(request_path), "operation": str(operation)}
 
     def _accept_event(self, event: dict) -> None:
         """Optional protocol validation before exposing a submission event."""
 
+    @reserve_idle_during_call
     def submit(
         self,
-        request_path: Path,
+        request_path: Path | Mapping,
         *,
         status_callback: Callable[[str], None] | None = None,
         operation: str = "solve",
     ) -> Iterator[dict]:
         with self._available:
+            self._cancel_idle_locked()
             while self._active_submission is not None or self._starting is not None or self._terminating:
                 self._available.wait()
             startup = _StartupToken()
@@ -90,7 +217,7 @@ class WorkerProcess:
                 self._emit_status("Submitting solve request" if operation == "solve" else "Submitting field request")
                 process.stdin.write(json.dumps(command, separators=(",", ":")) + "\n")
                 process.stdin.flush()
-                token = _SubmissionToken()
+                token = _SubmissionToken(operation)
                 self._active_submission = token
                 return _SubmissionEvents(self, process, token)
         finally:
@@ -101,8 +228,10 @@ class WorkerProcess:
                         self._status_callback = None
                     self._available.notify_all()
 
+    @reserve_idle_during_call
     def ensure_started(self, *, status_callback: Callable[[str], None] | None = None) -> None:
         with self._available:
+            self._cancel_idle_locked()
             while self._active_submission is not None or self._starting is not None or self._terminating:
                 self._available.wait()
             startup = _StartupToken()
@@ -158,6 +287,8 @@ class WorkerProcess:
         process = self._process
         self._process = None
         self._worker_info = None
+        self._cancel_idle_locked()
+        self._idle_dirty = False
         return process
 
     @staticmethod
@@ -190,6 +321,7 @@ class WorkerProcess:
 
             self._stderr_lines.clear()
             self._worker_info = None
+            self._idle_dirty = False
             command = julia_worker_command(
                 self.julia_executable,
                 self.solver_script,
@@ -259,6 +391,8 @@ class WorkerProcess:
                 if token.invalidated:
                     raise RuntimeError("BEAT Engine worker was terminated during submission.")
                 self._accept_event(event)
+                with self._available:
+                    self._observe_cleanup_locked(event, token)
                 terminal = str(event.get("type", "")) in {"completed", "cancelled", "failed"}
                 yield event
                 if terminal:
@@ -275,11 +409,12 @@ class WorkerProcess:
                 return
             self._active_submission = None
             self._status_callback = None
-            process = self._detach_process() if discard else None
+            process = self._detach_process() if discard or token.discard_on_close else None
             # Keep a new submission from starting until the abandoned child has
             # actually stopped, including its stderr collection.
             self._stop_process(process)
             self._available.notify_all()
+            self._arm_idle_locked()
 
     def _read_events(self, process: subprocess.Popen[str] | None = None) -> Iterator[dict]:
         process = self._process if process is None else process
@@ -338,8 +473,10 @@ class WorkerProcess:
 
 
 class _SubmissionToken:
-    def __init__(self) -> None:
+    def __init__(self, operation="solve") -> None:
         self.invalidated = False
+        self.operation = operation
+        self.discard_on_close = False
 
 
 class _StartupToken:
@@ -491,7 +628,7 @@ def resolve_julia_threads(julia_threads: str | int = "auto") -> str:
 def julia_command(
     julia_executable: str,
     solver_script: Path,
-    request_path: Path,
+    request_path: Path | Mapping,
     *,
     julia_project: Path | None,
     julia_sysimage: Path | None = None,
@@ -530,6 +667,7 @@ class WorkerPool:
         self._factory = factory
         self._lock = threading.Lock()
         self._workers: dict[tuple, WorkerProcess] = {}
+        self._idle_reservations = []
 
     def get_worker(
         self,
@@ -570,7 +708,28 @@ class WorkerPool:
                     startup_timeout_s=startup_timeout_s,
                 )
                 self._workers[key] = worker
+                for reservation in self._idle_reservations:
+                    reservation.append(worker.hold_idle_cleanup())
             return worker
+
+    def hold_idle_cleanup(self):
+        """Prevent idle cleanup while a client prepares a future request."""
+        with self._lock:
+            callbacks = [worker.hold_idle_cleanup() for worker in self._workers.values()]
+            self._idle_reservations.append(callbacks)
+        released = False
+
+        def release():
+            nonlocal released
+            with self._lock:
+                if released:
+                    return
+                released = True
+                self._idle_reservations = [r for r in self._idle_reservations if r is not callbacks]
+                for callback in callbacks:
+                    callback()
+
+        return release
 
     def shutdown(self) -> None:
         with self._lock:

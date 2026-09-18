@@ -63,8 +63,12 @@ def negotiate_submission(info: dict, request: dict, operation: str) -> dict:
     _require(operation in info["operations"], f"operation {operation!r} is unavailable.")
     contracts = info["contracts"]
     command = {"protocol_version": WORKER_PROTOCOL_VERSION}
+    if operation == "reclaim":
+        return command
     if operation == "solve":
         validate_solve_request(request)
+        if any("mesh_data" in mesh for mesh in request["compiled_system"]["meshes"]):
+            _require(1 in contracts.get("mesh_data", []), "mesh_data version 1 is unavailable; update BEAT Engine.")
         for name, version in (
             ("system_request", SYSTEM_SOLVE_REQUEST_VERSION),
             ("compiled_system", COMPILED_SYSTEM_VERSION),

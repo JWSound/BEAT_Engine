@@ -496,10 +496,49 @@ function object_by_id(items, object_id, label)
     error("Unknown $label id: $object_id")
 end
 
+function boundary_mesh_from_data(raw, scale::T) where {T<:AbstractFloat}
+    data = BeatEngineContract.BeatEngineMeshData.decode_mesh_data(raw)
+    all(block.kind == "triangle" for block in data.cells) || error("BEM mesh_data requires triangle elements.")
+    vertices = [SVector{3,T}(row) * scale for row in eachrow(data.points)]
+    faces = NTuple{3,Int}[Tuple(row) for block in data.cells for row in eachrow(block.indices)]
+    tags = Int[tag for block in data.cells for tag in block.tags]
+    return BoundaryMesh(vertices, faces, tags)
+end
+
+function volume_mesh_from_data(raw, scale::T) where {T<:AbstractFloat}
+    data = BeatEngineContract.BeatEngineMeshData.decode_mesh_data(raw)
+    vertices = [SVector{3,T}(row) * scale for row in eachrow(data.points)]
+    tetrahedra, faces = NTuple{4,Int}[], NTuple{3,Int}[]
+    quadratic_tetrahedra, quadratic_faces = NTuple{10,Int}[], NTuple{6,Int}[]
+    tetra_tags, face_tags = Int[], Int[]
+    for block in data.cells
+        if startswith(block.kind, "tetra")
+            append!(tetrahedra, [Tuple(row[1:4]) for row in eachrow(block.indices)])
+            append!(tetra_tags, block.tags)
+            # Public buffers use meshio/VTK ordering; the FEM kernel uses Gmsh ordering.
+            block.kind == "tetra10" && append!(quadratic_tetrahedra,
+                [Tuple(row[[1,2,3,4,5,6,7,8,10,9]]) for row in eachrow(block.indices)])
+        else
+            append!(faces, [Tuple(row[1:3]) for row in eachrow(block.indices)])
+            append!(face_tags, block.tags)
+            block.kind == "triangle6" && append!(quadratic_faces, [Tuple(row) for row in eachrow(block.indices)])
+        end
+    end
+    !isempty(tetrahedra) && !isempty(faces) || error("FEM mesh_data requires tetrahedra and boundary triangles.")
+    isempty(quadratic_tetrahedra) == isempty(quadratic_faces) || error("FEM cell and boundary orders must agree.")
+    if !isempty(quadratic_tetrahedra)
+        length(quadratic_tetrahedra) == length(tetrahedra) && length(quadratic_faces) == length(faces) ||
+            error("Mixed P1/P2 cells are not supported.")
+    end
+    names = Dict{Tuple{Int,Int},String}((Int(value[2]), Int(value[1])) => String(name) for (name, value) in data.names)
+    return VolumeMesh{T}(vertices, tetrahedra, tetra_tags, faces, face_tags, names, quadratic_tetrahedra, quadratic_faces)
+end
+
 function translated_volume_mesh(resource, ::Type{T}) where {T<:AbstractFloat}
     scale = T(resource["scale_to_m"])
     translation = SVector{3,T}(T.(resource["translation_m"]))
-    mesh = load_gmsh41_volume(String(resource["file"]), scale)
+    mesh = haskey(resource, "mesh_data") ? volume_mesh_from_data(resource["mesh_data"], scale) :
+           load_gmsh41_volume(String(resource["file"]), scale)
     return VolumeMesh(
         [vertex + translation for vertex in mesh.vertices],
         mesh.tetrahedra,
@@ -515,7 +554,8 @@ end
 function translated_boundary_mesh(resource, ::Type{T}) where {T<:AbstractFloat}
     scale = T(resource["scale_to_m"])
     translation = SVector{3,T}(T.(resource["translation_m"]))
-    mesh = load_gmsh22_with_tags(String(resource["file"]), scale)
+    mesh = haskey(resource, "mesh_data") ? boundary_mesh_from_data(resource["mesh_data"], scale) :
+           load_gmsh22_with_tags(String(resource["file"]), scale)
     return BoundaryMesh([vertex + translation for vertex in mesh.vertices], mesh.faces, mesh.physical_tags)
 end
 
@@ -2356,8 +2396,8 @@ function solve_request_impl(request; event_mode=false)
     validate_system_request(request)
     BeatEngineContract.BeatEngineProvenance.engine_identity()
     BeatEngineContract.BeatEngineProvenance.runtime_identity()
-    RUN_MESH_PROVENANCE[] = [Dict("id" => mesh["id"], "file" => mesh["file"],
-        "sha256" => BeatEngineContract.BeatEngineProvenance.file_hash(mesh["file"])) for mesh in request["compiled_system"]["meshes"]]
+    RUN_MESH_PROVENANCE[] = [BeatEngineContract.BeatEngineMeshData.mesh_provenance(
+        mesh, BeatEngineContract.BeatEngineProvenance.file_hash) for mesh in request["compiled_system"]["meshes"]]
     cancel_path = get(request, "cancel_path", nothing)
     cancel_requested() = cancel_path !== nothing && isfile(String(cancel_path))
     cancel_requested() && return (cancelled=true, solved_count=0)
@@ -3705,6 +3745,7 @@ end
 function run_worker()
     ready = worker_ready(worker_backend_availability())
     ready["worker_cleanup_policies"] = ["aggressive", "cuda_reuse"]
+    push!(ready["operations"], "reclaim")
     println(JSON.json(ready))
     flush(stdout)
     requests_since_cleanup = 0
@@ -3713,8 +3754,18 @@ function run_worker()
         try
             submission = JSON.parse(line)
             validate_worker_submission(submission)
-            request_path = String(submission["request"])
-            request = JSON.parse(read(request_path, String))
+            if get(submission, "operation", "solve") == "reclaim"
+                cleanup_started = time_ns()
+                reclaim_accelerator_memory!()
+                requests_since_cleanup = 0
+                println(JSON.json(Dict("type" => "completed", "worker_cleanup" => Dict(
+                    "policy" => "cuda_reuse", "reason" => "idle", "requests_since_cleanup" => 0,
+                    "seconds" => (time_ns() - cleanup_started) / 1e9))))
+                flush(stdout)
+                continue
+            end
+            request_path = String(get(submission, "request", ""))
+            request = haskey(submission, "request_inline") ? submission["request_inline"] : JSON.parse(read(request_path, String))
             operation = String(get(submission, "operation", "solve"))
             options = operation == "solve" ? get(request, "solver_options", Dict()) : request
             get(options, "phasor_convention", NEGATIVE_TIME_PHASOR) ==

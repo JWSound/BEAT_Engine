@@ -106,7 +106,19 @@ def _references(values: list, available: dict, path: str) -> None:
             _fail(path, f"unknown reference {value!r}")
 
 
+@lru_cache(maxsize=1)
+def _mesh_validator():
+    # Keep the contract loadable directly from its distribution directory.
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("beat_mesh_contract", Path(__file__).with_name("mesh.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.validate_mesh_sources
+
+
 def _graph(system: dict) -> None:
+    _mesh_validator()(system)
     collections = {}
     for name in ("meshes", "regions", "boundaries", "interfaces", "components", "excitation_ports"):
         _unique([item["id"] for item in system[name]], f"compiled_system.{name}")
