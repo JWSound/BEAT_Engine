@@ -35,6 +35,8 @@ using ..BeatEngineCore
 using ..BeatEngineCoupled
 
 include(joinpath(@__DIR__, "BeatEngineCondensedAssembly.jl"))
+include(joinpath(@__DIR__, "BeatEngineMumps.jl"))
+using .BeatEngineMumps
 
 export assemble_condensed_regular_operators,
     wavelength_quadrature_order,
@@ -103,16 +105,17 @@ end
 """
     _coupled_mode(name, bem_backend=:cpu; metal_default=:auto) -> :off | :on | :auto
 
-Resolve a condensed-coupled precision/optimization switch.
+Resolve a condensed-coupled optimization switch.
 
 - **Unset:** `metal_default` on the Metal backend, `:off` everywhere else, so CPU requests keep
   the 0.1.4 behaviour unless a switch is set explicitly.
-- **`auto`:** use it where the model allows; otherwise the established path.
+- **`auto`:** use the optimization when the model's structure allows it; otherwise use the
+  established path and record why (`coupled_optimization_fallback_reasons`).
 - **`1`/`on`/`true`/`yes`:** require it and raise when the structure does not allow it.
 - **`0`/`off`/`false`/`no`:** don't use it.
 
-Anything else is an error rather than a silent default. The precision switches have no structural
-precondition, so for them `auto` and `on` behave the same.
+Anything else is an error rather than a silent default. For switches without a structural
+precondition `auto` and `on` behave the same.
 """
 function _coupled_mode(name::AbstractString, bem_backend::Symbol=:cpu; metal_default::Symbol=:auto)
     value = lowercase(strip(get(ENV, name, "")))
@@ -125,6 +128,31 @@ end
 
 _coupled_switch(name::AbstractString, bem_backend::Symbol=:cpu; metal_default::Symbol=:auto) =
     _coupled_mode(name, bem_backend; metal_default=metal_default) != :off
+
+"""
+    _coupled_choice(name, bem_backend, choices, cpu_default, metal_default) -> Symbol
+
+A named choice (`BLAB_COUPLED_FEM_SOLVER`, `BLAB_COUPLED_INTERFACE_MASS_SOLVER`): unset gives the
+backend's default, otherwise one of `choices`.
+"""
+function _coupled_choice(name::AbstractString, bem_backend::Symbol, choices, cpu_default::Symbol, metal_default::Symbol)
+    value = lowercase(strip(get(ENV, name, "")))
+    isempty(value) && return bem_backend == :metal ? metal_default : cpu_default
+    Symbol(value) in choices && return Symbol(value)
+    error("Unsupported $name value: $value. Expected $(join(string.(choices), " or ")).")
+end
+
+"""
+Eliminate transducer-surface FEM vertices together with the interior instead of retaining them.
+
+Each transducer couples to the FEM only through one load column (`fem_surface`, the prescribed
+normal-velocity flux of a rigid piston) and one force row (`fem_force`, the same nodal areas times
+the surface completion factor). Both are rank one per transducer, so eliminating those vertices
+turns them into `|transducers|` extra interior solves (plus as many transpose solves) instead of
+retained Schur columns. Exact up to round-off; see `_build_condensation`.
+"""
+_transducer_condensation_mode(bem_backend::Symbol=:cpu) = _coupled_mode("BLAB_COUPLED_TRANSDUCER_CONDENSATION", bem_backend)
+_transducer_condensation_enabled(bem_backend::Symbol=:cpu) = _transducer_condensation_mode(bem_backend) != :off
 
 """
 `BLAB_COUPLED_DENSE_FLOAT64=1`: assemble and factor the dense coupled system in `ComplexF64`
@@ -378,6 +406,469 @@ function _fem_system_float64(store, fem_mesh::VolumeMesh, prepared, frequency_hz
 end
 
 """
+Eliminate the duplicated interface pressures from the dense coupled system.
+
+The continuity rows are `fem_trace * p_FEM - bem_trace * p_BEM = 0` with both traces unit
+selections (`assemble_interface_operators`), so once `Γ` is exactly the interface vertex set,
+`p_Γ = P p_B` with `P` an index map. Substituting it removes `|Γ|` unknowns and the `|Γ|`
+continuity rows. Exact; the dense order drops from `|Γ| + |B| + |I| + 2t` to `|B| + |I| + 2t`.
+"""
+_interface_pressure_elimination_mode(bem_backend::Symbol=:cpu) =
+    _coupled_mode("BLAB_COUPLED_INTERFACE_PRESSURE_ELIMINATION", bem_backend; metal_default=:off)
+_interface_pressure_elimination_enabled(bem_backend::Symbol=:cpu) = _interface_pressure_elimination_mode(bem_backend) != :off
+
+"""
+Additionally eliminate the interface fluxes (implies pressure elimination).
+
+After pressure elimination the condensed FEM rows read `S P p_B - M_Γ q + E y = g`, with `M_Γ`
+the interface boundary mass matrix restricted to `Γ` (geometry only, SPD for a nondegenerate
+conforming interface). Then `q = M_Γ⁻¹ (S P p_B + E y - g)`, and substituting it into the BEM rows
+leaves `[p_B, y]` only. `M_Γ` is factored once per geometry; `S` is never inverted.
+"""
+_interface_flux_elimination_mode(bem_backend::Symbol=:cpu) = _coupled_mode("BLAB_COUPLED_INTERFACE_FLUX_ELIMINATION", bem_backend)
+_interface_flux_elimination_enabled(bem_backend::Symbol=:cpu) = _interface_flux_elimination_mode(bem_backend) != :off
+
+"""
+`BLAB_COUPLED_FEM_SOLVER`: `umfpack` or `mumps`; unset is `mumps` on Metal (whose environment ships
+MUMPS_seq_jll) and `umfpack` elsewhere.
+
+`mumps` factors the whole FEM block once per frequency with sequential MUMPS in complex-symmetric
+LDLᵀ mode and takes the Schur complement on `Γ` from the partial factorization, instead of one
+UMFPACK solve per `Γ` column. The analysis is kept in the cache across frequencies. If the
+library cannot be loaded or a factorization fails, the condensation falls back to UMFPACK and
+says why in `fem_solver_fallback_reason`. See `BeatEngineMumps`.
+"""
+_fem_solver_selection(bem_backend::Symbol=:cpu) =
+    _coupled_choice("BLAB_COUPLED_FEM_SOLVER", bem_backend, (:umfpack, :mumps), :umfpack, :mumps)
+
+"""
+    _interface_elimination_request(bem_backend=:cpu) -> (mode, required)
+
+`mode` is `:flux`, `:pressure` or `:none`; `required` is whether the chosen switch was set to `on`
+(refuse unsupported structure) rather than `auto` (fall back to `:none`).
+"""
+function _interface_elimination_request(bem_backend::Symbol=:cpu)
+    flux = _interface_flux_elimination_mode(bem_backend)
+    flux != :off && return (:flux, flux == :on)
+    pressure = _interface_pressure_elimination_mode(bem_backend)
+    pressure != :off && return (:pressure, pressure == :on)
+    return (:none, false)
+end
+
+_interface_elimination_mode(bem_backend::Symbol=:cpu) = first(_interface_elimination_request(bem_backend))
+
+"""
+    _interface_elimination_map(interface_map, interface_operators, gamma_fem_vertices)
+
+Check the structural facts the interface elimination relies on and return, for every `Γ` column
+(sorted FEM vertex order), its interface degree of freedom and the BEM vertex it equals.
+"""
+function _interface_elimination_map(interface_map, interface_operators, gamma_fem_vertices)
+    fem_vertices = Int.(interface_map.fem_vertex_indices)
+    bem_vertices = Int.(interface_map.fem_to_bem_vertex_indices)
+    interface_count = length(fem_vertices)
+    # A FEM vertex shared by two interfaces would carry two continuity rows onto one pressure;
+    # removing both would drop the constraint between the two BEM copies.
+    allunique(fem_vertices) || error(
+        "Interface elimination requires each FEM interface vertex to belong to one interface.",
+    )
+    length(gamma_fem_vertices) == interface_count && sort(fem_vertices) == gamma_fem_vertices || error(
+        "Interface elimination requires the Schur set to be exactly the interface vertices; " *
+        "retained transducer surfaces widen it (set BLAB_COUPLED_TRANSDUCER_CONDENSATION=1).",
+    )
+    fem_count = size(interface_operators.fem_trace, 2)
+    bem_count = size(interface_operators.bem_trace, 2)
+    unit = ones(eltype(interface_operators.fem_trace), interface_count)
+    interface_operators.fem_trace == sparse(1:interface_count, fem_vertices, unit, interface_count, fem_count) &&
+        interface_operators.bem_trace == sparse(1:interface_count, bem_vertices, unit, interface_count, bem_count) ||
+        error("Interface elimination requires unit nodal-selection pressure traces.")
+    size(interface_operators.fem_load, 2) == interface_count ||
+        error("Interface elimination requires one flux column per interface vertex.")
+    dof_by_vertex = Dict(vertex => index for (index, vertex) in enumerate(fem_vertices))
+    gamma_dof = [dof_by_vertex[vertex] for vertex in gamma_fem_vertices]
+    return (gamma_dof=gamma_dof, bem_of_gamma=bem_vertices[gamma_dof])
+end
+
+"""
+    _interface_mass_factorization(store, interface_operators, gamma_fem_vertices)
+
+Sparse real LU of `M_Γ = fem_load[Γ, :]`, held in `store` across frequencies of one cached sweep.
+The load operator is frequency-independent and owned by the cache, so identity is the key.
+"""
+function _interface_mass_factorization(store, interface_operators, gamma_fem_vertices)
+    if !isnothing(store) &&
+       get(store, :fem_load, nothing) === interface_operators.fem_load &&
+       get(store, :gamma, nothing) == gamma_fem_vertices
+        return store[:factorization], true
+    end
+    mass = SparseMatrixCSC{Float64,Int}(interface_operators.fem_load[gamma_fem_vertices, :])
+    size(mass, 1) == size(mass, 2) || error("Interface mass matrix must be square.")
+    factorization = lu(mass)
+    if !isnothing(store)
+        store[:fem_load] = interface_operators.fem_load
+        store[:gamma] = copy(gamma_fem_vertices)
+        store[:factorization] = factorization
+    end
+    return factorization, false
+end
+
+"""
+`BLAB_COUPLED_INTERFACE_MASS_SOLVER`: `lu` or `cholmod`; unset is `cholmod` on Metal, `lu` elsewhere.
+
+Only read under `BLAB_COUPLED_INTERFACE_FLUX_ELIMINATION`. `M_Γ` is the real P1 boundary mass
+matrix of the interface: symmetric positive definite and frequency independent. `cholmod` factors
+it once per geometry with sparse Cholesky and applies it to a complex right-hand side as one real
+panel `[Re R, Im R]` instead of the UMFPACK per-column complex solves. The factor is checked
+against a random panel when built and replaced by the LU factor, with the reason recorded, if
+Cholesky fails or the check does not reach `1e-10`.
+"""
+_interface_mass_solver_selection(bem_backend::Symbol=:cpu) =
+    _coupled_choice("BLAB_COUPLED_INTERFACE_MASS_SOLVER", bem_backend, (:lu, :cholmod), :lu, :cholmod)
+
+"""
+`BLAB_COUPLED_INTERFACE_MASS_OVERLAP=1`: form `W = M_Γ⁻¹ S` and `V = M_Γ⁻¹ E` in the FEM
+condensation stage instead of after it. They depend only on the condensation and the interface
+geometry, so on Metal they run while the BEM operators assemble; only the products with the
+BEM coupling block wait for the BEM stage.
+"""
+_interface_mass_overlap_enabled(bem_backend::Symbol=:cpu) = _coupled_switch("BLAB_COUPLED_INTERFACE_MASS_OVERLAP", bem_backend)
+
+"""
+`BLAB_COUPLED_INTERFACE_BLOCKS=1`: keep the block structure of independent FEM components
+through the flux elimination.
+
+Vertices in different connected components of the FEM matrix graph share no entry of `A_II`,
+`A_IΓ` or `A_ΓΓ`, so `S` has no entry between their `Γ` vertices, and the interface mass matrix
+(a boundary mass over faces of one region) has none either. `W = M_Γ⁻¹ S` is then block diagonal
+and `B_q W` is a sum of per-component products `B_q[:, Γ_k] W_k`, costing `Σ n_k²` instead of
+`n²` columns-by-rows. Transducer columns `E` are not split. The mass matrix is checked
+structurally when the operator is built and `S` at every frequency. A mass matrix coupling two
+components is an error under `on` and falls back to one block under `auto`; `S` coupling two
+components of the FEM graph cannot happen and is always an error.
+"""
+_interface_blocks_mode(bem_backend::Symbol=:cpu) = _coupled_mode("BLAB_COUPLED_INTERFACE_BLOCKS", bem_backend)
+_interface_blocks_enabled(bem_backend::Symbol=:cpu) = _interface_blocks_mode(bem_backend) != :off
+
+"""
+`BLAB_COUPLED_DEMAND_RECONSTRUCTION=1`: skip the FEM interior back substitution when no requested
+output needs interior pressure. The caller decides (`reconstruct_interior` in
+`solve_condensed_coupled_excitations`); skipped interior pressures are `NaN` and the interior
+residual is reported as not evaluated.
+"""
+_demand_reconstruction_enabled(bem_backend::Symbol=:cpu) = _coupled_switch("BLAB_COUPLED_DEMAND_RECONSTRUCTION", bem_backend)
+
+_interface_mass_specialized(bem_backend::Symbol=:cpu) =
+    _interface_mass_solver_selection(bem_backend) != :lu || _interface_mass_overlap_enabled(bem_backend) ||
+    _interface_blocks_enabled(bem_backend)
+
+"""
+    _fem_component_labels(fem_system) -> Vector{Int}
+
+Connected-component label (1-based, in order of first vertex) of every FEM vertex in the graph
+of the stored entries of `fem_system`, treating each entry as an undirected edge.
+"""
+function _fem_component_labels(fem_system::SparseMatrixCSC)
+    count = size(fem_system, 1)
+    size(fem_system, 2) == count || error("FEM system must be square.")
+    parent = collect(1:count)
+    find(v) = begin
+        while parent[v] != v
+            parent[v] = parent[parent[v]]
+            v = parent[v]
+        end
+        v
+    end
+    rows = rowvals(fem_system)
+    for column in 1:count, entry in nzrange(fem_system, column)
+        a = find(rows[entry]); b = find(column)
+        a == b || (parent[max(a, b)] = min(a, b))
+    end
+    labels = zeros(Int, count)
+    next = 0
+    for vertex in 1:count
+        root = find(vertex)
+        labels[root] == 0 && (labels[root] = (next += 1))
+        labels[vertex] = labels[root]
+    end
+    return labels
+end
+
+"""
+    _interface_mass_operator(store, interface_operators, gamma_fem_vertices, gamma_dof, gamma_labels, solver)
+        -> (operator, cached)
+
+Per-block factors of `M_Γ` for the specialized flux elimination. `gamma_labels` assigns each `Γ`
+column (sorted FEM vertex order) to a block; `nothing` is one block. Block `k` holds
+`rows` (its `Γ` indices ordered by interface dof) and `dofs = gamma_dof[rows]` (ascending), so
+`M_Γ[rows, dofs]` is the symmetric block `M_kk` and `M_Γ X = R` splits into
+`X[dofs, :] = M_kk⁻¹ R[rows, :]`. Held in `store` across frequencies; the key is the load
+operator's identity, `Γ`, the labels and the solver.
+"""
+function _interface_mass_operator(store, interface_operators, gamma_fem_vertices, gamma_dof, gamma_labels, solver::Symbol)
+    labels = isnothing(gamma_labels) ? ones(Int, length(gamma_fem_vertices)) : gamma_labels
+    if !isnothing(store) &&
+       get(store, :operator_fem_load, nothing) === interface_operators.fem_load &&
+       get(store, :operator_gamma, nothing) == gamma_fem_vertices &&
+       get(store, :operator_labels, nothing) == labels &&
+       get(store, :operator_solver, nothing) == solver
+        return store[:operator], true
+    end
+    mass = SparseMatrixCSC{Float64,Int}(interface_operators.fem_load[gamma_fem_vertices, :])
+    count = length(gamma_fem_vertices)
+    size(mass) == (count, count) || error("Interface mass matrix must be square.")
+    length(gamma_dof) == count && sort(gamma_dof) == 1:count ||
+        error("Interface dof map must be a permutation of the interface dofs.")
+    block_rows = Vector{Int}[]
+    for label in sort(unique(labels))
+        members = findall(==(label), labels)
+        push!(block_rows, members[sortperm(gamma_dof[members])])
+    end
+    block_of_row = zeros(Int, count)
+    block_of_dof = zeros(Int, count)
+    for (block, rows) in enumerate(block_rows)
+        block_of_row[rows] .= block
+        block_of_dof[gamma_dof[rows]] .= block
+    end
+    # Values, not the stored pattern: an explicitly stored zero couples nothing.
+    mass_rows, mass_columns, mass_values = findnz(mass)
+    all(iszero(value) || block_of_row[row] == block_of_dof[column]
+        for (row, column, value) in zip(mass_rows, mass_columns, mass_values)) ||
+        error("Interface mass matrix couples interface vertices of different FEM components.")
+    blocks = map(block_rows) do rows
+        dofs = gamma_dof[rows]
+        block_mass = mass[rows, dofs]
+        issymmetric(block_mass) || error("Interface mass block is not symmetric.")
+        kind, factor, reason = solver, nothing, nothing
+        if solver == :cholmod
+            try
+                factor = cholesky(Symmetric(block_mass))
+                # Deterministic and generic enough for a residual check.
+                probe = [sin(0.7 * row + 1.3 * column * row + column) for row in 1:length(rows), column in 1:2]
+                check = norm(block_mass * (factor \ probe) - probe) / norm(probe)
+                check < 1e-10 || error("residual check $(check)")
+            catch exception
+                exception isa InterruptException && rethrow()
+                kind, factor = :lu, nothing
+                reason = "CHOLMOD interface mass factor rejected: " * sprint(showerror, exception)
+            end
+        end
+        isnothing(factor) && (factor = lu(block_mass))
+        (
+            rows=rows,
+            dofs=dofs,
+            contiguous=dofs == first(dofs):last(dofs),
+            kind=kind,
+            factor=factor,
+            fallback_reason=reason,
+        )
+    end
+    operator = (count=count, blocks=blocks, solver=solver)
+    if !isnothing(store)
+        store[:operator_fem_load] = interface_operators.fem_load
+        store[:operator_gamma] = copy(gamma_fem_vertices)
+        store[:operator_labels] = copy(labels)
+        store[:operator_solver] = solver
+        store[:operator] = operator
+    end
+    return operator, false
+end
+
+"""
+    _interface_mass_operator_or_single_block(store, operators, gamma, gamma_dof, labels, solver, blocks_mode, fallbacks)
+
+`_interface_mass_operator` with the `BLAB_COUPLED_INTERFACE_BLOCKS` policy: under `auto`, a mass
+matrix that couples two components is built as one block and the reason is pushed to `fallbacks`;
+under `on` the refusal propagates.
+"""
+function _interface_mass_operator_or_single_block(
+    store, interface_operators, gamma_fem_vertices, gamma_dof, gamma_labels, solver::Symbol, blocks_mode::Symbol,
+    fallbacks::Vector{String},
+)
+    try
+        return _interface_mass_operator(store, interface_operators, gamma_fem_vertices, gamma_dof, gamma_labels, solver)
+    catch exception
+        (exception isa ErrorException && blocks_mode == :auto && !isnothing(gamma_labels)) || rethrow()
+        push!(fallbacks, "interface blocks not used: " * exception.msg)
+        return _interface_mass_operator(store, interface_operators, gamma_fem_vertices, gamma_dof, nothing, solver)
+    end
+end
+
+"""
+    _mass_block_solve(block, rhs) -> Matrix{ComplexF64}
+
+`M_kk⁻¹ rhs` for a complex right-hand side. The Cholesky path solves the real and imaginary parts
+as one real panel.
+"""
+function _mass_block_solve(block, rhs::AbstractMatrix)
+    if block.kind == :cholmod
+        rows, columns = size(rhs)
+        panel = Matrix{Float64}(undef, rows, 2 * columns)
+        @inbounds for column in 1:columns, row in 1:rows
+            value = rhs[row, column]
+            panel[row, column] = real(value)
+            panel[row, columns + column] = imag(value)
+        end
+        solved = block.factor \ panel
+        result = Matrix{ComplexF64}(undef, rows, columns)
+        @inbounds for column in 1:columns, row in 1:rows
+            result[row, column] = complex(solved[row, column], solved[row, columns + column])
+        end
+        return result
+    end
+    return block.factor \ ComplexF64.(rhs)
+end
+
+"""
+    _interface_mass_apply(operator, rhs) -> Matrix{ComplexF64}
+
+`M_Γ⁻¹ rhs` with `rhs` in `Γ` row order and the result in interface-dof row order.
+"""
+function _interface_mass_apply(operator, rhs::AbstractMatrix)
+    result = zeros(ComplexF64, operator.count, size(rhs, 2))
+    for block in operator.blocks
+        result[block.dofs, :] = _mass_block_solve(block, rhs[block.rows, :])
+    end
+    return result
+end
+
+"""
+    interface_mass_diagnostics(system) -> Dict{String,Any}
+
+What the flux elimination's `M_Γ` solve actually ran, for the result diagnostics:
+`interface_mass_solver_requested` (`lu`/`cholmod`), `interface_mass_solver` (`lu`, `cholmod`, or
+`mixed` when some blocks fell back), `interface_mass_block_count` and
+`interface_mass_fallback_reasons` (one entry per block that fell back). All `nothing`/`0`/empty
+when no interface mass solve ran (no elimination, pressure elimination, or an uncondensed system).
+"""
+function interface_mass_diagnostics(system)
+    elimination = hasproperty(system, :interface_elimination) && system.interface_elimination == :flux ?
+                  system.interface_elimination_data : nothing
+    if !isnothing(elimination) && hasproperty(elimination, :mass_operator)
+        operator = elimination.mass_operator
+        kinds = unique(block.kind for block in operator.blocks)
+        return Dict{String,Any}(
+            "interface_mass_solver_requested" => String(operator.solver),
+            # No blocks (no interface vertices): nothing was solved.
+            "interface_mass_solver" => isempty(kinds) ? nothing : length(kinds) == 1 ? String(only(kinds)) : "mixed",
+            "interface_mass_block_count" => length(operator.blocks),
+            "interface_mass_fallback_reasons" =>
+                String[block.fallback_reason for block in operator.blocks if !isnothing(block.fallback_reason)],
+        )
+    elseif !isnothing(elimination) && hasproperty(elimination, :mass_factorization)
+        return Dict{String,Any}(
+            "interface_mass_solver_requested" => "lu",
+            "interface_mass_solver" => "lu",
+            "interface_mass_block_count" => 1,
+            "interface_mass_fallback_reasons" => String[],
+        )
+    end
+    return Dict{String,Any}(
+        "interface_mass_solver_requested" => nothing,
+        "interface_mass_solver" => nothing,
+        "interface_mass_block_count" => 0,
+        "interface_mass_fallback_reasons" => String[],
+    )
+end
+
+"""
+    _flux_mass_presolve(operator, schur, motion_columns) -> (schur_blocks, motion_solution, split)
+
+The FEM-only half of the flux elimination: `W_k = M_kk⁻¹ S[rows_k, rows_k]` per block and
+`V = M_Γ⁻¹ E`. Refuses an `S` with an entry between blocks.
+"""
+function _flux_mass_presolve(operator, schur::AbstractMatrix, motion_columns::AbstractMatrix)
+    split = Dict{Symbol,Float64}()
+    if length(operator.blocks) > 1
+        _split_timed!(split, :block_check) do
+            block_of_row = zeros(Int, operator.count)
+            for (index, block) in enumerate(operator.blocks)
+                block_of_row[block.rows] .= index
+            end
+            @inbounds for column in axes(schur, 2), row in axes(schur, 1)
+                block_of_row[row] == block_of_row[column] || iszero(schur[row, column]) ||
+                    error("Schur complement couples interface vertices of different FEM components.")
+            end
+        end
+    end
+    schur_blocks = map(operator.blocks) do block
+        local_schur = _split_timed!(() -> ComplexF64.(schur[block.rows, block.rows]), split, :schur_convert)
+        _split_timed!(() -> _mass_block_solve(block, local_schur), split, :mass_solve)
+    end
+    motion_solution = _split_timed!(() -> _interface_mass_apply(operator, motion_columns), split, :mass_solve)
+    return (schur_blocks=schur_blocks, motion_solution=motion_solution, split=split)
+end
+
+"""
+    _flux_block_products!(coupled, rows, columns_of_gamma, operator, schur_blocks, interface_block, split)
+
+`coupled[rows, columns_of_gamma[j]] += (B_q W)[:, j]` for every `Γ` column `j`, one block at a
+time: `B_q[:, dofs_k] W_k` lands on the columns of `rows_k`. A contiguous dof range is read through
+a strided view, otherwise the coupling columns are copied.
+"""
+function _flux_block_products!(coupled, rows, columns_of_gamma, operator, schur_blocks, interface_block, split)
+    for (block, schur_block) in zip(operator.blocks, schur_blocks)
+        coupling_columns = block.contiguous ?
+                           view(interface_block, :, first(block.dofs):last(block.dofs)) :
+                           interface_block[:, block.dofs]
+        block_coupling = _split_timed!(() -> coupling_columns * schur_block, split, :product)
+        _split_timed!(split, :scatter) do
+            for (local_column, column) in enumerate(block.rows)
+                @views coupled[rows, columns_of_gamma[column]] .+= block_coupling[:, local_column]
+            end
+        end
+    end
+    return coupled
+end
+
+"""
+    _gamma_motion_columns(condensation, T, scale, transducer_count, transducer_condensation, operators, gamma)
+
+`E`, the transducer motion columns of the condensed FEM rows on `Γ`, as `ComplexF64`: the same
+`Complex{T}` block the unmodified layout writes, promoted.
+"""
+function _gamma_motion_columns(
+    condensation,
+    ::Type{T},
+    normal_derivative_scale,
+    transducer_count,
+    transducer_condensation,
+    resolved_transducer_operators,
+    gamma_fem_vertices,
+) where {T}
+    transducer_count == 0 && return zeros(ComplexF64, length(gamma_fem_vertices), 0)
+    transducer_condensation &&
+        return ComplexF64.(-normal_derivative_scale .* Complex{T}.(condensation.motion_gamma))
+    return ComplexF64.(
+        -normal_derivative_scale .* Complex{T}.(
+            Matrix(resolved_transducer_operators.fem_surface[gamma_fem_vertices, :])
+        ),
+    )
+end
+
+"""
+    _split_timed!(f, split, key) -> f()
+
+Run `f` and add its wall time in seconds to `split[key]`. Diagnostics only.
+"""
+function _split_timed!(f, split::Dict{Symbol,Float64}, key::Symbol)
+    started = time_ns()
+    value = f()
+    split[key] = get(split, key, 0.0) + (time_ns() - started) / 1.0e9
+    return value
+end
+
+function _release_factorization_store!(store)
+    isnothing(store) && return nothing
+    factorization = get(store, :factorization, nothing)
+    if !isnothing(factorization)
+        finalize(factorization.numeric)
+        finalize(factorization.symbolic)
+    end
+    empty!(store)
+    return nothing
+end
+
+"""
     _build_condensation(fem_system, interface_operators, retained_vertices)
 
 Factor the FEM interior with UMFPACK and form the dense Schur complement.
@@ -409,9 +900,16 @@ function _build_condensation(
     interface_operators::InterfaceOperators{T},
     retained_vertices;
     schur_block_columns::Int=32,
+    motion_surface=nothing,
+    motion_force=nothing,
     schur_float64::Bool=false,
+    fem_solver::Symbol=:umfpack,
+    mumps_store=nothing,
 ) where {T<:AbstractFloat}
     schur_block_columns > 0 || error("Schur block column count must be positive.")
+    fem_solver in (:umfpack, :mumps) || error("Unsupported FEM condensation solver: $fem_solver.")
+    isnothing(motion_surface) == isnothing(motion_force) ||
+        error("Transducer condensation needs both the motion load and the force operator.")
     interior_vertices, retained = _interior_partition(
         fem_system,
         interface_operators,
@@ -419,6 +917,37 @@ function _build_condensation(
     )
     interior_count = length(interior_vertices)
     retained_count = length(retained)
+
+    fallback_reason = nothing
+    # MUMPS runs in Schur mode (ICNTL(19)), which rejects an empty Schur set (INFOG(1)=-33). That
+    # happens when nothing is retained: no interfaces, and transducer surfaces condensed. The
+    # UMFPACK path handles it; say why MUMPS was not tried instead of failing into it every frequency.
+    if fem_solver == :mumps && interior_count > 0 && retained_count == 0
+        fallback_reason = "MUMPS not used: the Schur set is empty (no retained FEM vertices)"
+    elseif fem_solver == :mumps && interior_count > 0
+        library = mumps_library()
+        if library.available
+            try
+                return _build_mumps_condensation(
+                    library,
+                    fem_system,
+                    interior_vertices,
+                    retained;
+                    result_type=T,
+                    motion_surface=motion_surface,
+                    motion_force=motion_force,
+                    mumps_store=mumps_store,
+                    schur_float64=schur_float64,
+                )
+            catch exception
+                exception isa InterruptException && rethrow()
+                fallback_reason = "MUMPS condensation failed: " * sprint(showerror, exception)
+                @warn "MUMPS FEM condensation failed; factoring with UMFPACK instead." exception
+            end
+        else
+            fallback_reason = "MUMPS unavailable: " * library.reason
+        end
+    end
 
     interior_system = SparseMatrixCSC{ComplexF64,Int}(fem_system[interior_vertices, interior_vertices])
     interior_retained = SparseMatrixCSC{ComplexF64,Int}(fem_system[interior_vertices, retained])
@@ -444,10 +973,60 @@ function _build_condensation(
     )
     # Kept double precision for a double-precision dense system; demoted otherwise.
     schur = schur_float64 ? schur_result.schur : Complex{T}.(schur_result.schur)
+
+    # Transducer-surface vertices eliminated with the interior leave their coupling behind as
+    # low-rank terms. With C the motion load columns and R the force columns (FEM x transducers),
+    # W = A_II⁻¹ C_I and Z = A_II⁻ᵀ R_I, the condensed blocks are
+    #   Γ rows / mechanical columns:  C_Γ - A_ΓI W   (scaled by the Neumann factor by the caller)
+    #   mechanical rows / Γ columns:  R_Γ - A_IΓᵀ Z  (transposed, negated by the caller)
+    #   mechanical / mechanical:      Rᵢᵀ W          (subtracted, scaled, from Z_m)
+    transducer_condensed = !isnothing(motion_surface)
+    transducer_started = time_ns()
+    motion_fields = if transducer_condensed
+        surface = SparseMatrixCSC{ComplexF64,Int}(motion_surface)
+        force = SparseMatrixCSC{ComplexF64,Int}(motion_force)
+        size(surface, 1) == size(fem_system, 1) && size(force) == size(surface) ||
+            error("Transducer motion operators must have one row per FEM vertex.")
+        surface_interior = surface[interior_vertices, :]
+        force_interior = force[interior_vertices, :]
+        motion_gamma = Matrix(surface[retained, :])
+        force_gamma = Matrix(force[retained, :])
+        motion_solution = zeros(ComplexF64, interior_count, size(surface, 2))
+        force_solution = zeros(ComplexF64, interior_count, size(surface, 2))
+        if interior_count > 0
+            motion_solution = factorization \ Matrix(surface_interior)
+            force_solution = transpose(factorization) \ Matrix(force_interior)
+            mul!(motion_gamma, retained_interior, motion_solution, -one(ComplexF64), one(ComplexF64))
+            mul!(force_gamma, transpose(interior_retained), force_solution, -one(ComplexF64), one(ComplexF64))
+        end
+        (
+            motion_interior=surface_interior,
+            motion_solution=motion_solution,
+            force_solution=force_solution,
+            motion_gamma=motion_gamma,
+            force_gamma=force_gamma,
+            motion_force_correction=Matrix(transpose(force_interior) * motion_solution),
+        )
+    else
+        (
+            motion_interior=nothing,
+            motion_solution=nothing,
+            force_solution=nothing,
+            motion_gamma=nothing,
+            force_gamma=nothing,
+            motion_force_correction=nothing,
+        )
+    end
+    transducer_solves_s = (time_ns() - transducer_started) / 1.0e9
     schur_extraction_s = (time_ns() - schur_started) / 1.0e9
 
     return (
         backend=interior_count == 0 ? :cpu_noop : :cpu_umfpack,
+        fem_solver_requested=fem_solver,
+        fem_solver_fallback_reason=fallback_reason,
+        mumps_solver=nothing,
+        mumps_owned=false,
+        mumps_threads=0,
         factorization=factorization,
         interior_system=interior_system,
         interior_retained=interior_retained,
@@ -461,16 +1040,144 @@ function _build_condensation(
         schur_block_columns=schur_result.block_size,
         schur_block_size=schur_result.block_size,
         schur_thread_count=schur_result.thread_count,
+        transducer_condensed=transducer_condensed,
+        motion_fields...,
         timings=(
             analysis_s=0.0,
             factorization_s=factorization_s,
             schur_extraction_s=schur_extraction_s,
+            transducer_solves_s=transducer_solves_s,
         ),
     )
 end
 
+"""
+    _build_mumps_condensation(library, fem_system, interior_vertices, retained; ...)
+
+The `BLAB_COUPLED_FEM_SOLVER=mumps` counterpart of the UMFPACK branch of `_build_condensation`,
+returning the same fields.
+
+MUMPS reads the lower triangle of the whole FEM block (SYM=2, so the block must be complex
+symmetric; checked entry by entry against the transpose) and returns `S` from the partial LDLᵀ
+factorization. `A_II⁻ᵀ = A_II⁻¹` under that symmetry, so the transducer force solves are
+ordinary interior solves:
+  motion_gamma, force_gamma  one reduction (`ICNTL(26)=1`) of the full `[C R]` columns
+  W, Z                       one internal-problem solve (`ICNTL(26)=0`) of the same columns
+
+`mumps_store` (the cache's) keeps the solver and its analysis across frequencies; without it the
+solver belongs to this condensation and `_release_condensation!` frees it.
+"""
+function _build_mumps_condensation(
+    library,
+    fem_system::SparseMatrixCSC{Complex{S}},
+    interior_vertices,
+    retained;
+    result_type::Type{T}=S,
+    motion_surface=nothing,
+    motion_force=nothing,
+    mumps_store=nothing,
+    schur_float64::Bool=false,
+) where {S<:AbstractFloat,T<:AbstractFloat}
+    threads = mumps_threads()
+    owned = isnothing(mumps_store)
+    solver = owned ? nothing : get(mumps_store, :solver, nothing)
+    if isnothing(solver) || !solver.initialized || solver.threads != threads
+        isnothing(solver) || mumps_release!(solver)
+        solver = MumpsSchurSolver(library; threads=threads)
+        owned || (mumps_store[:solver] = solver)
+    end
+    try
+        analysis_started = time_ns()
+        analysis_reused = mumps_analyse!(solver, fem_system, retained)
+        analysis_s = (time_ns() - analysis_started) / 1.0e9
+
+        factorization_started = time_ns()
+        # Assembly sums the (i, j) and (j, i) contributions separately, so allow round-off.
+        schur_double = mumps_factorize!(solver, fem_system; symmetry_tolerance=64 * eps(S))
+        factorization_s = (time_ns() - factorization_started) / 1.0e9
+
+        schur_started = time_ns()
+        schur = schur_float64 ? schur_double : Complex{T}.(schur_double)
+        transducer_condensed = !isnothing(motion_surface)
+        transducer_started = time_ns()
+        motion_fields = if transducer_condensed
+            surface = SparseMatrixCSC{ComplexF64,Int}(motion_surface)
+            force = SparseMatrixCSC{ComplexF64,Int}(motion_force)
+            size(surface, 1) == size(fem_system, 1) && size(force) == size(surface) ||
+                error("Transducer motion operators must have one row per FEM vertex.")
+            transducer_count = size(surface, 2)
+            columns = hcat(Matrix(surface), Matrix(force))
+            reduced = mumps_reduce(solver, columns)
+            interior_solution = mumps_interior_solve(solver, columns)
+            motion_solution = interior_solution[interior_vertices, 1:transducer_count]
+            force_interior = force[interior_vertices, :]
+            (
+                motion_interior=surface[interior_vertices, :],
+                motion_solution=motion_solution,
+                force_solution=interior_solution[interior_vertices, (transducer_count+1):end],
+                motion_gamma=reduced[:, 1:transducer_count],
+                force_gamma=reduced[:, (transducer_count+1):end],
+                motion_force_correction=Matrix(transpose(force_interior) * motion_solution),
+            )
+        else
+            (
+                motion_interior=nothing,
+                motion_solution=nothing,
+                force_solution=nothing,
+                motion_gamma=nothing,
+                force_gamma=nothing,
+                motion_force_correction=nothing,
+            )
+        end
+        transducer_solves_s = (time_ns() - transducer_started) / 1.0e9
+        schur_extraction_s = (time_ns() - schur_started) / 1.0e9
+
+        return (
+            backend=:mumps_seq,
+            fem_solver_requested=:mumps,
+            fem_solver_fallback_reason=nothing,
+            mumps_solver=solver,
+            mumps_owned=owned,
+            mumps_threads=threads,
+            # The full FEM block, for the back substitution's residual and coupling matvecs.
+            fem_system=fem_system,
+            factorization=nothing,
+            interior_system=nothing,
+            interior_retained=nothing,
+            retained_interior=nothing,
+            schur=schur,
+            interior_vertices=interior_vertices,
+            retained_vertices=retained,
+            interior_count=length(interior_vertices),
+            retained_count=length(retained),
+            schur_block_columns=0,
+            schur_block_size=0,
+            schur_thread_count=threads,
+            analysis_reused=analysis_reused,
+            factorization_cached=!owned,
+            transducer_condensed=transducer_condensed,
+            motion_fields...,
+            timings=(
+                analysis_s=analysis_s,
+                factorization_s=factorization_s,
+                schur_extraction_s=schur_extraction_s,
+                transducer_solves_s=transducer_solves_s,
+            ),
+        )
+    catch
+        # A cached solver in an unknown state must not be refactored next frequency.
+        mumps_release!(solver)
+        owned || delete!(mumps_store, :solver)
+        rethrow()
+    end
+end
+
 function _release_condensation!(condensation)
     isnothing(condensation) && return nothing
+    if hasproperty(condensation, :backend) && condensation.backend == :mumps_seq
+        condensation.mumps_owned && mumps_release!(condensation.mumps_solver)
+        return nothing
+    end
     # UMFPACK holds its factors outside the Julia heap; release them with the system rather than
     # waiting for the finalizer, so a frequency sweep does not accumulate them.
     isnothing(condensation.factorization) || finalize(condensation.factorization)
@@ -490,6 +1197,10 @@ function _forward_schur(
 ) where {T<:AbstractFloat}
     R = Complex{result_type}
     interior_rhs = ComplexF64.(fem_rhs[condensation.interior_vertices, :])
+    if hasproperty(condensation, :backend) && condensation.backend == :mumps_seq
+        reduced = mumps_reduce(condensation.mumps_solver, fem_rhs)
+        return R.(reduced), interior_rhs
+    end
     retained_rhs = ComplexF64.(fem_rhs[condensation.retained_vertices, :])
     condensation.interior_count == 0 && return R.(retained_rhs), interior_rhs
     mul!(
@@ -523,15 +1234,32 @@ stays at round-off, so it is not a resonance detector.
 function _backward_schur(
     condensation,
     interior_rhs,
-    retained_pressure::AbstractMatrix{Complex{T}},
+    retained_pressure::AbstractMatrix{Complex{T}};
+    motion_velocity=nothing,
+    motion_scale=nothing,
 ) where {T<:AbstractFloat}
     retained_double = ComplexF64.(retained_pressure)
-    interior_pressure = condensation.interior_count == 0 ?
-                        copy(interior_rhs) :
-                        condensation.factorization \
-                        (interior_rhs - condensation.interior_retained * retained_double)
-    interior_term = condensation.interior_system * interior_pressure
-    retained_term = condensation.interior_retained * retained_double
+    if hasproperty(condensation, :transducer_condensed) && condensation.transducer_condensed
+        # Eliminated transducer vertices carry the motion load `s C_I v` on the interior side.
+        (isnothing(motion_velocity) || isnothing(motion_scale)) &&
+            error("Transducer-condensed back substitution needs the diaphragm velocity.")
+        interior_rhs = interior_rhs +
+                       ComplexF64(motion_scale) .* (condensation.motion_interior * ComplexF64.(motion_velocity))
+    end
+    interior_pressure, interior_term, retained_term = if hasproperty(condensation, :backend) &&
+                                                         condensation.backend == :mumps_seq
+        _mumps_back_substitution(condensation, interior_rhs, retained_double)
+    else
+        pressure = condensation.interior_count == 0 ?
+                   copy(interior_rhs) :
+                   condensation.factorization \
+                   (interior_rhs - condensation.interior_retained * retained_double)
+        (
+            pressure,
+            condensation.interior_system * pressure,
+            condensation.interior_retained * retained_double,
+        )
+    end
     residual = interior_term + retained_term - interior_rhs
 
     interior_residual = zeros(T, size(residual, 2))
@@ -553,6 +1281,34 @@ function _backward_schur(
     fem_pressure[condensation.interior_vertices, :] = Complex{T}.(interior_pressure)
     fem_pressure[condensation.retained_vertices, :] = retained_pressure
     return fem_pressure, interior_residual
+end
+
+"""
+    _mumps_back_substitution(condensation, interior_rhs, retained_pressure)
+        -> (interior_pressure, interior_term, retained_term)
+
+`u_I = A_II⁻¹ (f_I - A_IΓ u_Γ)` with an explicit right-hand side and an internal-problem solve,
+not `ICNTL(26)=2`: MUMPS's expansion reuses the forward solution stored by the last reduction and
+ignores the right-hand side it is given, and transducer condensation changes `f_I` after the
+reduction. The two coupling terms come from the full FEM block, whose interior rows are exactly
+`[A_II A_IΓ]`.
+"""
+function _mumps_back_substitution(condensation, interior_rhs, retained_pressure)
+    matrix = condensation.fem_system
+    interior = condensation.interior_vertices
+    retained = condensation.retained_vertices
+    vertex_count = size(matrix, 1)
+    excitation_count = size(retained_pressure, 2)
+    lifted = zeros(ComplexF64, vertex_count, excitation_count)
+    lifted[retained, :] = retained_pressure
+    retained_term = (matrix * lifted)[interior, :]
+    rhs = zeros(ComplexF64, vertex_count, excitation_count)
+    rhs[interior, :] = interior_rhs - retained_term
+    interior_pressure = mumps_interior_solve(condensation.mumps_solver, rhs)[interior, :]
+    fill!(lifted, zero(ComplexF64))
+    lifted[interior, :] = interior_pressure
+    interior_term = (matrix * lifted)[interior, :]
+    return interior_pressure, interior_term, retained_term
 end
 
 """
@@ -788,6 +1544,10 @@ function prepare_condensed_coupled_cache(
         base_quadrature_order=quadrature_order,
         singular_order=singular_order,
         timings=timings,
+        # Interface mass factorization for BLAB_COUPLED_INTERFACE_FLUX_ELIMINATION.
+        interface_mass_store=Dict{Symbol,Any}(),
+        # MUMPS solver (and its analysis) for BLAB_COUPLED_FEM_SOLVER=mumps.
+        mumps_store=Dict{Symbol,Any}(),
         # Double-precision FEM matrices for BLAB_COUPLED_FEM_FLOAT64.
         fem_float64_store=Dict{Symbol,Any}(),
     )
@@ -804,7 +1564,13 @@ function release_condensed_coupled_cache!(cache)
             release_metal_field_evaluation_cache!(bundle.field_cache)
         end
     end
+    hasproperty(cache, :interface_mass_store) && _release_factorization_store!(cache.interface_mass_store)
     hasproperty(cache, :fem_float64_store) && empty!(cache.fem_float64_store)
+    if hasproperty(cache, :mumps_store)
+        solver = get(cache.mumps_store, :solver, nothing)
+        isnothing(solver) || mumps_release!(solver)
+        empty!(cache.mumps_store)
+    end
     release_coupled_cache!(cache.base)
     return nothing
 end
@@ -871,6 +1637,7 @@ function build_condensed_coupled_system(
     transducer_operators=nothing,
     prescribed_bem_normal_velocity=nothing,
     schur_block_columns::Int=32,
+    allow_transducer_condensation::Bool=true,
 ) where {T<:AbstractFloat}
     # `relative_residual` needs the monolithic coupled matrix, which this formulation never
     # forms. `fem_interior_residual` on each solution is the condensed-appropriate check.
@@ -888,6 +1655,21 @@ function build_condensed_coupled_system(
     retained_fem_vertices = sort(
         unique(vcat(interface_map.fem_vertex_indices, transducer_fem_vertices)),
     )
+    # Optimization switches resolve against the cache's backend (unset: on for Metal, off elsewhere);
+    # `optimization_fallbacks` records every `auto` switch that could not be used, and why.
+    bem_backend = isnothing(cache) ? :cpu : cache.base.bem_backend
+    optimization_fallbacks = String[]
+    # The cache is keyed on the full moving-surface set either way; only the Schur block changes.
+    transducer_condensation_mode = isempty(transducers) ? :off : _transducer_condensation_mode(bem_backend)
+    transducer_condensation = transducer_condensation_mode == :on ||
+                              (transducer_condensation_mode == :auto && allow_transducer_condensation)
+    if transducer_condensation_mode == :auto && !allow_transducer_condensation
+        push!(optimization_fallbacks,
+            "transducer condensation not used: the request needs transducer surfaces retained (speaker ROM)")
+    end
+    gamma_fem_vertices = transducer_condensation ?
+                         sort(unique(Int.(interface_map.fem_vertex_indices))) :
+                         retained_fem_vertices
     # Without a cache, build one for exactly the order this frequency selected, so the uncached
     # path honours the selection instead of silently falling back to the base order.
     selected_quadrature_order = isnothing(regular_quadrature_order) ? quadrature_order :
@@ -969,17 +1751,16 @@ function build_condensed_coupled_system(
         error("Prescribed BEM normal velocity must contain one row per BEM face.")
     bem_prescribed_neumann = normal_derivative_scale .* Complex{T}.(resolved_prescribed_bem_velocity)
     prescribed_bem_count = size(bem_prescribed_neumann, 2)
-    # Precision switches resolve against the cache's backend (unset: on for Metal, off elsewhere).
-    bem_backend = prepared.bem_backend
     if T !== Float64 && _fem_float64_enabled(bem_backend)
         fem_system = _fem_system_float64(
-            condensed_cache.fem_float64_store, fem_mesh, prepared, frequency_hz, sound_speed, density,
+            hasproperty(condensed_cache, :fem_float64_store) ? condensed_cache.fem_float64_store : nothing,
+            fem_mesh,
+            prepared,
+            frequency_hz,
+            sound_speed,
+            density,
         )
     end
-    # Scalar type of the dense coupled system. Under double assembly the Schur block and the condensed
-    # right-hand side stay Float64 up to the dense matrix; inputs that are single precision to begin
-    # with (BEM operators, traces, transducer parameters) are unchanged.
-    dense_type = _dense_double_assembly(bem_backend) ? Float64 : T
     fem_system_s = (time_ns() - fem_stage_started) / 1.0e9
 
     # Everything the condensation reads is final here and nothing below writes
@@ -988,14 +1769,81 @@ function build_condensed_coupled_system(
     # below because the overlap is the whole point; `fem_condensation_s` then
     # spans the concurrent region, and `stage_overlap` in the timings says so.
     stage_overlap = _stage_overlap_enabled(prepared.bem_backend)
-    condensation_started = time_ns()
-    condensation_task = stage_overlap ? Threads.@spawn(_build_condensation(
-        fem_system,
-        interface_operators,
-        retained_fem_vertices;
+    fem_solver = _fem_solver_selection(bem_backend)
+    # First use forwards an LP64 BLAS into libblastrampoline; do that here, before the condensation
+    # can overlap host BLAS work in the BEM stage.
+    fem_solver == :mumps && mumps_library()
+    # Scalar type of the dense coupled system. Under double assembly every block formed from
+    # double-precision FEM quantities (Schur, transducer motion/force, the mechanical block, the
+    # condensed right-hand side) stays Float64 up to the dense matrix; only inputs that are
+    # single precision to begin with (BEM operators, traces, transducer parameters) are Float32.
+    dense_type = _dense_double_assembly(bem_backend) ? Float64 : T
+    condensation_options = (
+        fem_solver=fem_solver,
+        mumps_store=(!isnothing(cache) && hasproperty(condensed_cache, :mumps_store)) ?
+                    condensed_cache.mumps_store : nothing,
         schur_block_columns=schur_block_columns,
+        motion_surface=transducer_condensation ? resolved_transducer_operators.fem_surface : nothing,
+        motion_force=transducer_condensation ? resolved_transducer_operators.fem_force : nothing,
         schur_float64=dense_type === Float64,
-    )) : nothing
+    )
+    interface_elimination, elimination_required = _interface_elimination_request(bem_backend)
+    elimination_map = nothing
+    if interface_elimination != :none
+        try
+            elimination_map = _interface_elimination_map(interface_map, interface_operators, gamma_fem_vertices)
+        catch exception
+            (exception isa ErrorException && !elimination_required) || rethrow()
+            push!(optimization_fallbacks, "interface elimination not used: " * exception.msg)
+            interface_elimination = :none
+        end
+    end
+    elimination_split = Dict{Symbol,Float64}()
+    # Specialized flux elimination (BLAB_COUPLED_INTERFACE_MASS_SOLVER / _MASS_OVERLAP / _BLOCKS).
+    mass_operator = nothing
+    mass_in_fem_stage = false
+    interface_mass_factorization_s = 0.0
+    interface_mass_cached = false
+    if interface_elimination == :flux && _interface_mass_specialized(bem_backend)
+        blocks_mode = _interface_blocks_mode(bem_backend)
+        gamma_labels = if blocks_mode != :off
+            _split_timed!(elimination_split, :components) do
+                _fem_component_labels(fem_system)[gamma_fem_vertices]
+            end
+        else
+            nothing
+        end
+        mass_store = hasproperty(condensed_cache, :interface_mass_store) ?
+                     condensed_cache.interface_mass_store : nothing
+        mass_started = time_ns()
+        mass_solver = _interface_mass_solver_selection(bem_backend)
+        mass_operator, interface_mass_cached = _interface_mass_operator_or_single_block(
+            mass_store, interface_operators, gamma_fem_vertices, elimination_map.gamma_dof, gamma_labels, mass_solver,
+            blocks_mode, optimization_fallbacks,
+        )
+        interface_mass_factorization_s = (time_ns() - mass_started) / 1.0e9
+        elimination_split[:mass_prep] = interface_mass_factorization_s
+        mass_in_fem_stage = _interface_mass_overlap_enabled(bem_backend)
+    end
+    fem_stage = () -> begin
+        stage_condensation = _build_condensation(
+            fem_system,
+            interface_operators,
+            gamma_fem_vertices;
+            condensation_options...,
+        )
+        presolve = mass_in_fem_stage ? _flux_mass_presolve(
+            mass_operator,
+            stage_condensation.schur,
+            _gamma_motion_columns(
+                stage_condensation, dense_type, normal_derivative_scale, transducer_count, transducer_condensation,
+                resolved_transducer_operators, gamma_fem_vertices,
+            ),
+        ) : nothing
+        (stage_condensation, presolve)
+    end
+    condensation_started = time_ns()
+    condensation_task = stage_overlap ? Threads.@spawn(fem_stage()) : nothing
 
     bem_operator_started = time_ns()
     # This solver's own fork of the CPU regular assembly, so it can be optimised without
@@ -1057,14 +1905,8 @@ function build_condensed_coupled_system(
     bem_matrix_s = (time_ns() - bem_matrix_started) / 1.0e9
 
     stage_overlap || (condensation_started = time_ns())
-    condensation = if isnothing(condensation_task)
-        _build_condensation(
-            fem_system,
-            interface_operators,
-            retained_fem_vertices;
-            schur_block_columns=schur_block_columns,
-            schur_float64=dense_type === Float64,
-        )
+    condensation, fem_stage_presolve = if isnothing(condensation_task)
+        fem_stage()
     else
         # `fetch` wraps a task failure in a TaskFailedException, which would
         # make the error a caller sees depend on whether the stage happened to
@@ -1082,11 +1924,28 @@ function build_condensed_coupled_system(
     fem_count = length(fem_mesh.vertices)
     bem_count = length(bem_mesh.vertices)
     interface_count = length(interface_map.fem_vertex_indices)
-    retained_fem_count = length(retained_fem_vertices)
+    retained_fem_count = length(gamma_fem_vertices)
     gamma_range = 1:retained_fem_count
-    bem_range = (retained_fem_count + 1):(retained_fem_count + bem_count)
-    flux_range = (retained_fem_count + bem_count + 1):(retained_fem_count + bem_count + interface_count)
-    acoustic_system_count = retained_fem_count + bem_count + interface_count
+    # Unknown and row layouts. `gamma_row_range` holds the condensed FEM rows' right-hand side.
+    #   :none      unknowns [p_Γ, p_B, q, y]  rows [Γ, BEM, continuity, mech, elec]
+    #   :pressure  unknowns [q, p_B, y]       rows [Γ, BEM, mech, elec]  (|Γ| == |I|)
+    #   :flux      unknowns [p_B, y]          rows [BEM, mech, elec]
+    if interface_elimination == :none
+        gamma_row_range = gamma_range
+        bem_range = (retained_fem_count + 1):(retained_fem_count + bem_count)
+        flux_range = (retained_fem_count + bem_count + 1):(retained_fem_count + bem_count + interface_count)
+        acoustic_system_count = retained_fem_count + bem_count + interface_count
+    elseif interface_elimination == :pressure
+        gamma_row_range = 1:retained_fem_count
+        flux_range = 1:interface_count
+        bem_range = (interface_count + 1):(interface_count + bem_count)
+        acoustic_system_count = interface_count + bem_count
+    else
+        gamma_row_range = 1:0
+        flux_range = 1:0
+        bem_range = 1:bem_count
+        acoustic_system_count = bem_count
+    end
     mechanical_range = transducer_count == 0 ?
                        (1:0) :
                        ((acoustic_system_count + 1):(acoustic_system_count + transducer_count))
@@ -1108,35 +1967,167 @@ function build_condensed_coupled_system(
     force_factor = T[transducer.bl_n_per_a for transducer in transducers]
 
     coupled = zeros(Complex{dense_type}, system_count, system_count)
+    interface_elimination_s = 0.0
+    elimination = nothing
     # The Schur complement takes the slot the full FEM block occupies in the monolithic
     # formulation, and the interface coupling is restricted to Γ.
-    coupled[gamma_range, gamma_range] = condensation.schur
-    coupled[gamma_range, flux_range] =
-        -Complex{T}.(Matrix(interface_operators.fem_load[retained_fem_vertices, :]))
-    coupled[flux_range, gamma_range] =
-        Complex{T}.(Matrix(interface_operators.fem_trace[:, retained_fem_vertices]))
-    coupled[bem_range, bem_range] = bem_lhs
-    coupled[bem_range, flux_range] = bem_interface_block
-    coupled[flux_range, bem_range] = -Complex{T}.(Matrix(interface_operators.bem_trace))
-    if transducer_count > 0
-        coupled[gamma_range, mechanical_range] =
-            -normal_derivative_scale .* Complex{T}.(
-                Matrix(resolved_transducer_operators.fem_surface[retained_fem_vertices, :])
-            )
-        coupled[bem_range, mechanical_range] = bem_motion_block
-        coupled[mechanical_range, gamma_range] =
-            -Complex{T}.(
-                transpose(
-                    Matrix(resolved_transducer_operators.fem_force[retained_fem_vertices, :]),
+    if interface_elimination == :none
+        coupled[gamma_range, gamma_range] = condensation.schur
+        coupled[gamma_range, flux_range] =
+            -Complex{T}.(Matrix(interface_operators.fem_load[gamma_fem_vertices, :]))
+        coupled[flux_range, gamma_range] =
+            Complex{T}.(Matrix(interface_operators.fem_trace[:, gamma_fem_vertices]))
+        coupled[bem_range, bem_range] = bem_lhs
+        coupled[bem_range, flux_range] = bem_interface_block
+        coupled[flux_range, bem_range] = -Complex{T}.(Matrix(interface_operators.bem_trace))
+    end
+    if transducer_count > 0 && transducer_condensation
+        if interface_elimination == :none
+            coupled[gamma_range, mechanical_range] =
+                -normal_derivative_scale .* Complex{dense_type}.(condensation.motion_gamma)
+            coupled[mechanical_range, gamma_range] = -Complex{dense_type}.(transpose(condensation.force_gamma))
+        end
+        # Formed in double precision so the interior's margin survives the subtraction.
+        coupled[mechanical_range, mechanical_range] = Complex{dense_type}.(
+            ComplexF64.(Matrix(Diagonal(mechanical_impedance))) -
+            ComplexF64(normal_derivative_scale) .* condensation.motion_force_correction
+        )
+    elseif transducer_count > 0
+        if interface_elimination == :none
+            coupled[gamma_range, mechanical_range] =
+                -normal_derivative_scale .* Complex{T}.(
+                    Matrix(resolved_transducer_operators.fem_surface[retained_fem_vertices, :])
                 )
-            )
+            coupled[mechanical_range, gamma_range] =
+                -Complex{T}.(
+                    transpose(
+                        Matrix(resolved_transducer_operators.fem_force[retained_fem_vertices, :]),
+                    )
+                )
+        end
+        coupled[mechanical_range, mechanical_range] = Matrix(Diagonal(mechanical_impedance))
+    end
+    if transducer_count > 0
+        coupled[bem_range, mechanical_range] = bem_motion_block
         coupled[mechanical_range, bem_range] =
             Complex{T}.(transpose(Matrix(resolved_transducer_operators.bem_force)))
-        coupled[mechanical_range, mechanical_range] = Matrix(Diagonal(mechanical_impedance))
         coupled[mechanical_range, electrical_range] =
             -Matrix(Diagonal(Complex{T}.(force_factor)))
         coupled[electrical_range, mechanical_range] = Matrix(Diagonal(Complex{T}.(force_factor)))
         coupled[electrical_range, electrical_range] = Matrix(Diagonal(electrical_impedance))
+    end
+    if !isnothing(fem_stage_presolve)
+        # Ran inside the FEM stage, concurrently with the BEM operators when overlapped; not part
+        # of `interface_elimination_s`.
+        for (key, value) in fem_stage_presolve.split
+            elimination_split[Symbol("fem_stage_", key)] = value
+        end
+    end
+    if interface_elimination != :none
+        elimination_started = time_ns()
+        # The same blocks the unmodified layout writes (at the dense scalar type), promoted for the elimination.
+        gamma_mech, mech_gamma, bem_columns = _split_timed!(elimination_split, :pack) do
+            local_gamma_mech = _gamma_motion_columns(
+                condensation, dense_type, normal_derivative_scale, transducer_count, transducer_condensation,
+                resolved_transducer_operators, gamma_fem_vertices,
+            )
+            local_mech_gamma = if transducer_count == 0
+                zeros(ComplexF64, 0, retained_fem_count)
+            elseif transducer_condensation
+                ComplexF64.(-Complex{dense_type}.(transpose(condensation.force_gamma)))
+            else
+                ComplexF64.(
+                    -Complex{T}.(transpose(Matrix(resolved_transducer_operators.fem_force[gamma_fem_vertices, :]))),
+                )
+            end
+            # Γ column j is the BEM pressure unknown it equals.
+            (local_gamma_mech, local_mech_gamma, collect(bem_range)[elimination_map.bem_of_gamma])
+        end
+        _split_timed!(elimination_split, :bem_block_copy) do
+            coupled[bem_range, bem_range] = bem_lhs
+        end
+        if interface_elimination == :pressure
+            coupled[gamma_row_range, flux_range] =
+                -Complex{T}.(Matrix(interface_operators.fem_load[gamma_fem_vertices, :]))
+            # `+=`: two interface vertices from different FEM domains may share a BEM vertex.
+            for (column, target) in enumerate(elimination_map.bem_of_gamma)
+                @views coupled[gamma_row_range, bem_columns[column]] .+= condensation.schur[:, column]
+            end
+            coupled[bem_range, flux_range] = bem_interface_block
+            transducer_count > 0 && (coupled[gamma_row_range, mechanical_range] = gamma_mech)
+            elimination = (
+                bem_of_gamma=elimination_map.bem_of_gamma,
+                gamma_dof=elimination_map.gamma_dof,
+            )
+        elseif !isnothing(mass_operator)
+            presolve = if isnothing(fem_stage_presolve)
+                stage_presolve = _flux_mass_presolve(mass_operator, condensation.schur, gamma_mech)
+                merge!(+, elimination_split, stage_presolve.split)
+                stage_presolve
+            else
+                fem_stage_presolve
+            end
+            interface_block = _split_timed!(() -> ComplexF64.(bem_interface_block), elimination_split, :block_convert)
+            _flux_block_products!(
+                coupled, bem_range, bem_columns, mass_operator, presolve.schur_blocks, interface_block,
+                elimination_split,
+            )
+            if transducer_count > 0
+                motion_coupling = _split_timed!(
+                    () -> interface_block * presolve.motion_solution, elimination_split, :product,
+                )
+                _split_timed!(() -> (coupled[bem_range, mechanical_range] .+= motion_coupling), elimination_split, :scatter)
+            end
+            elimination = (
+                bem_of_gamma=elimination_map.bem_of_gamma,
+                gamma_dof=elimination_map.gamma_dof,
+                mass_operator=mass_operator,
+                schur_blocks=presolve.schur_blocks,
+                motion_solution=presolve.motion_solution,
+                interface_block=interface_block,
+            )
+        else
+            mass_store = hasproperty(condensed_cache, :interface_mass_store) ?
+                         condensed_cache.interface_mass_store : nothing
+            mass_started = time_ns()
+            mass_factorization, interface_mass_cached =
+                _interface_mass_factorization(mass_store, interface_operators, gamma_fem_vertices)
+            interface_mass_factorization_s = (time_ns() - mass_started) / 1.0e9
+            elimination_split[:mass_prep] = interface_mass_factorization_s
+            # q = M_Γ⁻¹ (S P p_B + E y - g), in interface-dof order (the columns of fem_load).
+            schur_double = _split_timed!(() -> ComplexF64.(condensation.schur), elimination_split, :schur_convert)
+            schur_solution, motion_solution = _split_timed!(elimination_split, :mass_solve) do
+                (mass_factorization \ schur_double, mass_factorization \ gamma_mech)
+            end
+            schur_double = nothing
+            interface_block = _split_timed!(() -> ComplexF64.(bem_interface_block), elimination_split, :block_convert)
+            schur_coupling, motion_coupling = _split_timed!(elimination_split, :product) do
+                (interface_block * schur_solution, interface_block * motion_solution)
+            end
+            _split_timed!(elimination_split, :scatter) do
+                for column in eachindex(bem_columns)
+                    @views coupled[bem_range, bem_columns[column]] .+= schur_coupling[:, column]
+                end
+                transducer_count > 0 && (coupled[bem_range, mechanical_range] .+= motion_coupling)
+            end
+            schur_coupling = nothing
+            elimination = (
+                bem_of_gamma=elimination_map.bem_of_gamma,
+                gamma_dof=elimination_map.gamma_dof,
+                mass_factorization=mass_factorization,
+                schur_solution=schur_solution,
+                motion_solution=motion_solution,
+                interface_block=interface_block,
+            )
+        end
+        if transducer_count > 0
+            _split_timed!(elimination_split, :scatter) do
+                for column in eachindex(bem_columns)
+                    @views coupled[mechanical_range, bem_columns[column]] .+= mech_gamma[:, column]
+                end
+            end
+        end
+        interface_elimination_s = (time_ns() - elimination_started) / 1.0e9
     end
     block_assembly_s = (time_ns() - block_assembly_started) / 1.0e9
 
@@ -1161,16 +2152,27 @@ function build_condensed_coupled_system(
         field_cache=prepared.field_cache,
         coupled=nothing,
         factorization=factorization,
-        dense_scalar_type=dense_type,
-        # Element type of the FEM dynamic stiffness the condensation read (BLAB_COUPLED_FEM_FLOAT64).
-        fem_scalar_type=real(eltype(fem_system)),
         formulation=:fem_interface_condensed,
         # The order the assembly actually used, so diagnostics report what ran, not what was asked.
         regular_quadrature_order=selected_quadrature_order,
         condensation=condensation,
         fem_range=1:fem_count,
         gamma_range=gamma_range,
+        # Callers key caches on this set, so it keeps meaning interface ∪ transducer surfaces.
         retained_fem_vertices=retained_fem_vertices,
+        # The vertices `gamma_range` indexes; without the transducer surfaces when they are condensed.
+        gamma_fem_vertices=gamma_fem_vertices,
+        transducer_condensation=transducer_condensation,
+        # :none, :pressure or :flux; see `_interface_elimination_mode`. Under elimination,
+        # `gamma_range` keeps its length but no longer indexes the dense unknowns.
+        interface_elimination=interface_elimination,
+        interface_elimination_data=elimination,
+        gamma_row_range=gamma_row_range,
+        dense_scalar_type=dense_type,
+        # Element type of the FEM dynamic stiffness the condensation read (BLAB_COUPLED_FEM_FLOAT64).
+        fem_scalar_type=real(eltype(fem_system)),
+        # `auto` optimizations that could not be used for this model, with the reason.
+        optimization_fallback_reasons=optimization_fallbacks,
         bem_range=bem_range,
         flux_range=flux_range,
         mechanical_range=mechanical_range,
@@ -1198,6 +2200,12 @@ function build_condensed_coupled_system(
             # wall-clock span and must not be added together.
             stage_overlap=stage_overlap,
             block_assembly_s=block_assembly_s,
+            # Both inside `block_assembly_s`.
+            interface_elimination_s=interface_elimination_s,
+            interface_mass_factorization_s=interface_mass_factorization_s,
+            interface_mass_cached=interface_mass_cached,
+            # Parts of `interface_elimination_s` by sub-stage, reported as `interface_elim_<key>_s`.
+            interface_elimination_split=elimination_split,
             coupled_factorization_s=coupled_factorization_s,
             replay_factorization_s=0.0,
         ),
@@ -1219,6 +2227,9 @@ function _solution_from_parts(
     diaphragm_velocity=zeros(Complex{system.scalar_type}, length(system.transducers)),
     voice_coil_current=zeros(Complex{system.scalar_type}, length(system.transducers)),
     prescribed_bem_neumann=zeros(Complex{system.scalar_type}, length(system.bem_mesh.faces)),
+    fem_rhs_condensation_s=nothing,
+    fem_reconstruction_s=nothing,
+    solve_split=nothing,
 )
     T = system.scalar_type
     bem_neumann = (
@@ -1265,8 +2276,9 @@ function _solution_from_parts(
         voice_coil_current=voice_coil_current,
         relative_residual=nothing,
         fem_interior_residual=fem_interior_residual,
-        fem_rhs_condensation_s=nothing,
-        fem_reconstruction_s=nothing,
+        fem_rhs_condensation_s=fem_rhs_condensation_s,
+        fem_reconstruction_s=fem_reconstruction_s,
+        solve_split=solve_split,
         pressure_continuity_error=norm(pressure_jump) / pressure_scale,
         flux_conservation_error=abs(fem_integrated_flux - bem_integrated_flux_along_fem_normal) / flux_scale,
         all_bem_replay_error=nothing,
@@ -1275,7 +2287,15 @@ function _solution_from_parts(
     )
 end
 
-function solve_condensed_coupled_excitations(system, excitations)
+"""
+    solve_condensed_coupled_excitations(system, excitations; reconstruct_interior=true)
+
+`reconstruct_interior=false` skips the FEM interior back substitution: interior entries of
+`fem_pressure` are `NaN` and `fem_interior_residual` is `NaN` (not evaluated). Retained-vertex
+pressures, BEM pressures, interface fluxes, diaphragm velocities and currents are unaffected.
+Only for callers whose outputs never read interior pressure.
+"""
+function solve_condensed_coupled_excitations(system, excitations; reconstruct_interior::Bool=true)
     T = system.scalar_type
     requested = collect(excitations)
     isempty(requested) && error("At least one coupled excitation is required.")
@@ -1330,31 +2350,101 @@ function solve_condensed_coupled_excitations(system, excitations)
         end
     end
 
-    rhs = zeros(Complex{system.dense_scalar_type}, size(system.factorization, 1), excitation_count)
+    elimination_mode = hasproperty(system, :interface_elimination) ? system.interface_elimination : :none
+    elimination = elimination_mode == :none ? nothing : system.interface_elimination_data
+    rhs_type = Complex{system.dense_scalar_type}
+    rhs = zeros(rhs_type, size(system.factorization, 1), excitation_count)
     rhs[system.bem_range, :] = bem_rhs
     rhs[system.electrical_range, :] = electrical_rhs
+    # Sub-stage split of the solve (seconds), reported as `solve_<key>_s`.
+    solve_split = Dict{Symbol,Float64}()
+    rhs_condensation_started = time_ns()
     reduced_rhs, interior_rhs = _forward_schur(system.condensation, fem_rhs; result_type=system.dense_scalar_type)
-    rhs[system.gamma_range, :] = reduced_rhs
-    # Results keep the request's precision whatever precision the dense solve used.
-    solution = Complex{T}.(system.factorization \ rhs)
-    fem_pressure, fem_interior_residual = _backward_schur(
-        system.condensation,
-        interior_rhs,
-        solution[system.gamma_range, :],
-    )
-    return [
+    fem_rhs_condensation_s = (time_ns() - rhs_condensation_started) / 1.0e9
+    flux_rhs_solution = nothing
+    if elimination_mode == :flux
+        # BEM rows gain B_q M_Γ⁻¹ g from substituting q = M_Γ⁻¹ (S P p_B + E y - g).
+        flux_rhs_solution = _split_timed!(solve_split, :flux_rhs_mass) do
+            hasproperty(elimination, :mass_operator) ?
+                _interface_mass_apply(elimination.mass_operator, reduced_rhs) :
+                elimination.mass_factorization \ ComplexF64.(reduced_rhs)
+        end
+        _split_timed!(solve_split, :flux_rhs_product) do
+            rhs[system.bem_range, :] .+= elimination.interface_block * flux_rhs_solution
+        end
+    else
+        rhs[system.gamma_row_range, :] = reduced_rhs
+    end
+    transducer_condensed = hasproperty(system.condensation, :transducer_condensed) &&
+                           system.condensation.transducer_condensed
+    if transducer_condensed && system.condensation.interior_count > 0
+        # Mechanical rows pick up R_Iᵀ A_II⁻¹ f_I = Zᵀ f_I from the eliminated force vertices.
+        rhs[system.mechanical_range, :] .+=
+            Complex{system.dense_scalar_type}.(transpose(system.condensation.force_solution) * interior_rhs)
+    end
+    dense_solution = _split_timed!(() -> system.factorization \ rhs, solve_split, :dense_solve)
+    solution = Complex{T}.(dense_solution)
+    flux_reconstruction_started = time_ns()
+    retained_pressure, interface_flux = if elimination_mode == :none
+        solution[system.gamma_range, :], solution[system.flux_range, :]
+    elseif elimination_mode == :pressure
+        solution[system.bem_range, :][elimination.bem_of_gamma, :], solution[system.flux_range, :]
+    else
+        bem_gamma = ComplexF64.(dense_solution[system.bem_range, :][elimination.bem_of_gamma, :])
+        flux = if hasproperty(elimination, :mass_operator)
+            # W is block diagonal: q[dofs_k] = W_k p_B[rows_k] - h[dofs_k] (+ V y below).
+            block_flux = -flux_rhs_solution
+            for (block, schur_block) in zip(elimination.mass_operator.blocks, elimination.schur_blocks)
+                @views block_flux[block.dofs, :] .+= schur_block * bem_gamma[block.rows, :]
+            end
+            block_flux
+        else
+            elimination.schur_solution * bem_gamma - flux_rhs_solution
+        end
+        isempty(system.mechanical_range) ||
+            (flux .+= elimination.motion_solution * ComplexF64.(dense_solution[system.mechanical_range, :]))
+        Complex{T}.(bem_gamma), Complex{T}.(flux)
+    end
+    solve_split[:flux_reconstruction] = (time_ns() - flux_reconstruction_started) / 1.0e9
+    reconstruction_started = time_ns()
+    fem_pressure, fem_interior_residual = if reconstruct_interior
+        _backward_schur(
+            system.condensation,
+            interior_rhs,
+            retained_pressure;
+            motion_velocity=transducer_condensed ? solution[system.mechanical_range, :] : nothing,
+            motion_scale=transducer_condensed ? neumann_scale(system.density, system.omega) : nothing,
+        )
+    else
+        skipped = fill(
+            Complex{T}(T(NaN), T(NaN)),
+            system.condensation.interior_count + system.condensation.retained_count,
+            size(retained_pressure, 2),
+        )
+        skipped[system.condensation.retained_vertices, :] = retained_pressure
+        skipped, fill(T(NaN), size(retained_pressure, 2))
+    end
+    fem_reconstruction_s = (time_ns() - reconstruction_started) / 1.0e9
+    parts_started = time_ns()
+    solutions = [
         _solution_from_parts(
             system,
             fem_pressure[:, column],
             solution[system.bem_range, column],
-            solution[system.flux_range, column],
+            interface_flux[:, column],
             fem_interior_residual[column];
             diaphragm_velocity=solution[system.mechanical_range, column],
             voice_coil_current=solution[system.electrical_range, column],
             prescribed_bem_neumann=prescribed_bem_neumann[:, column],
+            fem_rhs_condensation_s=fem_rhs_condensation_s,
+            fem_reconstruction_s=fem_reconstruction_s,
+            solve_split=solve_split,
         )
         for column in axes(fem_pressure, 2)
     ]
+    # Shared by every solution of this call, so filled after they are built.
+    solve_split[:solution_parts] = (time_ns() - parts_started) / 1.0e9
+    return solutions
 end
 
 function solve_condensed_coupled_systems(system, radiator_tags; radiator_velocities=nothing)
