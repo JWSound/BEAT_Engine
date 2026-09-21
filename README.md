@@ -111,3 +111,8 @@ access the network. A listed backend may not work on the current machine. Client
 should retain the selected ID and let worker negotiation validate device/runtime
 availability and request compatibility at solve time. Preferences can therefore
 list the catalog immediately without probing or changing options by host.
+
+## Contributing and releases
+
+Use scoped PRs targeting `main`. See [contributing](CONTRIBUTING.md) and the
+[release process](docs/development.md). Stable releases are independent of main.
