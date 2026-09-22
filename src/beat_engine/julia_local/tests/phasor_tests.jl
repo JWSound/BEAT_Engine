@@ -43,6 +43,14 @@
                 rhs = assemble_burton_miller_rhs_cuda(mesh,p1,dp0,dq,k,rule;
                     device_cache=dc,singular_cache=sc,device_singular_cache=dsc)
                 @test Array(rhs) ≈ b*q rtol=3f-3 atol=3f-4
+                units = CUDA_MODULE.ones(ComplexF32, length(q))
+                mapping = assemble_burton_miller_rhs_cuda(mesh,p1,dp0,units,k,rule;
+                    device_cache=dc,singular_cache=sc,device_singular_cache=dsc,
+                    assemble_operator=true)
+                @test isapprox(Array(mapping), b; rtol=3f-3, atol=3f-4)
+                @test isapprox(Array(mapping * dq), Array(rhs); rtol=2f-5, atol=2f-6)
+                CUDA_MODULE.unsafe_free!(mapping)
+                CUDA_MODULE.unsafe_free!(units)
                 @test solve_burton_miller_system_cuda!(direct) ≈ p rtol=5f-3 atol=3f-4
                 gc = build_cuda_field_evaluation_cache(cache)
                 @test evaluate_galerkin_field_cuda(points,mesh,p,q,k,gc) ≈ field rtol=5f-4 atol=5f-5

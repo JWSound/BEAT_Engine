@@ -4,7 +4,8 @@
     return nothing
 end
 
-@inline function _cuda_bm_add_rhs!(rhs_re, rhs_im, row, slp_re, slp_im, adj_re, adj_im, q, inverse_k)
+@inline function _cuda_bm_add_rhs!(rhs_re, rhs_im, row, slp_re, slp_im, adj_re, adj_im, q, inverse_k, face=1)
+    row = ndims(rhs_re) == 2 ? row + (face - 1) * size(rhs_re, 1) : row
     coefficient_re = -slp_re + inverse_k * adj_im
     coefficient_im = -slp_im - inverse_k * adj_re
     q_re = real(q)
@@ -303,9 +304,9 @@ function _cuda_regular_kernel!(
             if direct_system
                 inverse_k = one(k) / k
                 q = q_neumann[trial_index]
-                _cuda_bm_add_rhs!(rhs_re, rhs_im, row1, slp1_re, slp1_im, adj1_re, adj1_im, q, inverse_k)
-                _cuda_bm_add_rhs!(rhs_re, rhs_im, row2, slp2_re, slp2_im, adj2_re, adj2_im, q, inverse_k)
-                _cuda_bm_add_rhs!(rhs_re, rhs_im, row3, slp3_re, slp3_im, adj3_re, adj3_im, q, inverse_k)
+                _cuda_bm_add_rhs!(rhs_re, rhs_im, row1, slp1_re, slp1_im, adj1_re, adj1_im, q, inverse_k, trial_index)
+                _cuda_bm_add_rhs!(rhs_re, rhs_im, row2, slp2_re, slp2_im, adj2_re, adj2_im, q, inverse_k, trial_index)
+                _cuda_bm_add_rhs!(rhs_re, rhs_im, row3, slp3_re, slp3_im, adj3_re, adj3_im, q, inverse_k, trial_index)
 
                 if !rhs_only
                     _cuda_bm_add_lhs!(system_re, system_im, row1 + (dlp_col1 - 1) * p1_dof_count, dlp11_re, dlp11_im, hyp11_re, hyp11_im, inverse_k)

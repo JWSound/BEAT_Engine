@@ -1,3 +1,6 @@
+include(joinpath(@__DIR__, "deploy_rhs_policy.jl"))
+const DEPLOY_RHS_CALIBRATION = Ref{Any}(nothing)
+
 const DEPLOY_BOUNDARY_STATE = Ref{Any}(nothing)
 const DEPLOY_GEOMETRY_STATE = Ref{Any}(nothing)
 
@@ -771,6 +774,13 @@ function solve_deploy_request_impl(
     rom_feedback_model_seconds = 0.0
     rom_feedback_upload_seconds = 0.0
     rom_feedback_rhs_seconds = 0.0
+    rom_rhs_operator = nothing
+    rom_rhs_operator_build_seconds = 0.0
+    rom_rhs_operator_apply_seconds = 0.0
+    rom_rhs_calibration_seconds = 0.0
+    rom_rhs_operator_used = false
+    rom_rhs_mode = String(get_value(request, "rom_feedback_mode", get(ENV, "BEAT_DEPLOY_ROM_FEEDBACK", "auto")))
+    rom_rhs_mode in ("auto", "matrix_free", "cached_operator") || error("Unknown Deploy ROM feedback mode.")
     rom_feedback_rhs_stage_seconds = Dict{String,Float64}()
     rom_feedback_preconditioner_seconds = 0.0
     rom_feedback_update_seconds = 0.0
@@ -921,6 +931,51 @@ function solve_deploy_request_impl(
                     cuda.synchronize()
                 end
                 try
+                    operator_bytes = sizeof(Complex{FloatType}) * length(mesh.vertices) * length(mesh.faces)
+                    profile = (length(mesh.vertices), length(mesh.faces), quadrature_order, singular_order,
+                        near_correction_cache.pair_count, ground_near_correction_cache.pair_count)
+                    prior = DEPLOY_RHS_CALIBRATION[]
+                    calibration = prior !== nothing && prior.profile == profile ? prior : nothing
+                    memory_fits = deploy_rhs_memory_fits(operator_bytes, cuda.free_memory())
+                    use_operator = memory_fits && (rom_rhs_mode == "cached_operator" ||
+                        (rom_rhs_mode == "auto" && deploy_use_rhs_operator(calibration, operator_bytes, cuda.free_memory())))
+                    build_feedback_operator = function(timings)
+                        operator_units = nothing
+                        try
+                            operator_units = cuda.ones(Complex{FloatType}, length(cached_q_neumann))
+                            rom_rhs_operator_build_seconds += @elapsed begin
+                                rom_rhs_operator = assemble_burton_miller_rhs_cuda(
+                                    mesh,
+                                    p1_space,
+                                    dp0_space,
+                                    operator_units,
+                                    k,
+                                    rule;
+                                    device_cache=device_cache,
+                                    singular_cache=singular_cache,
+                                    device_singular_cache=device_singular_cache,
+                                    device_image_singular_cache=device_image_singular_cache,
+                                    near_correction_cache=near_correction_cache,
+                                    device_near_correction_cache=device_near_correction_cache,
+                                    image_near_correction_cache=ground_near_correction_cache,
+                                    device_image_near_correction_cache=device_ground_near_correction_cache,
+                                    symmetry_mode=:ground,
+                                    timing=timings,
+                                    assemble_operator=true,
+                                )
+                            end
+                            return true
+                        catch err
+                            # A concurrent GPU user can consume memory after the budget check.
+                            if err isa OutOfMemoryError || nameof(typeof(err)) == :OutOfGPUMemoryError
+                                use_operator = false
+                                return false
+                            end
+                            rethrow()
+                        finally
+                            operator_units === nothing || cuda.unsafe_free!(operator_units)
+                        end
+                    end
                     apply_schur = function(candidate_pressure)
                         candidate_host = nothing
                         rom_feedback_pressure_download_seconds += @elapsed begin
@@ -943,24 +998,35 @@ function solve_deploy_request_impl(
                         try
                             rhs_stage_timings = Dict{String,Float64}()
                             rom_feedback_rhs_seconds += @elapsed begin
-                                feedback_rhs = assemble_burton_miller_rhs_cuda(
-                                    mesh,
-                                    p1_space,
-                                    dp0_space,
-                                    feedback_device,
-                                    k,
-                                    rule;
-                                    device_cache=device_cache,
-                                    singular_cache=singular_cache,
-                                    device_singular_cache=device_singular_cache,
-                                    device_image_singular_cache=device_image_singular_cache,
-                                    near_correction_cache=near_correction_cache,
-                                    device_near_correction_cache=device_near_correction_cache,
-                                    image_near_correction_cache=ground_near_correction_cache,
-                                    device_image_near_correction_cache=device_ground_near_correction_cache,
-                                    symmetry_mode=:ground,
-                                    timing=rhs_stage_timings,
-                                )
+                                if use_operator && rom_rhs_operator === nothing
+                                    build_feedback_operator(rhs_stage_timings)
+                                end
+                                if rom_rhs_operator === nothing
+                                    feedback_rhs = assemble_burton_miller_rhs_cuda(
+                                        mesh,
+                                        p1_space,
+                                        dp0_space,
+                                        feedback_device,
+                                        k,
+                                        rule;
+                                        device_cache=device_cache,
+                                        singular_cache=singular_cache,
+                                        device_singular_cache=device_singular_cache,
+                                        device_image_singular_cache=device_image_singular_cache,
+                                        near_correction_cache=near_correction_cache,
+                                        device_near_correction_cache=device_near_correction_cache,
+                                        image_near_correction_cache=ground_near_correction_cache,
+                                        device_image_near_correction_cache=device_ground_near_correction_cache,
+                                        symmetry_mode=:ground,
+                                        timing=rhs_stage_timings,
+                                    )
+                                else
+                                    rom_rhs_operator_used = true
+                                    rom_rhs_operator_apply_seconds += @elapsed begin
+                                        feedback_rhs = rom_rhs_operator * feedback_device
+                                        cuda.synchronize()
+                                    end
+                                end
                             end
                             for (name, seconds) in rhs_stage_timings
                                 normalized_name = if startswith(name, "rhs_")
@@ -1009,6 +1075,31 @@ function solve_deploy_request_impl(
                         rom_operator_applications,
                         rom_initial_relative_residual,
                     ) = gmres_result
+                    # Calibrate once on a successful matrix-free solve, using its actual
+                    # iteration count. The first solve pays this probe; later solves/sweep
+                    # frequencies choose from measured build/apply costs, not GPU constants.
+                    if rom_rhs_mode == "auto" && calibration === nothing && rom_operator_applications > 1 &&
+                       deploy_rhs_memory_fits(operator_bytes, cuda.free_memory())
+                        rom_rhs_calibration_seconds = @elapsed begin
+                            if build_feedback_operator(nothing)
+                                probe = nothing
+                                apply_seconds = try
+                                    @elapsed begin
+                                        probe = rom_rhs_operator * cached_q_neumann
+                                        cuda.synchronize()
+                                    end
+                                finally
+                                    probe === nothing || cuda.unsafe_free!(probe)
+                                end
+                                DEPLOY_RHS_CALIBRATION[] = (
+                                    profile=profile, build_s=rom_rhs_operator_build_seconds,
+                                    apply_s=apply_seconds,
+                                    direct_s=rom_feedback_rhs_seconds / rom_operator_applications,
+                                    applications=rom_operator_applications,
+                                )
+                            end
+                        end
+                    end
                     final_pressure_host = nothing
                     rom_final_pressure_download_seconds = @elapsed begin
                         final_pressure_host = Complex{FloatType}.(Array(rom_pressure))
@@ -1027,6 +1118,7 @@ function solve_deploy_request_impl(
                     end
                     rom_pressure
                 finally
+                    rom_rhs_operator === nothing || cuda.unsafe_free!(rom_rhs_operator)
                     cuda.unsafe_free!(preconditioned_rhs)
                 end
             elseif direct_cuda_assembly
@@ -1163,6 +1255,9 @@ function solve_deploy_request_impl(
                 ),
             )
             if rom_request
+                result["diagnostics"]["rom_feedback_mode"] = rom_rhs_operator_used ? "cached_operator" : "matrix_free"
+                result["diagnostics"]["rom_feedback_requested_mode"] = rom_rhs_mode
+                result["diagnostics"]["rom_rhs_operator_bytes"] = rom_rhs_operator_used ? sizeof(Complex{FloatType}) * length(mesh.vertices) * length(mesh.faces) : 0
                 result["diagnostics"]["rom_rank_per_sector"] = speaker_rom.rank
                 result["diagnostics"]["rom_sector_count"] = speaker_rom.sector_count
                 result["diagnostics"]["rom_symmetry"] = String(speaker_rom.symmetry)
@@ -1237,6 +1332,9 @@ function solve_deploy_request_impl(
                 "rom_feedback_model_s" => rom_feedback_model_seconds,
                 "rom_feedback_upload_s" => rom_feedback_upload_seconds,
                 "rom_feedback_rhs_s" => rom_feedback_rhs_seconds,
+                "rom_rhs_operator_build_s" => rom_rhs_operator_build_seconds,
+                "rom_rhs_operator_apply_s" => rom_rhs_operator_apply_seconds,
+                "rom_rhs_calibration_s" => rom_rhs_calibration_seconds,
                 "rom_feedback_rhs_other_s" => rom_feedback_rhs_other_seconds,
                 "rom_feedback_preconditioner_s" => rom_feedback_preconditioner_seconds,
                 "rom_feedback_update_s" => rom_feedback_update_seconds,
