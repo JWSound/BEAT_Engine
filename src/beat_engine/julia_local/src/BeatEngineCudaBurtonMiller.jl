@@ -41,6 +41,7 @@ function _cuda_bm_identity_kernel!(
     rhs_scale = area * inverse_k / typeof(area)(6)
     q = q_neumann[face_index]
     for row in (row1, row2, row3)
+        row = ndims(rhs_re) == 2 ? row + (face_index - 1) * size(rhs_re, 1) : row
         _cuda_atomic_add!(rhs_re, row, rhs_scale * imag(q))
         _cuda_atomic_add!(rhs_im, row, -rhs_scale * real(q))
     end
@@ -49,8 +50,8 @@ end
 
 function _cuda_bm_scale_rhs_kernel!(rhs_re, rhs_im, row_weights, dof_count)
     index = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    index > dof_count && return nothing
-    weight = row_weights[index]
+    index > length(rhs_re) && return nothing
+    weight = row_weights[mod1(index, dof_count)]
     rhs_re[index] *= weight
     rhs_im[index] *= weight
     return nothing
@@ -107,6 +108,7 @@ function _cuda_bm_correction_scatter_kernel!(
                 imag(adjoint),
                 q,
                 inverse_k,
+                dp0_cols[pair_index],
             )
         end
 
@@ -526,6 +528,7 @@ function assemble_burton_miller_rhs_cuda(
     device_image_near_correction_cache=nothing,
     symmetry_mode::Symbol=:off,
     timing=nothing,
+    assemble_operator::Bool=false,
 ) where {T<:AbstractFloat}
     k = outgoing_wavenumber(k)
     CUDA.functional() || error("Burton-Miller CUDA RHS assembly requested, but CUDA.functional() is false.")
@@ -548,11 +551,14 @@ function assemble_burton_miller_rhs_cuda(
     p1_count = p1_space.global_dof_count
     matrix_re = CUDA.zeros(T, 1)
     matrix_im = CUDA.zeros(T, 1)
-    rhs_re = CUDA.zeros(T, p1_count)
-    rhs_im = CUDA.zeros(T, p1_count)
-    rhs = nothing
+    storage = rhs_re = rhs_im = rhs = nothing
     succeeded = false
     try
+        # Interleaved storage exposes the matrix without a second full copy.
+        # With unit q, each column is the existing DP0-to-P1 RHS mapping.
+        storage = assemble_operator ? CUDA.zeros(T, 2, p1_count, dp0_space.global_dof_count) : nothing
+        rhs_re = assemble_operator ? view(storage, 1, :, :) : CUDA.zeros(T, p1_count)
+        rhs_im = assemble_operator ? view(storage, 2, :, :) : CUDA.zeros(T, p1_count)
         identity_transform = symmetry_transforms(:off; include_identity=true)[1]
         _cuda_timed_stage!(timing, "rhs_regular") do
             _launch_cuda_bm_regular_transform!(
@@ -625,7 +631,7 @@ function assemble_burton_miller_rhs_cuda(
             row_weights = CuArray(p1_symmetry_orbit_weights(mesh, symmetry_mode))
             try
                 threads = 256
-                blocks = cld(p1_count, threads)
+                blocks = cld(length(rhs_re), threads)
                 CUDA.@cuda threads=threads blocks=blocks _cuda_bm_scale_rhs_kernel!(
                     rhs_re, rhs_im, row_weights, p1_count,
                 )
@@ -636,7 +642,7 @@ function assemble_burton_miller_rhs_cuda(
         end
 
         _cuda_timed_stage!(timing, "rhs_complex_materialize") do
-            rhs = complex.(rhs_re, rhs_im)
+            rhs = assemble_operator ? reshape(reinterpret(Complex{T}, storage), p1_count, dp0_space.global_dof_count) : complex.(rhs_re, rhs_im)
             CUDA.synchronize()
         end
         succeeded = true
@@ -644,9 +650,13 @@ function assemble_burton_miller_rhs_cuda(
     finally
         CUDA.unsafe_free!(matrix_re)
         CUDA.unsafe_free!(matrix_im)
-        CUDA.unsafe_free!(rhs_re)
-        CUDA.unsafe_free!(rhs_im)
-        (!succeeded && rhs !== nothing) && CUDA.unsafe_free!(rhs)
+        if assemble_operator
+            (!succeeded && storage !== nothing) && CUDA.unsafe_free!(storage)
+        else
+            rhs_re === nothing || CUDA.unsafe_free!(rhs_re)
+            rhs_im === nothing || CUDA.unsafe_free!(rhs_im)
+            (!succeeded && rhs !== nothing) && CUDA.unsafe_free!(rhs)
+        end
     end
 end
 
