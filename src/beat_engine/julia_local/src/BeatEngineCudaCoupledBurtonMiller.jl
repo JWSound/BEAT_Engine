@@ -151,8 +151,9 @@ function _cuda_combined_kernel!(
                         inv_radius = one(k) / radius
                         phase = k * radius
                         green_scale = inv_radius / four_pi
-                        green_re = cos(phase) * green_scale
-                        green_im = sin(phase) * green_scale
+                        phase_sin, phase_cos = sincos(phase)
+                        green_re = phase_cos * green_scale
+                        green_im = phase_sin * green_scale
                         weight = tw * rw * jac_scale
                         weighted_re = green_re * weight
                         weighted_im = green_im * weight
@@ -394,8 +395,9 @@ function _cuda_combined_fused_kernel!(
                         inv_radius = one(k) / radius
                         phase = k * radius
                         green_scale = inv_radius / four_pi
-                        green_re = cos(phase) * green_scale
-                        green_im = sin(phase) * green_scale
+                        phase_sin, phase_cos = sincos(phase)
+                        green_re = phase_cos * green_scale
+                        green_im = phase_sin * green_scale
                         weight = tw * rw * jac_scale
                         weighted_re = green_re * weight
                         weighted_im = green_im * weight
