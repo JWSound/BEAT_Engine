@@ -6,6 +6,7 @@ using LinearAlgebra
 include(joinpath(@__DIR__, "contract_tests.jl"))
 include(joinpath(@__DIR__, "worker_cleanup_tests.jl"))
 include(joinpath(@__DIR__, "deploy_rhs_policy_tests.jl"))
+include(joinpath(@__DIR__, "exterior_rhs_policy_tests.jl"))
 include(joinpath(@__DIR__, "fixture_integrity_tests.jl"))
 
 include(joinpath(@__DIR__, "..", "src", "BeatEngineCore.jl"))
@@ -1543,6 +1544,98 @@ end
         )
         @test Array(symmetry_rhs_only) ≈ Array(symmetry_expected_rhs) rtol=5f-4 atol=5f-5
         CUDA_MODULE.unsafe_free!(symmetry_rhs_only)
+        # The fused and generic regular kernels agree to float32 rounding order,
+        # with images, image-singular corrections and the rhs-only launch, for the
+        # rule sizes production uses: order 1 (1 point), 2 (3) and 4 (6, the default).
+        for order in (1, 2, 4)
+            order_rule = triangle_rule(Float32, order)
+            order_cache = build_cuda_regular_assembly_cache(symmetry_mesh, order_rule; element_indices=symmetry_indices)
+            order_kwargs = (
+                device_cache=order_cache,
+                singular_cache=symmetry_singular_cache,
+                device_singular_cache=symmetry_cuda_singular_cache,
+                device_image_singular_cache=image_cache,
+                symmetry_mode=:xy,
+            )
+            by_kernel = map(("fused", "generic")) do kernel
+                withenv("BEAT_CUDA_BM_REGULAR_KERNEL" => kernel) do
+                    system = assemble_burton_miller_neumann_system_cuda(
+                        symmetry_mesh, symmetry_p1, symmetry_dp0, d_symmetry_q, k, order_rule; order_kwargs...,
+                    )
+                    rhs_only = assemble_burton_miller_rhs_cuda(
+                        symmetry_mesh, symmetry_p1, symmetry_dp0, d_symmetry_q, k, order_rule; order_kwargs...,
+                    )
+                    result = (matrix=Array(system.matrix), rhs=Array(system.rhs), rhs_only=Array(rhs_only))
+                    release_burton_miller_system_cuda!(system)
+                    CUDA_MODULE.unsafe_free!(rhs_only)
+                    result
+                end
+            end
+            @test length(order_rule.weights) == (order == 1 ? 1 : order == 2 ? 3 : 6)
+            @test by_kernel[1].matrix ≈ by_kernel[2].matrix rtol=2f-5 atol=2f-6
+            @test by_kernel[1].rhs ≈ by_kernel[2].rhs rtol=2f-5 atol=2f-6
+            @test by_kernel[1].rhs_only ≈ by_kernel[2].rhs_only rtol=2f-5 atol=2f-6
+        end
+        # The Spark-style path: x/xy images, image-singular corrections and row
+        # weights, with every excitation taken from the mapping in one assembly.
+        symmetry_units = CUDA_MODULE.ones(ComplexF32, symmetry_dp0.global_dof_count)
+        symmetry_operator_system = assemble_burton_miller_neumann_system_cuda(
+            symmetry_mesh,
+            symmetry_p1,
+            symmetry_dp0,
+            symmetry_units,
+            k,
+            rule;
+            device_cache=symmetry_cuda_cache,
+            singular_cache=symmetry_singular_cache,
+            device_singular_cache=symmetry_cuda_singular_cache,
+            device_image_singular_cache=image_cache,
+            symmetry_mode=:xy,
+            assemble_operator=true,
+        )
+        @test size(symmetry_operator_system.rhs) == (symmetry_p1.global_dof_count, symmetry_dp0.global_dof_count)
+        @test Array(symmetry_operator_system.matrix) ≈ Array(symmetry_direct_system.matrix) rtol=2f-5 atol=2f-6
+        @test Array(symmetry_operator_system.rhs * d_symmetry_q) ≈ Array(symmetry_direct_system.rhs) rtol=2f-5 atol=2f-6
+        release_burton_miller_system_cuda!(symmetry_operator_system)
+        CUDA_MODULE.unsafe_free!(symmetry_units)
+        symmetry_columns_q = zeros(ComplexF32, symmetry_dp0.global_dof_count, 3)
+        symmetry_columns_q[:, 1] = symmetry_q
+        symmetry_columns_q[:, 2] = ComplexF32.(range(-1, 1; length=symmetry_dp0.global_dof_count)) .* ComplexF32(0.3, -0.7)
+        symmetry_columns_q[end, 3] = ComplexF32(2, 1)
+        d_symmetry_columns_q = CUDA_MODULE.CuArray(symmetry_columns_q)
+        symmetry_columns_expected = (
+            -symmetry_operators.single_layer .-
+            coupling .* (
+                symmetry_operators.adjoint_double_layer .+
+                ComplexF32(0.5) .* symmetry_identity_cache.identity_p1_dp0
+            )
+        ) * d_symmetry_columns_q
+        symmetry_columns_rhs = Dict{Symbol,Matrix{ComplexF32}}()
+        for rhs_mode in (:cached_operator, :matrix_free)
+            columns_system = assemble_burton_miller_neumann_system_columns_cuda(
+                symmetry_mesh,
+                symmetry_p1,
+                symmetry_dp0,
+                d_symmetry_columns_q,
+                k,
+                rule;
+                rhs_mode=rhs_mode,
+                device_cache=symmetry_cuda_cache,
+                singular_cache=symmetry_singular_cache,
+                device_singular_cache=symmetry_cuda_singular_cache,
+                device_image_singular_cache=image_cache,
+                symmetry_mode=:xy,
+            )
+            @test columns_system.rhs_mode == rhs_mode
+            @test (columns_system.rhs_operator_bytes > 0) == (rhs_mode == :cached_operator)
+            @test Array(columns_system.matrix) ≈ Array(symmetry_expected_lhs) rtol=5f-4 atol=5f-5
+            symmetry_columns_rhs[rhs_mode] = Array(columns_system.rhs)
+            @test symmetry_columns_rhs[rhs_mode] ≈ Array(symmetry_columns_expected) rtol=5f-4 atol=5f-5
+            release_burton_miller_system_cuda!(columns_system)
+        end
+        @test symmetry_columns_rhs[:cached_operator] ≈ symmetry_columns_rhs[:matrix_free] rtol=2f-5 atol=2f-6
+        CUDA_MODULE.unsafe_free!(d_symmetry_columns_q)
+        CUDA_MODULE.unsafe_free!(symmetry_columns_expected)
         release_burton_miller_system_cuda!(symmetry_direct_system)
         CUDA_MODULE.unsafe_free!(symmetry_expected_lhs)
         CUDA_MODULE.unsafe_free!(symmetry_expected_rhs)
