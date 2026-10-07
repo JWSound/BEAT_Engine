@@ -1075,7 +1075,8 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     metal_field_batch = exterior_metal_field_output_batch(outputs, field_points_by_output, backend)
     mesh_setup_started = time_ns()
     bem_domain = aggregate_bem_region(meshes, unbounded_region, boundaries, FloatType)
-    mesh = snap_symmetry_planes(bem_domain.mesh, symmetry_mode)
+    symmetry_tolerance = symmetry_plane_tolerance(bem_domain.mesh.vertices)
+    mesh = snap_symmetry_planes(bem_domain.mesh, symmetry_mode; tolerance=symmetry_tolerance)
     validate_symmetry_fundamental_domain!(mesh, symmetry_mode)
     validate_compiled_ground_domain!(
         mesh, symmetry_mode;
@@ -1084,6 +1085,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     excitation_port_ids = String.(request["excitation_port_ids"])
     lumped = has_transducers ? exterior_motion_basis(
         system, excitation_port_ids, boundaries, bem_domain, mesh, unbounded_region, symmetry_mode,
+        symmetry_tolerance=symmetry_tolerance,
     ) : nothing
     excitations = has_transducers ? lumped.basis : exterior_excitations(
         excitation_port_ids,
@@ -1382,7 +1384,9 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 q = hcat(neumann_values...)
                 z = transpose(lumped.force) * p
                 network_solution = solve_exterior_lumped_network(
-                    z, lumped.transducers, excitations, port_objects, excitation_port_ids, omega, density, sound_speed,
+                    z, lumped.transducers, excitations, port_objects, excitation_port_ids,
+                    2pi * Float64(raw_frequency), Float64(unbounded_region["density_kg_per_m3"]),
+                    Float64(unbounded_region["sound_speed_m_per_s"]),
                     reference_voltage,
                 )
                 pressures = collect(eachcol(p * network_solution.velocity))

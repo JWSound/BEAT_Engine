@@ -345,15 +345,25 @@ Neumann data use the chosen precision; stored normals and areas are promoted
 without recomputation for Float64 motion/force arithmetic. LEM parameters and
 the small dense complex network remain Float64.
 
-CPU qualification on the 512-face slice-2 oscillating sphere measured mechanical
-Q=5.48 and Q=9.13 over 17 frequencies from 20 to 600 Hz, resolving the resonance,
+CPU qualification on the 512-face slice-2 oscillating sphere used bare mechanical
+Qms=5.48 and Qms=9.13 over 17 frequencies from 20 to 600 Hz, resolving the resonance,
 in both phasor conventions. Maximum pointwise complex relative Float32 drift
 across velocity, current, input impedance and three near/far pressure points was
 2.13e-6 (rounded up); maximum amplitude and phase differences were 1.02e-5 dB and
 0.000106 degrees. The optional three-step CPU LU refinement yielded a similar
 maximum; it refines the rounded Float32 operator, not the geometry or assembly.
-Both modes are below the qualification budget of 1e-2. These measurements qualify
-these drivers, not arbitrary resonant geometries; see
+Both modes are below the qualification budget of 1e-2; the public sphere regression
+uses a tighter 1e-4 budget. Electrical damping brings total Q to approximately 0.6.
+Near 58 Hz the sphere has low ka (approximately 0.1), and |Zrad| is approximately
+0.1 times |Ztotal|, including mechanical, electrical and radiation loading. BEM
+load error reaches velocity and current attenuated, with sensitivity scaling as
+|Zrad|/|Ztotal|. Transducer outputs inherit ideal-source Float32 BEM drift at
+acoustic resonances (the accepted example was approximately 6e-3 complex L2 at
+acoustic Q approximately 52, 0.05 dB, 0.41 degrees). For horn/waveguide-loaded
+drivers this drift can reach velocity, current and input impedance at full size.
+A Float64 CPU cross-check is recommended for resonant or acoustically loaded
+geometry; a Float64 network does not recover BEM accuracy. These measurements
+qualify the measured drivers; see
 [exterior transducer precision report](Exterior%20Transducer%20Precision.md) and
 `scripts/measure_exterior_transducer_precision.jl` for the full measurement set.
 `solver_options.transducer_reference_voltage_v`

@@ -23,6 +23,72 @@ function symmetry_request(file,mode,completion,orbit)
     r
 end
 
+function cap_plane(mesh,axis)
+    seam=findall(v -> iszero(v[axis]),mesh.vertices)
+    centre=sum(mesh.vertices[seam])/length(seam)
+    coordinates=filter(!=(axis),1:3)
+    sort!(seam;by=v -> atan((mesh.vertices[v]-centre)[coordinates[2]],
+        (mesh.vertices[v]-centre)[coordinates[1]]))
+    vertices=copy(mesh.vertices)
+    push!(vertices,centre)
+    faces=copy(mesh.faces)
+    for j in eachindex(seam)
+        a,b=seam[j],seam[mod1(j+1,length(seam))]
+        # Caps point out of the retained positive half-space.
+        if cross(vertices[a]-centre,vertices[b]-centre)[axis]>0
+            a,b=b,a
+        end
+        push!(faces,(a,b,length(vertices)))
+    end
+    BoundaryMesh(vertices,faces,fill(2,length(faces)))
+end
+
+@testset "image planes reject caps and unsnapped open seams" begin
+    full=sphere(0.1,SVector(0.,0.,0.),2;refinements=0)
+    for (mode,axes,copies) in (("x",(1,),2),("xy",(1,2),4))
+        reduced=cut_mesh(full,axes)
+        @test validate_exterior_transducer_surface!(reduced,Symbol(mode)) === nothing
+        if mode=="xy"
+            capped=cap_plane(cap_plane(reduced,1),2)
+            @test_throws "remove symmetry-plane caps" validate_exterior_transducer_surface!(capped,:xy)
+            mktemp() do path,io
+                mesh_file(io,capped)
+                @test_throws "active image plane" solve_request(symmetry_request(path,mode,copies,1))
+            end
+        end
+        for axis in axes
+            capped=cap_plane(reduced,axis)
+            @test_throws "remove symmetry-plane caps" validate_exterior_transducer_surface!(capped,Symbol(mode))
+            mktemp() do path,io
+                mesh_file(io,capped)
+                @test_throws "active image plane" solve_request(symmetry_request(path,mode,copies,1))
+            end
+            # 5e-7 lies between the old snapping and closure tolerances.
+            for T in (Float64,Float32)
+                displaced=BoundaryMesh([SVector{3,T}(ntuple(i ->
+                    i==axis && iszero(v[i]) ? 5e-7 : v[i],3)) for v in reduced.vertices],
+                    reduced.faces,reduced.physical_tags)
+                tolerance=symmetry_plane_tolerance(displaced.vertices)
+                @test tolerance < T(5e-7) < T(1e-6)
+                snapped=snap_symmetry_planes(displaced,Symbol(mode);tolerance=tolerance)
+                @test_throws "closed BEM surfaces" validate_exterior_transducer_surface!(snapped,Symbol(mode);tolerance=tolerance)
+                mktemp() do path,io
+                    mesh_file(io,displaced)
+                    r=symmetry_request(path,mode,copies,1)
+                    r["solver_options"]["precision"]=T===Float32 ? "float32" : "float64"
+                    @test_throws "closed BEM surfaces" solve_request(r)
+                end
+                near=BoundaryMesh([SVector{3,T}(ntuple(i ->
+                    i==axis && iszero(v[i]) ? tolerance/2 : v[i],3)) for v in reduced.vertices],
+                    reduced.faces,reduced.physical_tags)
+                @test_throws "closed BEM surfaces" validate_exterior_transducer_surface!(near,Symbol(mode);tolerance=tolerance)
+                @test validate_exterior_transducer_surface!(
+                    snap_symmetry_planes(near,Symbol(mode);tolerance=tolerance),Symbol(mode);tolerance=tolerance) === nothing
+            end
+        end
+    end
+end
+
 @testset "x/xy fractional sphere: exact cuts, LEM and mirrored fields" begin
     full=sphere(0.1,SVector(0.,0.,0.),2;refinements=2)
     mktemp() do fullpath,io

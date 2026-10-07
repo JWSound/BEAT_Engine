@@ -74,20 +74,26 @@ function exterior_impedance_matrix(mesh, pressures, excitations, components, tar
 end
 
 """Exterior transducers currently require closed, consistently outward-wound solids."""
-function validate_exterior_transducer_surface!(mesh, symmetry=:off; ground_tolerance=1e-6)
+function validate_exterior_transducer_surface!(mesh, symmetry=:off;
+    tolerance=symmetry_plane_tolerance(mesh.vertices))
     isempty(mesh.faces) && error("Exterior transducers require closed BEM surfaces.")
     planes = symmetry == :x ? (1,) : symmetry == :xy ? (1,2) : symmetry == :ground ? (2,) : ()
     edge_faces = Dict{Tuple{Int,Int},Vector{Tuple{Int,Int}}}()
     for (index, (a,b,c)) in enumerate(mesh.faces)
+        for axis in planes
+            all(abs(mesh.vertices[v][axis]) <= tolerance for v in (a,b,c)) || continue
+            error("Exterior transducer faces must not lie wholly on an active image plane ($(axis == 1 ? "X=0" : "Y=0")); remove symmetry-plane caps.")
+        end
         for (u,v) in ((a,b),(b,c),(c,a))
             push!(get!(edge_faces, minmax(u,v), Tuple{Int,Int}[]), (index, u < v ? 1 : -1))
         end
     end
     for ((u,v),entries) in edge_faces
-        # An active image plane closes a boundary edge. Every other edge
-        # still needs two opposite incidences; non-manifold edges fail.
+        # Reflection closes only seams exactly on the plane after snapping
+        # with the shared scale-dependent tolerance. Every other edge still
+        # needs two opposite incidences; non-manifold edges fail.
         image_edge = length(entries) == 1 && any(planes) do axis
-            abs(mesh.vertices[u][axis]) <= ground_tolerance && abs(mesh.vertices[v][axis]) <= ground_tolerance
+            iszero(mesh.vertices[u][axis]) && iszero(mesh.vertices[v][axis])
         end
         image_edge || (length(entries) == 2 && entries[1][2] == -entries[2][2]) ||
             error("Exterior transducers require closed BEM surfaces with consistent winding; open/two-sided diaphragms are unsupported.")
@@ -125,8 +131,9 @@ function validate_exterior_transducer_surface!(mesh, symmetry=:off; ground_toler
 end
 
 """All drivers first (compiled order), then requested ideal sources, once per component."""
-function exterior_motion_basis(system, requested_ports, boundaries, bem_domain, mesh, region, symmetry)
-    validate_exterior_transducer_surface!(mesh, symmetry)
+function exterior_motion_basis(system, requested_ports, boundaries, bem_domain, mesh, region, symmetry;
+    symmetry_tolerance=symmetry_plane_tolerance(mesh.vertices))
+    validate_exterior_transducer_surface!(mesh, symmetry; tolerance=symmetry_tolerance)
     # Float64 here preserves LEM parameters as well as BEM geometry. No FEM tags
     # are passed: the shared parser cannot resolve a boundary into another region.
     transducers, index_by_id = electrodynamic_transducers_from_wire(

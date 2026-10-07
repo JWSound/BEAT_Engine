@@ -2,13 +2,15 @@
 
 CPU direct-system assembly, quadrature and singular order 4, on the exact slice-2 oscillating sphere (radius 0.1 m, 512 faces, 258 nodes). Float32 is compared with Float64 using the same faceted geometry. This is a measurement report, not a numerical baseline.
 
-LEM: Re=6 ohm, Le=0.5 mH, Bl=7 N/A, Mmd=15 g, Cms=0.5 mm/N, voltage=2.83 V. Rms=1 or 0.6 N s/m gives bare mechanical Q=sqrt(Mmd/Cms)/Rms=5.48 or 9.13; electrical and radiation loading reduce the driven resonance Q.
+LEM: Re=6 ohm, Le=0.5 mH, Bl=7 N/A, Mmd=15 g, Cms=0.5 mm/N, voltage=2.83 V. Rms=1 or 0.6 N s/m gives bare mechanical Qms=sqrt(Mmd/Cms)/Rms=5.48 or 9.13. With electrical damping the total Q is approximately 0.6; these Qms values do not describe a high-Q acoustic resonance.
+
+Near 58 Hz this sphere is in the low-ka regime (ka approximately 0.1), with |Zrad| approximately 0.1 times |Ztotal|, where Ztotal includes mechanical, electrical and radiation loading. BEM load error therefore reaches velocity and current attenuated: its sensitivity scales as |Zrad|/|Ztotal|. The small errors below do not bound acoustically resonant or strongly loaded drivers.
 
 Frequencies (Hz): 20, 35, 40, 45, 48, 50, 52, 54, 56, 58, 60, 62, 65, 70, 80, 100, 600. The 2 Hz spacing around resonance resolves the bare mechanical resonance at 58.1 Hz and the radiation-loaded resonance below it. Pressure points (m): (0,0,0.15), (0,0,2), (1,0,2).
 
 Each entry reports the maximum over frequencies and, for pressure, all three points. Complex relative error is pointwise abs(test/reference - 1); dB and degrees are absolute amplitude-ratio and principal phase-ratio differences. Both phasor conventions were measured. LU refinement requests up to three Float64-residual corrections of the rounded Float32 operator. Every refined solve stopped after one correction. It cannot recover assembly or geometry error.
 
-| Phasor | Q | Refinement requested | Quantity | Max complex relative | Max dB | Max degrees |
+| Phasor | Bare Qms | Refinement requested | Quantity | Max complex relative | Max dB | Max degrees |
 |---|---:|---:|---|---:|---:|---:|
 | exp(+i omega t) | 5.47723 | 0 | u | 1.18938065e-07 | 4.91282364e-07 | 6.77665675e-06 |
 | exp(+i omega t) | 5.47723 | 0 | i | 8.73367232e-07 | 3.78445305e-06 | 4.33685681e-05 |
@@ -44,5 +46,7 @@ Each entry reports the maximum over frequencies and, for pressure, all three poi
 | exp(-i omega t) | 9.12871 | 3 | pressure | 1.66325922e-06 | 1.00552654e-05 | 9.52477678e-05 |
 
 Decision: every measured point is below 1e-2 complex relative error. Float32 is allowed, backend precision defaults are preserved, and Metal exterior transducers are enabled with the network kept in Float64. CUDA and ROCm are unqualified. This scope does not establish accuracy for arbitrary higher-Q geometries.
+
+Transducer outputs inherit the ideal-source Float32 BEM drift at acoustic resonances. The accepted ideal-source example had approximately 6e-3 complex L2 drift at acoustic Q approximately 52 (0.05 dB, 0.41 degrees). With sensitivity scaling as |Zrad|/|Ztotal|, that drift can reach velocity, current and input impedance at full size for horn/waveguide-loaded drivers. A Float64 host network cannot recover BEM assembly or geometry accuracy. A Float64 CPU cross-check is recommended for resonant or acoustically loaded geometry. The public sphere regression uses a 1e-4 budget, providing margin above the measured 2.13e-6 maximum; the general qualification decision remains 1e-2.
 
 Reproduce through the compute broker using `julia --threads=2 --startup-file=no --project=src/beat_engine/julia_local scripts/measure_exterior_transducer_precision.jl`. The script prints every per-frequency metric as JSON. Public-path regression coverage is in `exterior_transducer_precision_tests.jl`; Metal hardware coverage is in `exterior_transducer_metal_tests.jl`.
