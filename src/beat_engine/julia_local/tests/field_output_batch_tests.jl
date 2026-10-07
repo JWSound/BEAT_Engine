@@ -30,7 +30,8 @@ function field_outputs()
         field_output("one", [[1.0, -0.0, 0.0]]),
         field_output("polar", polar),
         field_output("interface", [[0.0, 0.0, 2.0]]; quantity="interface_radiated_pressure"),
-        Dict("id" => "boundary", "quantity" => "bem_boundary_pressure", "target_ids" => []),
+        Dict("id" => "boundary", "quantity" => "bem_boundary_pressure", "target_ids" => [],
+             "options" => Dict{String,Any}()),
         field_output("sphere", sphere),
         field_output("repeat", reverse(polar)),
     ]))
@@ -132,6 +133,7 @@ end
                                                                               Dict("real" => 0.5, "imag" => -0.1)]])))
                     end
                     request["outputs"] = outputs
+                    @test Driver.BeatEngineContract.validate_system_request(request) === nothing
                     run = Driver.solve_coupled_workload(request)
                     @test !run.outcome.cancelled && run.outcome.solved_count == 2
                     @test length(run.results) == 2
