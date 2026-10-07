@@ -236,6 +236,106 @@ function _evaluate_galerkin_field_metal_fast(
     return result
 end
 
+# Enqueue only: callers own the buffers and wait before reading or freeing them.
+# Keeping this separate also lets the hardware gate poison and reuse the work buffers.
+function _metal_fast_field_outputs!(d_potentials, d_partials, d_eval_points, d_weights4,
+                                    d_pressure, d_neumann, point_counts, chunk_counts,
+                                    k::Float32, cache::MetalFieldEvaluationCache{Float32})
+    tables = _metal_fast_field_tables_for(cache)
+    groupsize = 128
+    _metal_launch(
+        _metal_fast_field_sources_kernel!,
+        cache.source_count,
+        d_weights4, d_pressure, d_neumann, cache.source_weights, cache.source_faces, cache.source_elements,
+        cache.basis_values, Int32(cache.source_count);
+        groupsize=groupsize,
+    )
+    point_offset = 0
+    partial_offset = 0
+    for (point_count, chunk_count) in zip(point_counts, chunk_counts)
+        point_count == 0 && continue
+        # Preserve the original n_i × 3 argument type as well as its linear layout.
+        points = reshape(view(d_eval_points, 3 * point_offset + 1:3 * (point_offset + point_count)), point_count, 3)
+        potentials = view(d_potentials, point_offset + 1:point_offset + point_count)
+        partials = chunk_count == 1 ? potentials :
+            view(d_partials, partial_offset + 1:partial_offset + point_count * chunk_count)
+        chunk_length = cld(cache.source_count, chunk_count)
+        _metal_launch(
+            _metal_fast_field_kernel!,
+            point_count * chunk_count,
+            partials, points, tables.points4, tables.normals4, d_weights4, k,
+            Int32(cache.source_count), Int32(point_count), Int32(chunk_length), Int32(chunk_count), Val(1);
+            groupsize=groupsize,
+        )
+        if chunk_count > 1
+            _metal_launch(
+                _metal_field_reduce_partials_kernel!,
+                point_count,
+                potentials, partials, point_count, chunk_count;
+                groupsize=groupsize,
+            )
+            partial_offset += point_count * chunk_count
+        end
+        point_offset += point_count
+    end
+    return nothing
+end
+
+"""
+    evaluate_galerkin_field_metal_outputs(point_sets, pressure, neumann, k, cache)
+
+Evaluate one Float32 excitation at several outputs with one sources pass and wait.
+Each output retains its own source partition and the single-drive kernels used by
+`evaluate_galerkin_field_metal`, including the unreduced result when chunks == 1.
+"""
+function evaluate_galerkin_field_metal_outputs(point_sets, pressure, neumann, k::Float32,
+                                               cache::MetalFieldEvaluationCache{Float32})
+    k = outgoing_wavenumber(k)
+    point_counts = length.(point_sets)
+    point_count = sum(point_counts)
+    point_count == 0 && return [ComplexF32[] for _ in point_sets]
+    _require_metal!()
+    chunk_counts = [n == 0 ? 1 : _metal_field_chunk_count(n, cache.source_count) for n in point_counts]
+    # Each block is vec(n_i × 3), not a column of a concatenated n_total × 3 matrix.
+    points = Vector{Float32}(undef, 3 * point_count)
+    point_offset = 0
+    for (eval_points, n) in zip(point_sets, point_counts)
+        points[3 * point_offset + 1:3 * (point_offset + n)] = vec(_metal_eval_point_arrays(eval_points, Float32))
+        point_offset += n
+    end
+    d_eval_points = MtlArray(points)
+    pressure_on_device = pressure isa MtlArray
+    neumann_on_device = neumann isa MtlArray
+    d_pressure = pressure_on_device ? pressure : MtlArray(ComplexF32.(pressure))
+    d_neumann = neumann_on_device ? neumann : MtlArray(ComplexF32.(neumann))
+    d_weights4 = MtlArray{_MetalFloat4}(undef, cache.source_count)
+    partial_count = sum((n * c for (n, c) in zip(point_counts, chunk_counts) if c > 1); init=0)
+    # The fast kernel writes every partial, even for empty source chunks; the
+    # same kernel (chunks == 1) or the original reducer writes every potential.
+    d_partials = MtlArray{ComplexF32}(undef, partial_count)
+    d_potentials = MtlArray{ComplexF32}(undef, point_count)
+    try
+        _metal_fast_field_outputs!(d_potentials, d_partials, d_eval_points, d_weights4,
+            d_pressure, d_neumann, point_counts, chunk_counts, k, cache)
+        Metal.synchronize()
+        host = Array(d_potentials)
+        results = Vector{Vector{ComplexF32}}(undef, length(point_counts))
+        point_offset = 0
+        for (index, n) in enumerate(point_counts)
+            results[index] = host[point_offset + 1:point_offset + n]
+            point_offset += n
+        end
+        return results
+    finally
+        Metal.unsafe_free!(d_eval_points)
+        pressure_on_device || Metal.unsafe_free!(d_pressure)
+        neumann_on_device || Metal.unsafe_free!(d_neumann)
+        Metal.unsafe_free!(d_weights4)
+        Metal.unsafe_free!(d_partials)
+        Metal.unsafe_free!(d_potentials)
+    end
+end
+
 function _metal_fast_field_pass(eval_points, pressures, neumanns, k::Float32, cache::MetalFieldEvaluationCache)
     nd = length(pressures)
     point_count = length(eval_points)

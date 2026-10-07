@@ -962,8 +962,8 @@ function parse_field_output_points(outputs, ::Type{T}) where {T<:AbstractFloat}
 end
 
 # Only batch kernels whose per-point source reduction is independent of the
-# observation count. Metal chooses source chunks from that count, so retain its
-# per-output calls even when BLAB_METAL_FIELD_CHUNKS happens to be fixed.
+# observation count. Metal chooses source chunks from that count, so its separate
+# output batching helper below retains each output's point count.
 function exterior_field_output_batch(outputs, points_by_output::Dict{String,Vector{SVector{3,T}}}, backend) where {T<:AbstractFloat}
     backend == :metal && return nothing
     points = SVector{3,T}[]
@@ -976,6 +976,20 @@ function exterior_field_output_batch(outputs, points_by_output::Dict{String,Vect
         ranges[id] = first_point:length(points)
     end
     return (; points, ranges)
+end
+
+function exterior_metal_field_output_batch(outputs, points_by_output::Dict{String,Vector{SVector{3,T}}}, backend) where {T<:AbstractFloat}
+    backend == :metal && T === Float32 &&
+        isdefined(BeatEngineCore, :_evaluate_galerkin_field_metal_fast) || return nothing
+    point_sets = Vector{SVector{3,T}}[]
+    indices = Dict{String,Int}()
+    for output in outputs
+        String(output["quantity"]) == "exterior_pressure" || continue
+        id = String(output["id"])
+        push!(point_sets, points_by_output[id])
+        indices[id] = length(point_sets)
+    end
+    return (; point_sets, indices)
 end
 
 function solve_exterior_request(request, system, unbounded_region; event_mode=false)
@@ -1024,6 +1038,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     outputs = get(request, "outputs", Any[])
     field_points_by_output = parse_field_output_points(outputs, FloatType)
     field_batch = exterior_field_output_batch(outputs, field_points_by_output, backend)
+    metal_field_batch = exterior_metal_field_output_batch(outputs, field_points_by_output, backend)
     mesh_setup_started = time_ns()
     bem_domain = aggregate_bem_region(meshes, unbounded_region, boundaries, FloatType)
     mesh = snap_symmetry_planes(bem_domain.mesh, symmetry_mode)
@@ -1343,25 +1358,34 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 quantity = String(output["quantity"])
                 if quantity == "exterior_pressure"
                     field_started = time_ns()
-                    if field_batch === nothing || batched_fields === nothing
-                        points = field_batch === nothing ?
-                            field_points_by_output[String(output["id"])] : field_batch.points
-                        evaluated = [
-                            exterior_field(
-                                points,
-                                mesh,
-                                pressure,
-                                neumann,
-                                wavenumber,
-                                selected_field_cache,
-                                backend;
-                                cpu_kernel=backend == :cpu ? BeatEngineCore.beat_cpu_field_kernel() : :scalar,
-                            ) for (pressure, neumann) in zip(pressures, neumann_values)
-                        ]
-                        field_batch === nothing || (batched_fields = evaluated)
+                    if metal_field_batch !== nothing
+                        if batched_fields === nothing
+                            batched_fields = [evaluate_galerkin_field_metal_outputs(
+                                metal_field_batch.point_sets, pressure, neumann, wavenumber,
+                                selected_field_cache) for (pressure, neumann) in zip(pressures, neumann_values)]
+                        end
+                        values = [field[metal_field_batch.indices[String(output["id"])]] for field in batched_fields]
+                    else
+                        if field_batch === nothing || batched_fields === nothing
+                            points = field_batch === nothing ?
+                                field_points_by_output[String(output["id"])] : field_batch.points
+                            evaluated = [
+                                exterior_field(
+                                    points,
+                                    mesh,
+                                    pressure,
+                                    neumann,
+                                    wavenumber,
+                                    selected_field_cache,
+                                    backend;
+                                    cpu_kernel=backend == :cpu ? BeatEngineCore.beat_cpu_field_kernel() : :scalar,
+                                ) for (pressure, neumann) in zip(pressures, neumann_values)
+                            ]
+                            field_batch === nothing || (batched_fields = evaluated)
+                        end
+                        values = field_batch === nothing ? evaluated :
+                            [field[field_batch.ranges[String(output["id"])]] for field in batched_fields]
                     end
-                    values = field_batch === nothing ? evaluated :
-                        [field[field_batch.ranges[String(output["id"])]] for field in batched_fields]
                     push!(
                         quantities,
                         quantity_wire(
@@ -2720,6 +2744,7 @@ function solve_request_impl(request; event_mode=false)
     outputs = get(request, "outputs", Any[])
     field_points_by_output = parse_field_output_points(outputs, FloatType)
     field_batch = exterior_field_output_batch(outputs, field_points_by_output, bem_backend)
+    metal_field_batch = exterior_metal_field_output_batch(outputs, field_points_by_output, bem_backend)
     mesh_setup_started = time_ns()
     fem_domains = aggregate_fem_domains(
         meshes,
@@ -3413,18 +3438,27 @@ function solve_request_impl(request; event_mode=false)
                                   get(options, "excitation_weights", Any[]) :
                                   raw_weight_sweep[frequency_index]
                     if isempty(raw_weights)
-                        if field_batch === nothing || batched_fields === nothing
-                            evaluation_points = field_batch === nothing ? points : field_batch.points
-                            evaluated = [
-                                exterior_field(evaluation_points, bem_mesh,
-                                    solution.bem_pressure, solution.bem_neumann,
-                                    coupled_system.wavenumber, coupled_system.field_cache, bem_backend)
-                                for solution in solutions
-                            ]
-                            field_batch === nothing || (batched_fields = evaluated)
+                        if metal_field_batch !== nothing
+                            if batched_fields === nothing
+                                batched_fields = [evaluate_galerkin_field_metal_outputs(
+                                    metal_field_batch.point_sets, solution.bem_pressure, solution.bem_neumann,
+                                    coupled_system.wavenumber, coupled_system.field_cache) for solution in solutions]
+                            end
+                            pressures = [field[metal_field_batch.indices[String(output["id"])]] for field in batched_fields]
+                        else
+                            if field_batch === nothing || batched_fields === nothing
+                                evaluation_points = field_batch === nothing ? points : field_batch.points
+                                evaluated = [
+                                    exterior_field(evaluation_points, bem_mesh,
+                                        solution.bem_pressure, solution.bem_neumann,
+                                        coupled_system.wavenumber, coupled_system.field_cache, bem_backend)
+                                    for solution in solutions
+                                ]
+                                field_batch === nothing || (batched_fields = evaluated)
+                            end
+                            pressures = field_batch === nothing ? evaluated :
+                                [field[field_batch.ranges[String(output["id"])]] for field in batched_fields]
                         end
-                        pressures = field_batch === nothing ? evaluated :
-                            [field[field_batch.ranges[String(output["id"])]] for field in batched_fields]
                         push!(
                             quantities,
                             quantity_wire(
