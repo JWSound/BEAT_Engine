@@ -141,6 +141,7 @@ function precompile_workload()
     finally
         rm(directory; force=true, recursive=true)
     end
+    precompile_exterior_transducer_workload()
     # CPU BEM assembly avoids a GPU launch during image generation. Resolve
     # the Metal condensed defaults explicitly, including sequential MUMPS.
     precompile_coupled_workload(; tiny=false, mumps=true)

@@ -804,6 +804,8 @@ function exterior_excitations(ports, components, boundaries, boundary_tag_by_id,
 end
 
 function exterior_neumann(mesh, excitation, density::T, omega::T) where {T<:AbstractFloat}
+    motion = get(excitation, :bem_normal_velocity, nothing)
+    motion === nothing || return neumann_scale(density, omega) .* T.(motion)
     values = zeros(Complex{T}, length(mesh.faces))
     for (tag, amplitude) in zip(excitation.tags, excitation.amplitudes)
         for face_index in eachindex(mesh.faces)
@@ -1035,10 +1037,9 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     FloatType = precision_name == "float64" ? Float64 : precision_name == "float32" ? Float32 :
                 error("Exterior precision must be float32 or float64.")
     has_transducers = any(component["kind"] == "electrodynamic_transducer" for component in components)
-    has_transducers && FloatType !== Float64 && error("Exterior electrodynamic_transducers require float64 BEM precision.")
     backend = Symbol(lowercase(String(get(options, "bem_backend", "cpu"))))
     backend in (:cpu, :cuda, :rocm, :metal) || error("Exterior BEM backend must be cpu, cuda, rocm, or metal.")
-    has_transducers && backend == :metal && error(
+    has_transducers && backend == :metal && FloatType === Float64 && error(
         "Exterior electrodynamic_transducers cannot use Metal: float64 BEM is unsupported; use CPU.",
     )
     reference_voltage = Float64(get(options, "transducer_reference_voltage_v", DEFAULT_TRANSDUCER_REFERENCE_VOLTAGE_V))
@@ -1204,7 +1205,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     produce_metal_system = function (index)
         omega = FloatType(2pi) * FloatType(frequencies_hz[index])
         wavenumber = omega / sound_speed
-        # Metal is ideal-only: preserve the precompiled producer/generator captures.
+        # Face motion travels in each excitation, preserving the ideal producer/generator captures.
         neumann_values = [exterior_neumann(mesh, excitation, density, omega) for excitation in excitations]
         system, assembly_s = assemble_exterior_direct_metal(
             mesh, p1_space, dp0_space, neumann_values, wavenumber, base_rule; metal_fused_kwargs...,

@@ -337,13 +337,26 @@ and unadvertised.
 
 Transducers use the coupled path's LEM parameter names, rigid-translation axis,
 boundary signs/weights, optional semi-inductance and optional sealed rear chamber.
-Only BEM tags in the active exterior region may be attached. BEM precision must
-be explicitly `float64` (the exterior default is still float32, which is refused
-here). CPU is the qualified backend for exterior transducers. Metal is explicitly
-refused: Apple GPU BEM supports Float32 only. CUDA and ROCm use generic floating
-types and can represent Float64; their exterior transducer paths remain
-unqualified by hardware gates in this slice. Geometry, motion/force operators,
-LEM parameters and the small dense complex network all use Float64. `solver_options.transducer_reference_voltage_v`
+Only BEM tags in the active exterior region may be attached. Float32 and Float64
+BEM precision are allowed; each backend keeps its existing precision default.
+Metal supports Float32 BEM only. CUDA and ROCm remain unqualified for exterior
+transducers because no matching hardware gate has been run. BEM geometry and
+Neumann data use the chosen precision; stored normals and areas are promoted
+without recomputation for Float64 motion/force arithmetic. LEM parameters and
+the small dense complex network remain Float64.
+
+CPU qualification on the 512-face slice-2 oscillating sphere measured mechanical
+Q=5.48 and Q=9.13 over 17 frequencies from 20 to 600 Hz, resolving the resonance,
+in both phasor conventions. Maximum pointwise complex relative Float32 drift
+across velocity, current, input impedance and three near/far pressure points was
+2.13e-6 (rounded up); maximum amplitude and phase differences were 1.02e-5 dB and
+0.000106 degrees. The optional three-step CPU LU refinement yielded a similar
+maximum; it refines the rounded Float32 operator, not the geometry or assembly.
+Both modes are below the qualification budget of 1e-2. These measurements qualify
+these drivers, not arbitrary resonant geometries; see
+[exterior transducer precision report](Exterior%20Transducer%20Precision.md) and
+`scripts/measure_exterior_transducer_precision.jl` for the full measurement set.
+`solver_options.transducer_reference_voltage_v`
 defines voltage-port amplitude (default 2.83 V, finite and positive, validated
 before solving in both contract validators). This is the phasor voltage directly: the worker does not insert a square-root-of-two factor.
 
@@ -407,20 +420,28 @@ single nonzero volume flow. No absolute-value substitution for S is valid.
 
 ### Current physical limits and compatibility gates
 
-Exterior transducers support **off and rigid ground** symmetry in this slice.
+Exterior transducers support **off, x, xy and rigid ground** symmetry.
 Ground has completion=orbit=1 and contributes an image only to the Green function.
-`x` and `xy` transducer symmetry are explicitly refused and deferred to the next
-slice; the existing coupled completion×orbit rule alone does not qualify them.
-Ideal-only x/xy support is retained.
+For x/xy, the existing image Green function reconstructs an even drive on all
+backends. Each motion axis must lie in every active symmetry plane, including
+planes that generate whole-driver orbit copies. The coupled parser's rule
+`surface_completion_factor * physical_driver_orbit_count = reduction_factor`
+applies (2 for x, 4 for xy). Completion enters the force integration only; orbit
+enters the published matrix row weights only. Effective area includes all real
+copies. Driving one member of a mirrored pair independently cannot be represented
+by this even symmetry sector: submit that drive with symmetry off.
 
 The exterior BEM mesh must consist of closed, consistently outward-wound solids.
 The worker checks two oppositely oriented incidences per edge and positive signed
-volume per connected shell. In ground mode, a single-incidence edge is allowed
-when both endpoints lie on Y=0 (within the ground tolerance of 1e-6 m): the
-reflected surface supplies the other incidence and closes the solid. Signed
-volume is computed about an origin on Y=0, so a virtual ground cap contributes
-zero and the reflected solid has twice the positive half-solid volume. Ground
+volume per connected shell. A single-incidence edge is allowed when both endpoints
+lie on one active image plane (X=0 for x; X=0 or Y=0 for xy; Y=0 for ground,
+within 1e-6 m). Reflection supplies the other incidence. Signed volume is computed
+about an origin in all active planes, so virtual caps contribute zero. Ground
 triangles lying flat on Y=0 remain refused because they coincide with their images.
+The symmetry gate uses exact plane cuts of the same mirrored sphere triangles,
+with a fixed 1e-6 relative budget for load, velocity, current, input impedance and
+mirrored fields in both phasor conventions. It also checks whole-driver orbits and
+mixed completion/orbit accounting with a signed moving patch.
 
 Connectivity uses vertex indices, not geometric welding. Multiple independent
 closed meshes are accepted, but adjoining meshes with unwelded seams can be

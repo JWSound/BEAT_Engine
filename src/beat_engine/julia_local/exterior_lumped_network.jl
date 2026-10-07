@@ -76,6 +76,7 @@ end
 """Exterior transducers currently require closed, consistently outward-wound solids."""
 function validate_exterior_transducer_surface!(mesh, symmetry=:off; ground_tolerance=1e-6)
     isempty(mesh.faces) && error("Exterior transducers require closed BEM surfaces.")
+    planes = symmetry == :x ? (1,) : symmetry == :xy ? (1,2) : symmetry == :ground ? (2,) : ()
     edge_faces = Dict{Tuple{Int,Int},Vector{Tuple{Int,Int}}}()
     for (index, (a,b,c)) in enumerate(mesh.faces)
         for (u,v) in ((a,b),(b,c),(c,a))
@@ -83,11 +84,12 @@ function validate_exterior_transducer_surface!(mesh, symmetry=:off; ground_toler
         end
     end
     for ((u,v),entries) in edge_faces
-        # The ground image closes a boundary edge on Y=0. Every other edge
+        # An active image plane closes a boundary edge. Every other edge
         # still needs two opposite incidences; non-manifold edges fail.
-        ground_edge = symmetry == :ground && length(entries) == 1 &&
-            abs(mesh.vertices[u][2]) <= ground_tolerance && abs(mesh.vertices[v][2]) <= ground_tolerance
-        ground_edge || (length(entries) == 2 && entries[1][2] == -entries[2][2]) ||
+        image_edge = length(entries) == 1 && any(planes) do axis
+            abs(mesh.vertices[u][axis]) <= ground_tolerance && abs(mesh.vertices[v][axis]) <= ground_tolerance
+        end
+        image_edge || (length(entries) == 2 && entries[1][2] == -entries[2][2]) ||
             error("Exterior transducers require closed BEM surfaces with consistent winding; open/two-sided diaphragms are unsupported.")
     end
     neighbours = [Int[] for _ in mesh.faces]
@@ -102,9 +104,9 @@ function validate_exterior_transducer_surface!(mesh, symmetry=:off; ground_toler
         stack = [seed]
         seen[seed] = true
         origin = mesh.vertices[first(mesh.faces[seed])]
-        # A virtual cap on Y=0 contributes zero volume about this origin;
-        # reflection gives twice this positive half-solid volume.
-        symmetry == :ground && (origin = typeof(origin)(origin[1], 0, origin[3]))
+        # Virtual caps on active planes contribute zero signed volume
+        # about an origin in all those planes.
+        origin = typeof(origin)(ntuple(i -> i in planes ? 0 : origin[i], 3))
         volume = 0.0
         while !isempty(stack)
             index = pop!(stack)
@@ -124,7 +126,6 @@ end
 
 """All drivers first (compiled order), then requested ideal sources, once per component."""
 function exterior_motion_basis(system, requested_ports, boundaries, bem_domain, mesh, region, symmetry)
-    symmetry in (:off, :ground) || error("Exterior electrodynamic_transducers support only off and ground symmetry.")
     validate_exterior_transducer_surface!(mesh, symmetry)
     # Float64 here preserves LEM parameters as well as BEM geometry. No FEM tags
     # are passed: the shared parser cannot resolve a boundary into another region.
@@ -132,6 +133,10 @@ function exterior_motion_basis(system, requested_ports, boundaries, bem_domain, 
         system["components"], boundaries, Dict{String,Int}(), bem_domain.boundary_tag_by_id,
         nothing, mesh, Float64, symmetry,
     )
+    planes = symmetry == :x ? (1,) : symmetry == :xy ? (1,2) : ()
+    for t in transducers, axis in planes
+        abs(t.motion_axis[axis]) <= 1e-8 || error("Exterior motion_axis must lie in every active symmetry plane.")
+    end
     basis = NamedTuple[]
     for (index,t) in enumerate(transducers)
         push!(basis, (component_id=t.id, tags=t.bem_boundary_tags, amplitudes=t.bem_motion_signs,
@@ -153,9 +158,21 @@ function exterior_motion_basis(system, requested_ports, boundaries, bem_domain, 
     ideals = exterior_excitations(ideal_ports, (ports=system["excitation_ports"],items=system["components"]),
         boundaries,bem_domain.boundary_tag_by_id,region,symmetry,Float64)
     append!(basis,ideals)
-    operators = assemble_bem_transducer_operators(mesh,transducers)
+    force_mesh = exterior_force_mesh(mesh)
+    operators = assemble_bem_transducer_operators(force_mesh,transducers)
+    for index in eachindex(transducers)
+        basis[index] = merge(basis[index], (bem_normal_velocity=Vector(operators.bem_normal_velocity[:,index]),))
+    end
     force = exterior_basis_force_matrix(mesh,basis,operators,symmetry)
     return (; basis, transducers, operators, force)
+end
+
+# Promote stored geometry, without recomputing rounded Float32 normals or areas.
+exterior_force_mesh(mesh::BoundaryMesh{Float64}) = mesh
+function exterior_force_mesh(mesh::BoundaryMesh)
+    BoundaryMesh{Float64}(SVector{3,Float64}.(mesh.vertices), mesh.faces, mesh.physical_tags,
+        SVector{3,Float64}.(mesh.centroids), SVector{3,Float64}.(mesh.normals), Float64.(mesh.areas),
+        [ntuple(i -> SVector{3,Float64}(face[i]), 3) for face in mesh.face_vertices])
 end
 
 function exterior_basis_force_matrix(mesh, basis, operators, symmetry)
@@ -181,7 +198,8 @@ end
 function exterior_basis_neumann(mesh, e, density, omega, operators)
     get(e,:kind,"ideal_velocity_source") == "electrodynamic_transducer" ||
         return exterior_neumann(mesh,e,density,omega)
-    return neumann_scale(density,omega) .* Vector(operators.bem_normal_velocity[:,e.transducer_index])
+    T = typeof(density)
+    return neumann_scale(density,omega) .* T.(Vector(operators.bem_normal_velocity[:,e.transducer_index]))
 end
 
 # Keep transducer-only captures out of the ideal-path generator inventory.

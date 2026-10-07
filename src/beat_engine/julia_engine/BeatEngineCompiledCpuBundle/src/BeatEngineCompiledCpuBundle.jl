@@ -131,6 +131,7 @@ include(joinpath(@__DIR__, "..", "..", "CompiledCoupledWorkload.jl"))
     finally
         rm(directory; force=true, recursive=true)
     end
+    precompile_exterior_transducer_workload()
     # CPU ships no MUMPS artifact. The tiny analogue caches the condensed path
     # with the beat_cpu defaults: flux elimination, CHOLMOD interface mass,
     # Float32 FEM with UMFPACK and the refined dense LU.
