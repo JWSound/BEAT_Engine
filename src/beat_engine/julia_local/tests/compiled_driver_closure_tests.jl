@@ -18,7 +18,7 @@ include(joinpath(@__DIR__, "..", "..", "julia_engine", "CompiledDriverClosures.j
     # The shared resolver uses only(matches), so missing or ambiguous captured
     # fields fail this hardware-free gate before a Metal package build.
     closures = compiled_driver_closure_types(Driver)
-    @test keys(closures) == (:producer, :neumann, :field_values)
+    @test keys(closures) == (:producer, :neumann)
     for closure in values(closures)
         T = Base.unwrap_unionall(closure)
         @test T <: Function

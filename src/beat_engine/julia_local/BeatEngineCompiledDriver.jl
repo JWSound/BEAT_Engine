@@ -987,7 +987,7 @@ end
 
 function exterior_metal_field_output_batch(outputs, points_by_output::Dict{String,Vector{SVector{3,T}}}, backend) where {T<:AbstractFloat}
     backend == :metal && T === Float32 &&
-        isdefined(BeatEngineCore, :evaluate_galerkin_field_metal_outputs) || return nothing
+        BeatEngineCore.METAL_MODULE !== nothing || return nothing
     point_sets = Vector{SVector{3,T}}[]
     indices = Dict{String,Int}()
     for output in outputs
@@ -1395,12 +1395,14 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 quantity = String(output["quantity"])
                 if quantity == "exterior_pressure"
                     field_started = time_ns()
-                    values = [exterior_output_fields!(fields, String(output["id"]),
-                        field_points_by_output, mesh, pressure, neumann, wavenumber,
-                        selected_field_cache, backend, field_batch, metal_field_batch;
-                        cpu_kernel=backend == :cpu ? BeatEngineCore.beat_cpu_field_kernel() : :scalar,
-                        metal_field_points=metal_field_points)
-                        for (fields, pressure, neumann) in zip(fields_by_excitation, pressures, neumann_values)]
+                    values = Vector{Vector{Complex{FloatType}}}()
+                    for (fields, pressure, neumann) in zip(fields_by_excitation, pressures, neumann_values)
+                        push!(values, exterior_output_fields!(fields, String(output["id"]),
+                            field_points_by_output, mesh, pressure, neumann, wavenumber,
+                            selected_field_cache, backend, field_batch, metal_field_batch;
+                            cpu_kernel=backend == :cpu ? BeatEngineCore.beat_cpu_field_kernel() : :scalar,
+                            metal_field_points=metal_field_points))
+                    end
                     push!(
                         quantities,
                         quantity_wire(

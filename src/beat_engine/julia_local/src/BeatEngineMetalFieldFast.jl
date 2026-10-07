@@ -324,6 +324,7 @@ Each output retains its own source partition and the single-drive kernels used b
 Pass request-owned `prepare_metal_field_output_points(point_sets)` to reuse the
 unchanged observation blocks across frequencies; release it alongside the solve's
 field caches with `release_metal_field_output_points!` after evaluation completes.
+The `point_cache` is owned by one solve and matched by point counts only; callers must pass the cache built from the same point sets.
 """
 function evaluate_galerkin_field_metal_outputs(point_sets, pressure, neumann, k::Float32,
                                                cache::MetalFieldEvaluationCache{Float32}; point_cache=nothing)

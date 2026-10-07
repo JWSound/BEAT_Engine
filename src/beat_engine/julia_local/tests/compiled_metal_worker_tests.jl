@@ -67,6 +67,29 @@ end
     @test mumps.LIVE_SOLVERS == solvers_before
 end
 
+@testset "warm exterior Metal field calls stay in the runtime inventory" begin
+    bundle = BeatEngineCompiledMetalBundle
+    core = bundle.BeatEngineCore
+    # Derive the batch descriptors from the production builders without a solve
+    # or GPU buffers; the inventory must match the types the driver passes.
+    outputs = bundle.workload_request("unused.msh", "off")["outputs"]
+    points_by_output = bundle.parse_field_output_points(outputs, Float32)
+    field_batch = bundle.exterior_field_output_batch(outputs, points_by_output, :metal)
+    metal_batch = bundle.exterior_metal_field_output_batch(outputs, points_by_output, :metal)
+    @test field_batch === nothing
+    @test metal_batch !== nothing
+    runtime = bundle.metal_runtime_signatures()
+    @test Tuple{typeof(Core.kwcall),
+        NamedTuple{(:cpu_kernel, :metal_field_points), Tuple{Symbol, core.MetalFieldOutputPoints}},
+        typeof(bundle.exterior_output_fields!), Dict{String,Any}, String, typeof(points_by_output),
+        core.BoundaryMesh{Float32}, Vector{ComplexF32}, Vector{ComplexF32}, Float32,
+        core.MetalFieldEvaluationCache{Float32}, Symbol, typeof(field_batch), typeof(metal_batch)} in runtime
+    @test Tuple{typeof(Core.kwcall),
+        NamedTuple{(:point_cache,), Tuple{core.MetalFieldOutputPoints}},
+        typeof(core.evaluate_galerkin_field_metal_outputs), typeof(metal_batch.point_sets),
+        Vector{ComplexF32}, Vector{ComplexF32}, Float32, core.MetalFieldEvaluationCache{Float32}} in runtime
+end
+
 @testset "Metal host workload has matching compile-only methods" begin
     signatures = BeatEngineCompiledMetalBundle.metal_host_signatures()
     @test !isempty(signatures)

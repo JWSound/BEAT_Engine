@@ -96,7 +96,7 @@ end
         for backend in (:cpu, :cuda, :rocm)
             @test Driver.exterior_metal_field_output_batch(outputs, parsed, backend) === nothing
         end
-        if T === Float64 || !isdefined(Engine, :evaluate_galerkin_field_metal_outputs)
+        if T === Float64 || Engine.METAL_MODULE === nothing
             @test Driver.exterior_metal_field_output_batch(outputs, parsed, :metal) === nothing
         else
             metal_batch = Driver.exterior_metal_field_output_batch(outputs, parsed, :metal)

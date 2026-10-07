@@ -160,7 +160,7 @@ Run it on a host with the selected backend available and its Julia environment
 instantiated. It is not part of ordinary CI.
 
 `compiled_driver_closure_tests.jl` runs in the CPU `runtests.jl` gate and can
-also run standalone with the `julia_local` project. It resolves all three driver
+also run standalone with the `julia_local` project. It resolves both driver
 closure types used by the Metal runtime precompile inventory from their captured
 fields, using the same lookup and field tuples. It requires no GPU or Metal
 package and performs no solves or kernel launches.

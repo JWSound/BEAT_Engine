@@ -22,7 +22,10 @@ include(joinpath(@__DIR__, "..", "..", "CompiledDriverClosures.jl"))
 
 function metal_runtime_signatures()
     channel_task_wrapper = metal_channel_task_wrapper_type()
-    (; producer, neumann, field_values) = compiled_driver_closure_types()
+    (; producer, neumann) = compiled_driver_closure_types()
+    core = BeatEngineCore
+    points = Vector{SVector{3,Float32}}
+    metal_field_batch = NamedTuple{(:point_sets, :indices), Tuple{Vector{points}, Dict{String,Int}}}
     # The keyword implementation also has a patch-dependent generated name.
     metal_kernel_keyword_body = typeof(Base.bodyfunction(which(Tuple{Metal.HostKernel})))
     signatures = [
@@ -82,8 +85,18 @@ function metal_runtime_signatures()
         Tuple{typeof(Base.append!), Array{Any, 1}, Tuple{Metal.var"#broadcast_2d#_copyto!##2", Tuple{Metal.MtlArray{Base.Complex{Float32}, 2, Metal.SharedStorage}, Base.Broadcast.Broadcasted{Metal.MtlArrayStyle{2, Metal.SharedStorage}, Tuple{Base.OneTo{Int64}, Base.OneTo{Int64}}, typeof(Base.:(+)), Tuple{Base.Broadcast.Extruded{Metal.MtlArray{Base.Complex{Float32}, 2, Metal.SharedStorage}, Tuple{Bool, Bool}, Tuple{Int64, Int64}}, Base.Broadcast.Extruded{Metal.MtlArray{Base.Complex{Float32}, 2, Metal.PrivateStorage}, Tuple{Bool, Bool}, Tuple{Int64, Int64}}}}}}},
         Tuple{typeof(Base.put!), Base.Channel{Tuple{Int64, Any}}, Tuple{Int64, NamedTuple{(:system, :k, :assembly_s), Tuple{NamedTuple{(:matrix, :rhs, :regular_pairs, :singular_pairs, :image_singular_pairs, :drive_count, :on_gpu, :gpu_backend, :assembly_mode), Tuple{Metal.MtlArray{Base.Complex{Float32}, 2, Metal.SharedStorage}, Metal.MtlArray{Base.Complex{Float32}, 2, Metal.SharedStorage}, Int64, Int64, Int64, Int64, Bool, Symbol, Symbol}}, Float32, Float64}}}},
         Tuple{typeof(Base.getproperty), NamedTuple{(:system, :k, :assembly_s), Tuple{NamedTuple{(:matrix, :rhs, :regular_pairs, :singular_pairs, :image_singular_pairs, :drive_count, :on_gpu, :gpu_backend, :assembly_mode), Tuple{Metal.MtlArray{Base.Complex{Float32}, 2, Metal.SharedStorage}, Metal.MtlArray{Base.Complex{Float32}, 2, Metal.SharedStorage}, Int64, Int64, Int64, Int64, Bool, Symbol, Symbol}}, Float32, Float64}}, Symbol},
-        Tuple{Type{Base.Generator{I, F} where F where I}, field_values{BeatEngineCompiledMetalBundle.BeatEngineCore.BoundaryMesh{Float32}, Symbol, BeatEngineCompiledMetalBundle.BeatEngineCore.MetalFieldEvaluationCache{Float32}, Float32, Array{StaticArrays.StaticArraysCore.SArray{Tuple{3}, Float32, 1, 3}, 1}}, Base.Iterators.Zip{Tuple{Array{Array{Base.Complex{Float32}, 1}, 1}, Array{Array{Base.Complex{Float32}, 1}, 1}}}},
-        Tuple{typeof(Base.collect), Base.Generator{Base.Iterators.Zip{Tuple{Array{Array{Base.Complex{Float32}, 1}, 1}, Array{Array{Base.Complex{Float32}, 1}, 1}}}, field_values{BeatEngineCompiledMetalBundle.BeatEngineCore.BoundaryMesh{Float32}, Symbol, BeatEngineCompiledMetalBundle.BeatEngineCore.MetalFieldEvaluationCache{Float32}, Float32, Array{StaticArrays.StaticArraysCore.SArray{Tuple{3}, Float32, 1, 3}, 1}}}},
+        # Exact warm exterior Metal calls: no CPU batch, solve-owned point cache,
+        # host Float32 traces, and the same keyword order as the driver.
+        Tuple{typeof(Core.kwcall),
+            NamedTuple{(:cpu_kernel, :metal_field_points), Tuple{Symbol, core.MetalFieldOutputPoints}},
+            typeof(BeatEngineCompiledMetalBundle.exterior_output_fields!),
+            Dict{String,Any}, String, Dict{String,points}, core.BoundaryMesh{Float32},
+            Vector{ComplexF32}, Vector{ComplexF32}, Float32, core.MetalFieldEvaluationCache{Float32},
+            Symbol, Nothing, metal_field_batch},
+        Tuple{typeof(Core.kwcall),
+            NamedTuple{(:point_cache,), Tuple{core.MetalFieldOutputPoints}},
+            typeof(core.evaluate_galerkin_field_metal_outputs), Vector{points},
+            Vector{ComplexF32}, Vector{ComplexF32}, Float32, core.MetalFieldEvaluationCache{Float32}},
         Tuple{typeof(Base.fill!), Metal.MtlArray{Base.Complex{Float32}, 1, Metal.PrivateStorage}, Base.Complex{Float32}},
         Tuple{typeof(Base.map), typeof(Metal.mtlconvert), Tuple{Metal.KernelAbstractions.CompilerMetadata{Metal.KernelAbstractions.NDIteration.DynamicSize, Metal.KernelAbstractions.NDIteration.DynamicCheck, Nothing, Base.IteratorsMD.CartesianIndices{1, Tuple{Base.OneTo{Int64}}}, Metal.KernelAbstractions.NDIteration.NDRange{1, Metal.KernelAbstractions.NDIteration.DynamicSize, Metal.KernelAbstractions.NDIteration.DynamicSize, Base.IteratorsMD.CartesianIndices{1, Tuple{Base.OneTo{Int64}}}, Base.IteratorsMD.CartesianIndices{1, Tuple{Base.OneTo{Int64}}}}}, Metal.MtlArray{Base.Complex{Float32}, 1, Metal.PrivateStorage}, Base.Complex{Float32}}},
         Tuple{typeof(Core.kwcall), NamedTuple{(:threads, :groups), Tuple{Int64, Int64}}, Metal.HostKernel{Metal.GPUArrays.var"#gpu_fill_kernel!#gpu_fill_kernel!##0", Tuple{Metal.KernelAbstractions.CompilerMetadata{Metal.KernelAbstractions.NDIteration.DynamicSize, Metal.KernelAbstractions.NDIteration.DynamicCheck, Nothing, Base.IteratorsMD.CartesianIndices{1, Tuple{Base.OneTo{Int64}}}, Metal.KernelAbstractions.NDIteration.NDRange{1, Metal.KernelAbstractions.NDIteration.DynamicSize, Metal.KernelAbstractions.NDIteration.DynamicSize, Base.IteratorsMD.CartesianIndices{1, Tuple{Base.OneTo{Int64}}}, Base.IteratorsMD.CartesianIndices{1, Tuple{Base.OneTo{Int64}}}}}, Metal.MtlDeviceArray{Base.Complex{Float32}, 1, 1}, Base.Complex{Float32}}}, Metal.KernelAbstractions.CompilerMetadata{Metal.KernelAbstractions.NDIteration.DynamicSize, Metal.KernelAbstractions.NDIteration.DynamicCheck, Nothing, Base.IteratorsMD.CartesianIndices{1, Tuple{Base.OneTo{Int64}}}, Metal.KernelAbstractions.NDIteration.NDRange{1, Metal.KernelAbstractions.NDIteration.DynamicSize, Metal.KernelAbstractions.NDIteration.DynamicSize, Base.IteratorsMD.CartesianIndices{1, Tuple{Base.OneTo{Int64}}}, Base.IteratorsMD.CartesianIndices{1, Tuple{Base.OneTo{Int64}}}}}, Vararg{Any}},
