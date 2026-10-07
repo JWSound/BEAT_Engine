@@ -1,7 +1,7 @@
 # Standalone bitwise gate or included by runtests.jl; reuse its loaded bundle.
 module FieldOutputBatchTests
 
-using Test, StaticArrays, JSON
+using Test, StaticArrays, JSON, Base64
 
 if isdefined(Main, :CompiledWorkloadBundle)
     const Driver = Main.CompiledWorkloadBundle
@@ -41,18 +41,41 @@ end
 bits(values::AbstractVector{Complex{T}}) where {T} =
     reinterpret(T === Float32 ? UInt32 : UInt64, collect(values))
 
+function check_quantity_bits(actual, expected)
+    @test Dict(k => v for (k, v) in actual if k != "values") ==
+          Dict(k => v for (k, v) in expected if k != "values")
+    actual_values, expected_values = actual["values"], expected["values"]
+    @test Dict(k => v for (k, v) in actual_values if k != "content_base64") ==
+          Dict(k => v for (k, v) in expected_values if k != "content_base64")
+    T = actual_values["dtype"] == "complex64" ? Float32 : Float64
+    decoded_actual = reinterpret(Complex{T}, base64decode(actual_values["content_base64"]))
+    decoded_expected = reinterpret(Complex{T}, base64decode(expected_values["content_base64"]))
+    @test bits(decoded_actual) == bits(decoded_expected)
+end
+
+struct FieldEvaluationCounter
+    point_counts::Vector{Int}
+end
+
+function Driver.exterior_field(points, counter::FieldEvaluationCounter, pressure, neumann,
+                               wavenumber, cache, backend; cpu_kernel=:scalar)
+    push!(counter.point_counts, length(points))
+    return ComplexF32[ComplexF32(point[1], point[2]) for point in points]
+end
+
 function check_fields(evaluate, outputs, parsed, batch, T)
     together = evaluate(batch.points)
     @test all(isfinite, together)
     for output in outputs
-        String(output["quantity"]) == "exterior_pressure" || continue
+        Driver.per_excitation_field_output(output) || continue
         id = String(output["id"])
         separate = evaluate(parsed[id])
         sliced = together[batch.ranges[id]]
         @test bits(sliced) == bits(separate)
         # Check the existing complex encoding, shape, axes and metadata too.
-        @test Driver.quantity_wire(output, Driver.rows([sliced], T), "Pa", ["excitation", "observation"]) ==
-              Driver.quantity_wire(output, Driver.rows([separate], T), "Pa", ["excitation", "observation"])
+        check_quantity_bits(
+            Driver.quantity_wire(output, Driver.rows([sliced], T), "Pa", ["excitation", "observation"]),
+            Driver.quantity_wire(output, Driver.rows([separate], T), "Pa", ["excitation", "observation"]))
     end
 end
 
@@ -73,7 +96,7 @@ end
         for backend in (:cpu, :cuda, :rocm)
             @test Driver.exterior_metal_field_output_batch(outputs, parsed, backend) === nothing
         end
-        if T === Float64 || !isdefined(Engine, :_evaluate_galerkin_field_metal_fast)
+        if T === Float64 || !isdefined(Engine, :evaluate_galerkin_field_metal_outputs)
             @test Driver.exterior_metal_field_output_batch(outputs, parsed, :metal) === nothing
         else
             metal_batch = Driver.exterior_metal_field_output_batch(outputs, parsed, :metal)
@@ -88,7 +111,74 @@ end
     end
 end
 
+@testset "weighted outputs are excluded from per-excitation field evaluations" begin
+    outputs = Any[
+        field_output("one", [[1.0, -0.0, 0.0]]),
+        field_output("weighted", fill([3.0, 0.0, 1.0], 5);
+                     options=Dict("excitation_weights" => [Dict("real" => 1.0)])),
+        field_output("two", [[2.0, 0.0, 1.0], [2.0, 0.0, -1.0]]),
+        field_output("sweep", fill([4.0, 0.0, 1.0], 7);
+                     options=Dict("excitation_weights_sweep" => [Any[], [Dict("real" => 1.0)]])),
+        field_output("empty-weights", [[5.0, 0.0, 1.0]];
+                     options=Dict("excitation_weights" => Any[])),
+    ]
+    for T in (Float32, Float64)
+        parsed = Driver.parse_field_output_points(outputs, T)
+        for backend in (:cpu, :cuda, :rocm)
+            batch = Driver.exterior_field_output_batch(outputs, parsed, backend)
+            @test batch.ranges == Dict("one" => 1:1, "two" => 2:3)
+            counter = FieldEvaluationCounter(Int[])
+            # Each frequency/excitation evaluates only the three unweighted
+            # points once, even when the outputs are requested in reverse order.
+            for frequency in 1:2, excitation in 1:2
+                fields = Dict{String,Any}()
+                for id in ("two", "one", "two")
+                    values = Driver.exterior_output_fields!(fields, id, parsed, counter,
+                        nothing, nothing, T(frequency), nothing, backend, batch, nothing)
+                    @test length(values) == length(parsed[id])
+                end
+                @test Set(keys(fields)) == Set(["one", "two"])
+            end
+            @test counter.point_counts == fill(3, 4)
+            # A sweep with empty weights at this frequency still needs the
+            # existing per-output fallback; it must not enter the batch.
+            fields = Dict{String,Any}()
+            Driver.exterior_output_fields!(fields, "sweep", parsed, counter,
+                nothing, nothing, one(T), nothing, backend, batch, nothing)
+            @test counter.point_counts[end] == 7
+            @test Set(keys(fields)) == Set(["sweep"])
+            Driver.exterior_output_fields!(fields, "one", parsed, counter,
+                nothing, nothing, one(T), nothing, backend, batch, nothing)
+            @test counter.point_counts[end-1:end] == [7, 3]
+            # Unsupported batch paths continue to evaluate one output at a time.
+            fallback_counter = FieldEvaluationCounter(Int[])
+            fallback_fields = Dict{String,Any}()
+            for id in ("two", "one")
+                Driver.exterior_output_fields!(fallback_fields, id, parsed, fallback_counter,
+                    nothing, nothing, one(T), nothing, backend, nothing, nothing)
+            end
+            @test fallback_counter.point_counts == [2, 1]
+        end
+        metal_batch = Driver.exterior_metal_field_output_batch(outputs, parsed, :metal)
+        if metal_batch !== nothing
+            @test metal_batch.indices == Dict("one" => 1, "two" => 2)
+            @test length.(metal_batch.point_sets) == [1, 2]
+        end
+    end
+end
+
+@testset "wire comparison detects signed zero" begin
+    positive = Driver.quantity_wire(field_output("zero", [[0.0, 0.0, 0.0]]),
+                                    ComplexF32[ComplexF32(0.0f0, 0.0f0)], "Pa", ["observation"])
+    negative = Driver.quantity_wire(field_output("zero", [[0.0, 0.0, 0.0]]),
+                                    ComplexF32[ComplexF32(-0.0f0, 0.0f0)], "Pa", ["observation"])
+    decode(q) = reinterpret(ComplexF32, base64decode(q["values"]["content_base64"]))
+    @test decode(positive) == decode(negative)
+    @test bits(decode(positive)) != bits(decode(negative))
+end
+
 @testset "CPU field separate/concatenated bitwise equality" begin
+    @test Threads.nthreads() > 1
     mktempdir() do directory
         path = joinpath(directory, "plate.msh")
         write(path, Driver.workload_plate_mesh())
@@ -158,8 +248,8 @@ end
                         separate = Driver.solve_coupled_workload(single)
                         @test length(separate.results) == 2
                         for frequency in 1:2
-                            @test run.results[frequency]["quantities"][index] ==
-                                  only(separate.results[frequency]["quantities"])
+                            check_quantity_bits(run.results[frequency]["quantities"][index],
+                                                only(separate.results[frequency]["quantities"]))
                         end
                     end
                 end
@@ -194,13 +284,23 @@ end
             mesh = Engine.load_gmsh22_with_tags(path, one(T))
             cpu_cache = Engine.build_field_evaluation_cache(mesh, Engine.tensor_triangle_rule(T, 4); symmetry_mode=:xy)
             cache = Engine.build_metal_field_evaluation_cache(cpu_cache)
+            point_cache = nothing
             try
                 outputs = field_outputs()
+                push!(outputs, field_output("weighted", fill([3.0, 0.0, 1.0], 5);
+                    options=Dict("excitation_weights" => [Dict("real" => 1.0)])))
+                push!(outputs, field_output("sweep", fill([4.0, 0.0, 1.0], 7);
+                    options=Dict("excitation_weights_sweep" => [Any[]])))
                 parsed = Driver.parse_field_output_points(outputs, T)
                 batch = Driver.exterior_field_output_batch(outputs, parsed, :cpu)
                 metal_batch = Driver.exterior_metal_field_output_batch(outputs, parsed, :metal)
                 point_sets = metal_batch.point_sets
                 @test length.(point_sets) == [1, 37, 2664, 37]
+                point_cache = Engine.prepare_metal_field_output_points(point_sets)
+                uploaded_points = point_cache.device_points
+                @test point_cache.point_counts == [1, 37, 2664, 37]
+                @test length(uploaded_points) == 3 * (1 + 37 + 2664 + 37)
+                @test !haskey(metal_batch.indices, "weighted") && !haskey(metal_batch.indices, "sweep")
                 withenv("BLAB_METAL_FIELD_CHUNKS" => "auto") do
                     @test Engine._metal_field_chunk_count(37, cache.source_count) !=
                           Engine._metal_field_chunk_count(2664, cache.source_count)
@@ -216,6 +316,17 @@ end
                                 points, pressure, neumann, Engine.outgoing_wavenumber(k), cache)
                             together = Engine.evaluate_galerkin_field_metal_outputs(point_sets, pressure, neumann, k, cache)
                             @test length(together) == length(point_sets)
+                            # The same upload serves changed frequencies and excitations.
+                            for frequency_k in (k, 2k)
+                                retained = Engine.evaluate_galerkin_field_metal_outputs(
+                                    point_sets, pressure, neumann, frequency_k, cache; point_cache=point_cache)
+                                @test point_cache.device_points === uploaded_points
+                                for (points, values) in zip(point_sets, retained)
+                                    separate = Engine._evaluate_galerkin_field_metal_fast(
+                                        points, pressure, neumann, Engine.outgoing_wavenumber(frequency_k), cache)
+                                    @test bits(values) == bits(separate)
+                                end
+                            end
                             for (points, values) in zip(point_sets, together)
                                 @test all(isfinite, values)
                                 @test bits(values) == bits(reference(points))
@@ -232,6 +343,47 @@ end
                                 Vector{SVector{3,T}}[], pressure, neumann, k, cache))
                         end
                     end
+                end
+                @testset "allocation failure preserves request-owned points and borrowed pressure" begin
+                    pressure = zeros(ComplexF32, length(mesh.vertices))
+                    neumann = zeros(ComplexF32, length(mesh.faces))
+                    d_pressure = metal.MtlArray(pressure)
+                    try
+                        @test_throws MethodError Engine.evaluate_galerkin_field_metal_outputs(
+                            point_sets, pressure, [:invalid], k, cache; point_cache=point_cache)
+                        @test_throws MethodError Engine.evaluate_galerkin_field_metal_outputs(
+                            point_sets, d_pressure, [:invalid], k, cache; point_cache=point_cache)
+                        retained = Engine.evaluate_galerkin_field_metal_outputs(
+                            point_sets, d_pressure, neumann, k, cache; point_cache=point_cache)
+                        fresh = Engine.evaluate_galerkin_field_metal_outputs(point_sets, pressure, neumann, k, cache)
+                        @test point_cache.device_points === uploaded_points
+                        @test bits(Array(d_pressure)) == bits(pressure)
+                        @test all(bits(a) == bits(b) for (a, b) in zip(retained, fresh))
+                    finally
+                        metal.synchronize()
+                        metal.unsafe_free!(d_pressure)
+                    end
+                end
+                @testset "request points survive quadrature cache replacement" begin
+                    pressure = ones(ComplexF32, length(mesh.vertices))
+                    neumann = ones(ComplexF32, length(mesh.faces))
+                    for order in (2, 4)
+                        other_cache = Engine.build_metal_field_evaluation_cache(
+                            Engine.build_field_evaluation_cache(mesh, Engine.triangle_rule(T, order);
+                                                                symmetry_mode=:xy))
+                        try
+                            retained = Engine.evaluate_galerkin_field_metal_outputs(
+                                point_sets, pressure, neumann, k, other_cache; point_cache=point_cache)
+                            for (points, values) in zip(point_sets, retained)
+                                separate = Engine._evaluate_galerkin_field_metal_fast(
+                                    points, pressure, neumann, Engine.outgoing_wavenumber(k), other_cache)
+                                @test bits(values) == bits(separate)
+                            end
+                        finally
+                            Engine.release_metal_field_evaluation_cache!(other_cache)
+                        end
+                    end
+                    @test point_cache.device_points === uploaded_points
                 end
                 # Retain the fixed-partition concatenation gate as well.
                 for chunks in ("1", "4"), drive in 1:2
@@ -288,6 +440,7 @@ end
                     end
                 end
             finally
+                point_cache === nothing || Engine.release_metal_field_output_points!(point_cache)
                 Engine.release_metal_field_evaluation_cache!(cache)
             end
             @testset "compiled Metal exterior/coupled output order and wire" begin
@@ -327,8 +480,8 @@ end
                                 separate = Driver.solve_coupled_workload(single)
                                 @test length(separate.results) == 2
                                 for frequency in 1:2
-                                    @test run.results[frequency]["quantities"][index] ==
-                                          only(separate.results[frequency]["quantities"])
+                                    check_quantity_bits(run.results[frequency]["quantities"][index],
+                                                        only(separate.results[frequency]["quantities"]))
                                 end
                             end
                         end

@@ -237,7 +237,6 @@ function _evaluate_galerkin_field_metal_fast(
 end
 
 # Enqueue only: callers own the buffers and wait before reading or freeing them.
-# Keeping this separate also lets the hardware gate poison and reuse the work buffers.
 function _metal_fast_field_outputs!(d_potentials, d_partials, d_eval_points, d_weights4,
                                     d_pressure, d_neumann, point_counts, chunk_counts,
                                     k::Float32, cache::MetalFieldEvaluationCache{Float32})
@@ -281,21 +280,18 @@ function _metal_fast_field_outputs!(d_potentials, d_partials, d_eval_points, d_w
     return nothing
 end
 
-"""
-    evaluate_galerkin_field_metal_outputs(point_sets, pressure, neumann, k, cache)
+# Request-owned observation blocks. Their lifetime is independent of the
+# quadrature-specific field caches a coupled sweep may select per frequency.
+struct MetalFieldOutputPoints
+    device_points
+    point_counts::Vector{Int}
+end
 
-Evaluate one Float32 excitation at several outputs with one sources pass and wait.
-Each output retains its own source partition and the single-drive kernels used by
-`evaluate_galerkin_field_metal`, including the unreduced result when chunks == 1.
-"""
-function evaluate_galerkin_field_metal_outputs(point_sets, pressure, neumann, k::Float32,
-                                               cache::MetalFieldEvaluationCache{Float32})
-    k = outgoing_wavenumber(k)
-    point_counts = length.(point_sets)
+function prepare_metal_field_output_points(point_sets)
+    point_counts = [length(points) for points in point_sets]
     point_count = sum(point_counts)
-    point_count == 0 && return [ComplexF32[] for _ in point_sets]
+    point_count == 0 && return MetalFieldOutputPoints(nothing, point_counts)
     _require_metal!()
-    chunk_counts = [n == 0 ? 1 : _metal_field_chunk_count(n, cache.source_count) for n in point_counts]
     # Each block is vec(n_i × 3), not a column of a concatenated n_total × 3 matrix.
     points = Vector{Float32}(undef, 3 * point_count)
     point_offset = 0
@@ -303,21 +299,61 @@ function evaluate_galerkin_field_metal_outputs(point_sets, pressure, neumann, k:
         points[3 * point_offset + 1:3 * (point_offset + n)] = vec(_metal_eval_point_arrays(eval_points, Float32))
         point_offset += n
     end
-    d_eval_points = MtlArray(points)
+    device_points = nothing
+    try
+        device_points = MtlArray(points)
+        return MetalFieldOutputPoints(device_points, point_counts)
+    catch
+        Metal.synchronize()
+        device_points === nothing || Metal.unsafe_free!(device_points)
+        rethrow()
+    end
+end
+
+function release_metal_field_output_points!(points::MetalFieldOutputPoints)
+    points.device_points === nothing || Metal.unsafe_free!(points.device_points)
+    return nothing
+end
+
+"""
+    evaluate_galerkin_field_metal_outputs(point_sets, pressure, neumann, k, cache; point_cache=nothing)
+
+Evaluate one Float32 excitation at several outputs with one sources pass and wait.
+Each output retains its own source partition and the single-drive kernels used by
+`evaluate_galerkin_field_metal`, including the unreduced result when chunks == 1.
+Pass request-owned `prepare_metal_field_output_points(point_sets)` to reuse the
+unchanged observation blocks across frequencies; release it alongside the solve's
+field caches with `release_metal_field_output_points!` after evaluation completes.
+"""
+function evaluate_galerkin_field_metal_outputs(point_sets, pressure, neumann, k::Float32,
+                                               cache::MetalFieldEvaluationCache{Float32}; point_cache=nothing)
+    k = outgoing_wavenumber(k)
+    point_counts = [length(points) for points in point_sets]
+    point_count = sum(point_counts)
+    point_cache === nothing || point_cache.point_counts == point_counts ||
+        throw(ArgumentError("Metal field point cache must match the output point blocks."))
+    point_count == 0 && return [ComplexF32[] for _ in point_sets]
+    _require_metal!()
+    chunk_counts = [n == 0 ? 1 : _metal_field_chunk_count(n, cache.source_count) for n in point_counts]
     pressure_on_device = pressure isa MtlArray
     neumann_on_device = neumann isa MtlArray
-    d_pressure = pressure_on_device ? pressure : MtlArray(ComplexF32.(pressure))
-    d_neumann = neumann_on_device ? neumann : MtlArray(ComplexF32.(neumann))
-    d_weights4 = MtlArray{_MetalFloat4}(undef, cache.source_count)
-    partial_count = sum((n * c for (n, c) in zip(point_counts, chunk_counts) if c > 1); init=0)
-    # The fast kernel writes every partial, even for empty source chunks; the
-    # same kernel (chunks == 1) or the original reducer writes every potential.
-    d_partials = MtlArray{ComplexF32}(undef, partial_count)
-    d_potentials = MtlArray{ComplexF32}(undef, point_count)
+    owns_points = point_cache === nothing
+    d_pressure = d_neumann = d_weights4 = d_partials = d_potentials = nothing
+    synchronized = false
     try
-        _metal_fast_field_outputs!(d_potentials, d_partials, d_eval_points, d_weights4,
+        owns_points && (point_cache = prepare_metal_field_output_points(point_sets))
+        d_pressure = pressure_on_device ? pressure : MtlArray(ComplexF32.(pressure))
+        d_neumann = neumann_on_device ? neumann : MtlArray(ComplexF32.(neumann))
+        d_weights4 = MtlArray{_MetalFloat4}(undef, cache.source_count)
+        partial_count = sum((n * c for (n, c) in zip(point_counts, chunk_counts) if c > 1); init=0)
+        # The fast kernel writes every partial, even for empty source chunks; the
+        # same kernel (chunks == 1) or the original reducer writes every potential.
+        d_partials = MtlArray{ComplexF32}(undef, partial_count)
+        d_potentials = MtlArray{ComplexF32}(undef, point_count)
+        _metal_fast_field_outputs!(d_potentials, d_partials, point_cache.device_points, d_weights4,
             d_pressure, d_neumann, point_counts, chunk_counts, k, cache)
         Metal.synchronize()
+        synchronized = true
         host = Array(d_potentials)
         results = Vector{Vector{ComplexF32}}(undef, length(point_counts))
         point_offset = 0
@@ -327,12 +363,14 @@ function evaluate_galerkin_field_metal_outputs(point_sets, pressure, neumann, k:
         end
         return results
     finally
-        Metal.unsafe_free!(d_eval_points)
-        pressure_on_device || Metal.unsafe_free!(d_pressure)
-        neumann_on_device || Metal.unsafe_free!(d_neumann)
-        Metal.unsafe_free!(d_weights4)
-        Metal.unsafe_free!(d_partials)
-        Metal.unsafe_free!(d_potentials)
+        # A failed allocation or launch may follow already committed GPU work.
+        synchronized || Metal.synchronize()
+        owns_points && point_cache !== nothing && release_metal_field_output_points!(point_cache)
+        pressure_on_device || d_pressure === nothing || Metal.unsafe_free!(d_pressure)
+        neumann_on_device || d_neumann === nothing || Metal.unsafe_free!(d_neumann)
+        for buffer in (d_weights4, d_partials, d_potentials)
+            buffer === nothing || Metal.unsafe_free!(buffer)
+        end
     end
 end
 
