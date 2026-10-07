@@ -196,4 +196,82 @@ end
         end
     end
 end
+
+@testset "batched transducer fields use superposed traces in requested port order" begin
+    # Different LEMs and reversed ports expose accidental reuse of basis columns.
+    # Full/half/quarter meshes have identical triangles before image reduction.
+    full = join_meshes(sphere(0.1,SVector(0.,0.,0.35),2;refinements=1),
+                       sphere(0.1,SVector(0.,0.,0.75),3;refinements=1))
+    for (mode,axes,copies) in (("off",(),1),("x",(1,),2),("xy",(1,2),4),("ground",(),1))
+        mesh = isempty(axes) ? full : cut_mesh(full,axes)
+        # Ground reflects across Y=0 and requires the complete radiators above it.
+        if mode=="ground"
+            mesh = BoundaryMesh([v+SVector(0.,0.25,0.) for v in mesh.vertices],
+                                mesh.faces,mesh.physical_tags)
+        end
+        mktemp() do path,io
+            mesh_file(io,mesh)
+            for convention in (POSITIVE_TIME_PHASOR,NEGATIVE_TIME_PHASOR)
+                r = driver_request(path;tags=[2,3])
+                r["excitation_port_ids"] = ["port:2","port:1"]
+                r["frequencies_hz"] = [600.,100.]
+                r["solver_options"]["symmetry"] = mode
+                r["solver_options"]["phasor_convention"] = convention
+                for component in r["compiled_system"]["components"]
+                    p = component["parameters"]
+                    p["surface_completion_factor"] = copies
+                    p["physical_driver_orbit_count"] = 1
+                    p["symmetry_role"] = copies>1 ? "fractional_driver" : "complete_representative"
+                    p["fractional_symmetry_axes"] = mode=="xy" ? ["x","y"] : mode=="x" ? ["x"] : []
+                end
+                r["compiled_system"]["components"][2]["parameters"]["re_ohm"] = 8.
+                r["compiled_system"]["components"][2]["parameters"]["mmd_kg"] = 0.024
+                fields = [Dict("id"=>id,"quantity"=>"exterior_pressure","target_ids"=>[],
+                    "options"=>Dict("points_m"=>points)) for (id,points) in (
+                    ("near",[[0.25,0.2,0.5],[-0.25,0.2,0.5],[0.25,-0.2,0.5]]),
+                    ("far",[[0.4,0.3,2.],[-0.4,-0.3,2.]]))]
+                filter!(o -> o["quantity"]!="exterior_pressure",r["outputs"])
+                append!(r["outputs"],fields)
+                # Independently solve unit-velocity bases through the ideal path.
+                basis = deepcopy(r)
+                basis["excitation_port_ids"] = ["port:1","port:2"]
+                for component in basis["compiled_system"]["components"]
+                    component["kind"] = "ideal_velocity_source"
+                    component["parameters"] = Dict("motion_profile"=>"rigid_translation","motion_axis"=>[0.,0.,1.])
+                end
+                for port in basis["compiled_system"]["excitation_ports"]
+                    port["kind"] = "normal_velocity"
+                end
+                filter!(o -> !(o["quantity"] in ("diaphragm_velocity","voice_coil_current")),basis["outputs"])
+                actual_results,basis_results = captured(r),captured(basis)
+                @test length(actual_results)==length(basis_results)==2
+                for (actual,b) in zip(actual_results,basis_results)
+                    @test actual["excitation_port_ids"] == ["port:2","port:1"]
+                    @test actual["freq_hz"] == b["freq_hz"]
+                    aq,bq = quantities(actual),quantities(b)
+                    # Wire rows are requested ports; columns are basis components.
+                    u = decoded(aq["diaphragm_velocity"])
+                    @test size(u)==(2,2)
+                    for id in ("near","far","bem_boundary_pressure","bem_boundary_neumann")
+                        @test decoded(aq[id]) ≈ u * decoded(bq[id]) rtol=1e-11
+                    end
+                    if mode in ("x","xy")
+                        near = decoded(aq["near"])
+                        @test near[:,1] ≈ near[:,2] rtol=1e-12
+                        if mode=="xy"
+                            @test near[:,1] ≈ near[:,3] rtol=1e-12
+                        end
+                    end
+                end
+                # Each field output alone must preserve the exact batched wire.
+                for output in fields
+                    single = deepcopy(r); single["outputs"] = [output]
+                    for (a,b) in zip(actual_results,captured(single))
+                        @test quantities(a)[output["id"]] == only(b["quantities"])
+                    end
+                end
+            end
+        end
+    end
+end
 end
