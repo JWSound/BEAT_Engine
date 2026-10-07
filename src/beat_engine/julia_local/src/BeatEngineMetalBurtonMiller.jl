@@ -503,8 +503,11 @@ function _launch_metal_fused_singular_kernels!(
         stage_timings["sing_info_parts"] = part_count
         stage_timings["sing_info_rule_points"] = rule_point_count
     end
-    lhs_values = Metal.zeros(eltype(lhs), value_count, 9)
-    rhs_values = Metal.zeros(eltype(lhs), value_count, 3)
+    # The grouped packed kernel assigns all nine/three components for every
+    # (pair, part), including empty quadrature parts. No write-back reads these
+    # buffers until those kernels complete, so zero-fill launches are redundant.
+    lhs_values = MtlArray{eltype(lhs)}(undef, value_count, 9)
+    rhs_values = MtlArray{eltype(lhs)}(undef, value_count, 3)
     stamp = _metal_fused_stage!(stage_timings, "sing_alloc", timed, stamp)
     tables = _metal_fused_singular_tables_for(regular_cache, singular_cache)
     packed = _metal_packed_pair_tables_for(regular_cache)
@@ -664,7 +667,10 @@ function assemble_burton_miller_neumann_system_metal(
             # of blitting them through a staging buffer. The pair-block and
             # right-hand-side partials are device-only scratch and stay private.
             lhs = Metal.zeros(Complex{T}, p1_count, p1_count; storage=storage)
-            rhs = Metal.zeros(Complex{T}, p1_count, drive_count; storage=storage)
+            # The RHS reducer assigns every (row, drive) before singular and
+            # identity contributions are added; only lhs and rhs_partial add
+            # into their initial contents and therefore require zero-fill.
+            rhs = MtlArray{Complex{T},2,storage}(undef, p1_count, drive_count)
             # Pair scratch belongs to this assembly, never to the shared geometry cache.
             blocks = MtlArray{Float32}(undef, _METAL_FUSED_COMPONENTS * length(device_cache.element_indices) * tables.chunk_size)
             rhs_partial = Metal.zeros(Complex{T}, p1_count, tables.chunk_size, drive_count)
