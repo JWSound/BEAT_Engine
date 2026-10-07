@@ -1,6 +1,12 @@
 using Test
-# Hardware suites use the Metal project, whose compiled bundle also contains
-# the CPU host workload. Do not require an undeclared CPU package there.
+# Accelerator qualification also exercises the shared CPU workload. CUDA and
+# ROCm do not declare the compiled CPU bundle; expose the checked-in packages
+# after the active environment so its accelerator dependency versions win.
+const COMPILED_WORKLOAD_PROJECT = basename(dirname(Base.active_project()))
+if COMPILED_WORKLOAD_PROJECT in ("julia_cuda", "julia_rocm")
+    push!(LOAD_PATH, normpath(joinpath(@__DIR__, "..", "..", "julia_engine")))
+end
+# The Metal bundle contains the same host workload.
 if basename(dirname(Base.active_project())) == "julia_metal"
     import BeatEngineCompiledMetalBundle
     const CompiledWorkloadBundle = BeatEngineCompiledMetalBundle
@@ -102,7 +108,7 @@ end
 end
 
 # The CPU compiled entry is only declared in the CPU project.
-if @isdefined(BeatEngineCompiledCpuBundle)
+if COMPILED_WORKLOAD_PROJECT == "julia_local"
 @testset "tiny coupled request solves through compiled CPU entry and fallback" begin
     bundle = BeatEngineCompiledCpuBundle
     request = bundle.coupled_workload_request(; tiny=true)
@@ -184,5 +190,40 @@ end
             # The caller's environment comes back unchanged.
             @test all(ENV[name] == value for (name, value) in inherited)
         end
+        # The beat_cpu configuration: the same reductions with Float32 FEM and UMFPACK.
+        cpu = Dict(bundle.coupled_workload_environment(; mumps=false, defaults=:cpu))
+        @test cpu["BLAB_COUPLED_FEM_FLOAT64"] == "off" && cpu["BLAB_COUPLED_FEM_SOLVER"] == "umfpack"
+        @test cpu["BLAB_COUPLED_INTERFACE_FLUX_ELIMINATION"] == "auto" && cpu["BLAB_COUPLED_INTERFACE_MASS_SOLVER"] == "cholmod"
+        @test cpu["BLAB_COUPLED_DENSE_REFINEMENT"] == "auto" && cpu["BLAB_MUMPS_THREADS"] === nothing
+        @test all(ENV[name] == value for (name, value) in inherited)
     end
+    @test_throws "defaults" bundle.coupled_workload_environment(; mumps=false, defaults=:cuda)
+end
+
+@testset "coupled workload pins exactly what an unset environment selects" begin
+    bundle = CompiledWorkloadBundle
+    cc = bundle.BeatEngineCoupledCondensed
+    probes = (cc._transducer_condensation_enabled, cc._dense_float64_enabled, cc._dense_refinement_enabled,
+              cc._fem_float64_enabled, cc._interface_flux_elimination_enabled, cc._interface_mass_overlap_enabled,
+              cc._interface_blocks_enabled, cc._demand_reconstruction_enabled, cc._fem_solver_selection,
+              cc._interface_mass_solver_selection)
+    cleared = [name => nothing for name in keys(ENV) if startswith(name, "BLAB_COUPLED_")]
+    for defaults in (:metal, :cpu)
+        unset = withenv(() -> [probe(defaults) for probe in probes], cleared...)
+        # mumps=true keeps the resolved FEM solver instead of the host workload's UMFPACK override.
+        pinned = withenv(() -> [probe(defaults) for probe in probes],
+                         bundle.coupled_workload_environment(; mumps=true, defaults)...)
+        @test pinned == unset
+    end
+end
+
+@testset "tiny coupled workload with beat_cpu defaults solves (strict)" begin
+    bundle = CompiledWorkloadBundle
+    request = bundle.JSON.parse(bundle.JSON.json(bundle.coupled_workload_request(; tiny=true)))
+    withenv(bundle.coupled_workload_environment(; mumps=false, defaults=:cpu)...) do
+        run = bundle.solve_coupled_workload(request)
+        bundle.check_coupled_workload(run; mumps=false, defaults=:cpu)
+        @test all(result["diagnostics"]["fem_matrix_precision"] == "float32" for result in run.results)
+    end
+    bundle.reset_compiled_workload_state!()
 end

@@ -25,7 +25,11 @@ const CONTRACT_CORPUS = JSON.parsefile(joinpath(@__DIR__, "..", "..", "beat_cont
             if case["valid"]
                 @test validate_system_request(request) === nothing
             else
-                @test_throws ErrorException validate_system_request(request)
+                if haskey(case, "expected_message")
+                    @test_throws case["expected_message"] validate_system_request(request)
+                else
+                    @test_throws ErrorException validate_system_request(request)
+                end
             end
         end
     end
@@ -79,8 +83,10 @@ end
     info = worker_ready(Dict("cpu" => Dict("available" => true, "reason" => "")))
     @test info["protocol"]["version"] == 1
     @test info["contracts"]["system_request"] == [1]
-    @test info["contracts"]["compiled_system"] == [1, 2]
+    @test info["contracts"]["compiled_system"] == [1, 2, 3]
+    @test info["exterior_component_kinds"] == ["ideal_velocity_source", "electrodynamic_transducer"]
     @test info["contracts"]["system_result"] == [2]
+    @test "radiation_impedance_matrix" in info["optional_output_quantities"]
     @test info["runtime"]["julia_version"] == string(VERSION)
     @test length(info["engine"]["source_sha256"]) == 64
     @test haskey(info["engine"]["source_files_sha256"], "julia_local/coupled_solver.jl")

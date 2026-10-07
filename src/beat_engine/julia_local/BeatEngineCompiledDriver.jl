@@ -10,6 +10,7 @@ using .BeatEngineWorkerCleanup
 include(joinpath(@__DIR__, "src", "BeatEngineCore.jl"))
 using .BeatEngineCore
 include(joinpath(@__DIR__, "compiled_ground_contract.jl"))
+include(joinpath(@__DIR__, "exterior_lumped_network.jl"))
 include(joinpath(@__DIR__, "src", "BeatEngineCoupled.jl"))
 using .BeatEngineCoupled
 include(joinpath(@__DIR__, "src", "BeatEngineCoupledCondensed.jl"))
@@ -683,7 +684,7 @@ function rows(vectors, ::Type{T}) where {T<:AbstractFloat}
 end
 
 function exterior_quadrature_selection(options, mesh::BoundaryMesh{T}, frequency_hz::T, sound_speed::T, base_order::Int, backend::Symbol) where {T<:AbstractFloat}
-    default_mode = backend == :cpu ? "wavelength" : "fixed"
+    default_mode = "fixed"
     mode = lowercase(String(get(options, "regular_quadrature_mode", default_mode)))
     mode in ("fixed", "wavelength") || error(
         "Unsupported regular quadrature mode: $mode. Expected fixed or wavelength.",
@@ -942,6 +943,24 @@ end
 
 release_exterior_metal_system(produced) = release_metal_burton_miller_system!(produced.system)
 
+# Specialize on the requested precision before converting JSON's Vector{Any}.
+# Retain the original broadcast and SVector construction so rounding and shape
+# errors are unchanged.
+function parse_field_output_points(outputs, ::Type{T}) where {T<:AbstractFloat}
+    points_by_output = Dict{String,Vector{SVector{3,T}}}()
+    for output in outputs
+        quantity = String(output["quantity"])
+        quantity in ("exterior_pressure", "interface_radiated_pressure") || continue
+        raw_points = get(get(output, "options", Dict{String,Any}()), "points_m", Any[])
+        isempty(raw_points) && error(quantity == "exterior_pressure" ?
+            "exterior_pressure output requires options.points_m." :
+            "interface_radiated_pressure requires points_m.")
+        points_by_output[String(output["id"])] =
+            SVector{3,T}[SVector{3,T}(T.(point)) for point in raw_points]
+    end
+    return points_by_output
+end
+
 function solve_exterior_request(request, system, unbounded_region; event_mode=false)
     meshes = system["meshes"]
     boundaries = system["boundaries"]
@@ -951,8 +970,15 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     precision_name = lowercase(String(get(options, "precision", "float32")))
     FloatType = precision_name == "float64" ? Float64 : precision_name == "float32" ? Float32 :
                 error("Exterior precision must be float32 or float64.")
+    has_transducers = any(component["kind"] == "electrodynamic_transducer" for component in components)
+    has_transducers && FloatType !== Float64 && error("Exterior electrodynamic_transducers require float64 BEM precision.")
     backend = Symbol(lowercase(String(get(options, "bem_backend", "cpu"))))
     backend in (:cpu, :cuda, :rocm, :metal) || error("Exterior BEM backend must be cpu, cuda, rocm, or metal.")
+    has_transducers && backend == :metal && error(
+        "Exterior electrodynamic_transducers cannot use Metal: float64 BEM is unsupported; use CPU.",
+    )
+    reference_voltage = Float64(get(options, "transducer_reference_voltage_v", DEFAULT_TRANSDUCER_REFERENCE_VOLTAGE_V))
+    isfinite(reference_voltage) && reference_voltage > 0 || error("transducer_reference_voltage_v must be finite and positive.")
     requested_assembly = lowercase(String(get(options, "burton_miller_assembly", "direct_system")))
     requested_assembly in ("direct_system", "operator_matrices") || error(
         "Exterior burton_miller_assembly must be direct_system or operator_matrices.",
@@ -978,6 +1004,8 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     sound_speed > zero(FloatType) && density > zero(FloatType) || error(
         "Exterior sound speed and density must be positive.",
     )
+    outputs = get(request, "outputs", Any[])
+    field_points_by_output = parse_field_output_points(outputs, FloatType)
     mesh_setup_started = time_ns()
     bem_domain = aggregate_bem_region(meshes, unbounded_region, boundaries, FloatType)
     mesh = snap_symmetry_planes(bem_domain.mesh, symmetry_mode)
@@ -987,7 +1015,10 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
         min_clearance_m=Float64(get(options, "ground_plane_min_clearance_m", 0.0)),
     )
     excitation_port_ids = String.(request["excitation_port_ids"])
-    excitations = exterior_excitations(
+    lumped = has_transducers ? exterior_motion_basis(
+        system, excitation_port_ids, boundaries, bem_domain, mesh, unbounded_region, symmetry_mode,
+    ) : nothing
+    excitations = has_transducers ? lumped.basis : exterior_excitations(
         excitation_port_ids,
         (ports=port_objects, items=components),
         boundaries,
@@ -1076,7 +1107,6 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     identity_cache = Dict{Int,Any}(base_order => (identity_p1_p1, identity_p1_dp0))
     cpu_field_cache_by_order = Dict{Int,Any}(base_order => cpu_field_cache)
     cpu_assembly_cache_by_order = Dict{Int,Any}()
-    outputs = get(request, "outputs", Any[])
     cancel_path = get(request, "cancel_path", nothing)
     cancel_requested() = cancel_path !== nothing && isfile(String(cancel_path))
     solved_count = 0
@@ -1108,6 +1138,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     produce_metal_system = function (index)
         omega = FloatType(2pi) * FloatType(frequencies_hz[index])
         wavenumber = omega / sound_speed
+        # Metal is ideal-only: preserve the precompiled producer/generator captures.
         neumann_values = [exterior_neumann(mesh, excitation, density, omega) for excitation in excitations]
         system, assembly_s = assemble_exterior_direct_metal(
             mesh, p1_space, dp0_space, neumann_values, wavenumber, base_rule; metal_fused_kwargs...,
@@ -1175,7 +1206,9 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     symmetry_mode=symmetry_mode,
                 )
             end : nothing
-            neumann_values = [exterior_neumann(mesh, excitation, density, omega) for excitation in excitations]
+            neumann_values = has_transducers ?
+                exterior_basis_neumann_values(mesh, excitations, density, omega, lumped.operators) :
+                [exterior_neumann(mesh, excitation, density, omega) for excitation in excitations]
             operators = nothing
             metal_solve_method = :lu
             exterior_rhs = nothing
@@ -1270,15 +1303,28 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 end
                 solve_s = (time_ns() - solve_started) / 1.0e9
             end
+            basis_pressures = pressures
+            network_solution = nothing
+            if has_transducers
+                network_started = time_ns()
+                p = hcat(basis_pressures...)
+                q = hcat(neumann_values...)
+                z = transpose(lumped.force) * p
+                network_solution = solve_exterior_lumped_network(
+                    z, lumped.transducers, excitations, port_objects, excitation_port_ids, omega, density, sound_speed,
+                    reference_voltage,
+                )
+                pressures = collect(eachcol(p * network_solution.velocity))
+                neumann_values = collect(eachcol(q * network_solution.velocity))
+                solve_s += (time_ns() - network_started) / 1.0e9
+            end
             quantities = Dict{String,Any}[]
             field_s = 0.0
             for output in outputs
                 quantity = String(output["quantity"])
                 if quantity == "exterior_pressure"
                     field_started = time_ns()
-                    raw_points = get(get(output, "options", Dict{String,Any}()), "points_m", Any[])
-                    isempty(raw_points) && error("exterior_pressure output requires options.points_m.")
-                    points = [SVector{3,FloatType}(FloatType.(point)) for point in raw_points]
+                    points = field_points_by_output[String(output["id"])]
                     values = [
                         exterior_field(
                             points,
@@ -1321,16 +1367,30 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                             ["excitation", "bem_face"],
                         ),
                     )
+                elseif quantity == "radiation_impedance_matrix"
+                    matrix, metadata = exterior_impedance_matrix(
+                        mesh, basis_pressures, excitations, components, output["target_ids"], symmetry_mode;
+                        force_matrix=has_transducers ? lumped.force : nothing,
+                    )
+                    push!(quantities, quantity_wire(output, matrix, "N*s/m",
+                        ["receiver_component", "source_component"]; metadata=metadata))
+                elseif quantity in ("diaphragm_velocity", "voice_coil_current") && has_transducers
+                    values = quantity == "diaphragm_velocity" ?
+                        network_solution.velocity[1:length(lumped.transducers), :] : network_solution.current
+                    push!(quantities, quantity_wire(output, Matrix(transpose(values)),
+                        quantity == "diaphragm_velocity" ? "m/s" : "A", ["excitation", "transducer"];
+                        metadata=exterior_transducer_metadata(lumped.transducers)))
                 elseif quantity == "radiation_impedance"
                     impedance_by_component = Complex{FloatType}[]
                     pressure_by_component = Dict(
                         excitation.component_id => pressure
-                        for (excitation, pressure) in zip(excitations, pressures)
+                        for (excitation, pressure) in zip(excitations, basis_pressures)
                     )
                     excitation_by_component = Dict(
                         excitation.component_id => excitation for excitation in excitations
                     )
                     for component in components
+                        component["kind"] == "ideal_velocity_source" || continue
                         component_id = String(component["id"])
                         push!(
                             impedance_by_component,
@@ -1391,6 +1451,13 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     "cache_setup_s" => 0.0,
                 ),
             )
+            if has_transducers
+                diagnostics["exterior_lumped_network"] = Dict(
+                    "termination" => "shorted", "precision" => "float64",
+                    "motion_basis_component_ids" => [e.component_id for e in excitations],
+                    "residual_max_abs" => network_solution.residual_max_abs,
+                )
+            end
             if exterior_rhs !== nothing
                 diagnostics["exterior_rhs_requested_mode"] = exterior_rhs_requested_mode
                 diagnostics["exterior_rhs_mode"] = exterior_rhs.mode
@@ -2126,8 +2193,8 @@ function solve_interior_request(request, system, bounded_regions; event_mode=fal
             DEFAULT_TRANSDUCER_REFERENCE_VOLTAGE_V,
         ),
     )
-    transducer_reference_voltage_v > zero(FloatType) || error(
-        "transducer_reference_voltage_v must be greater than zero.",
+    isfinite(transducer_reference_voltage_v) && transducer_reference_voltage_v > zero(FloatType) || error(
+        "transducer_reference_voltage_v must be finite and positive.",
     )
     fem_consistent_mass_weight = FloatType(
         get(solver_options, "fem_consistent_mass_weight", 1.0),
@@ -2622,9 +2689,11 @@ function solve_request_impl(request; event_mode=false)
             DEFAULT_TRANSDUCER_REFERENCE_VOLTAGE_V,
         ),
     )
-    transducer_reference_voltage_v > zero(FloatType) || error(
-        "transducer_reference_voltage_v must be greater than zero.",
+    isfinite(transducer_reference_voltage_v) && transducer_reference_voltage_v > zero(FloatType) || error(
+        "transducer_reference_voltage_v must be finite and positive.",
     )
+    outputs = get(request, "outputs", Any[])
+    field_points_by_output = parse_field_output_points(outputs, FloatType)
     mesh_setup_started = time_ns()
     fem_domains = aggregate_fem_domains(
         meshes,
@@ -2929,7 +2998,6 @@ function solve_request_impl(request; event_mode=false)
         end
         cache_setup_s = (time_ns() - cache_setup_started) / 1.0e9
     end
-    outputs = get(request, "outputs", Any[])
     rom_requested = any(
         String(output["quantity"]) in SPEAKER_ROM_QUANTITIES for output in outputs
     )
@@ -3275,8 +3343,7 @@ function solve_request_impl(request; event_mode=false)
                     field_started = time_ns()
                     options = get(output, "options", Dict{String,Any}())
                     raw_points = get(options, "points_m", Any[])
-                    isempty(raw_points) && error("interface_radiated_pressure requires points_m.")
-                    points = [SVector{3,FloatType}(FloatType.(point)) for point in raw_points]
+                    points = field_points_by_output[String(output["id"])]
                     ids = [String(interface["id"]) for interface in interfaces]
                     names = [String(get(interface, "name", interface["id"])) for interface in interfaces]
                     if radiation_has_other
@@ -3308,9 +3375,7 @@ function solve_request_impl(request; event_mode=false)
                 elseif quantity == "exterior_pressure"
                     field_started = time_ns()
                     options = get(output, "options", Dict{String,Any}())
-                    raw_points = get(options, "points_m", Any[])
-                    isempty(raw_points) && error("exterior_pressure output requires options.points_m.")
-                    points = [SVector{3,FloatType}(FloatType.(point)) for point in raw_points]
+                    points = field_points_by_output[String(output["id"])]
                     raw_weight_sweep = get(options, "excitation_weights_sweep", Any[])
                     if !isempty(raw_weight_sweep)
                         length(raw_weight_sweep) == length(request["frequencies_hz"]) || error(
@@ -4096,6 +4161,12 @@ function run_worker()
                 requests_since_cleanup += 1
                 reason = cleanup_reason(cleanup, requests_since_cleanup;
                     cancelled=outcome.cancelled, free_fraction=free_fraction)
+                if reason == "aggressive"
+                    finish_aggressive_solve!(outcome.solved_count,
+                        event -> println(JSON.json(event)), reclaim_accelerator_memory!)
+                    requests_since_cleanup = 0
+                    continue
+                end
                 if reason == "reuse"
                     # Release request-owned field caches, retaining allocator/library
                     # caches. CUDA's allocation-pressure reclamation remains enabled.

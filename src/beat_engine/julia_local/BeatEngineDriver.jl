@@ -114,7 +114,7 @@ function beat_backend_from_request(request)
 end
 
 function regular_quadrature_mode_from_config(config, beat_backend::Symbol)
-    default_mode = beat_backend == :cpu ? "wavelength" : "fixed"
+    default_mode = "fixed"
     mode = lowercase(strip(String(get_value(config, "regular_quadrature_mode", get_value(config, "quadrature_mode", default_mode)))))
     mode in ("fixed", "wavelength") || error("Unsupported regular quadrature mode: $(mode). Expected fixed or wavelength.")
     if beat_backend != :cpu && mode == "wavelength"
@@ -1456,6 +1456,7 @@ function solve_request_impl(request)
                         Float32(dense_solve_report.plan.lu_model_seconds),
                     "dense_solve_model_gmres_s" => dense_solve_report === nothing ? nothing :
                         Float32(dense_solve_report.plan.gmres_model_seconds),
+                    BeatEngineCore.beat_dense_refinement_diagnostics(dense_solve_report)...,
                     (near_enabled ? (
                         "near_correction_enabled" => true,
                         "near_pair_count" => operators.near_pair_count,

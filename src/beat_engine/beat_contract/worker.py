@@ -50,12 +50,25 @@ def validate_worker_ready(info: dict) -> None:
             isinstance(values, list) and all(isinstance(value, str) and value for value in values),
             f"invalid {name} capabilities.",
         )
+    if "exterior_component_kinds" in info:
+        kinds = info["exterior_component_kinds"]
+        _require(
+            isinstance(kinds, list) and all(isinstance(kind, str) and bool(kind.strip()) for kind in kinds),
+            "invalid exterior_component_kinds capabilities; expected a list of non-empty strings.",
+        )
     if "exterior_source_profiles" in info:
         profiles = info["exterior_source_profiles"]
         _require(
             isinstance(profiles, list)
             and all(isinstance(profile, str) and bool(profile.strip()) for profile in profiles),
             "invalid exterior_source_profiles capabilities; expected a list of non-empty strings.",
+        )
+    if "optional_output_quantities" in info:
+        quantities = info["optional_output_quantities"]
+        _require(
+            isinstance(quantities, list)
+            and all(isinstance(quantity, str) and bool(quantity.strip()) for quantity in quantities),
+            "invalid optional_output_quantities capabilities; expected a list of non-empty strings.",
         )
     backends = info.get("backends")
     _require(isinstance(backends, dict) and bool(backends), "missing backend availability.")
@@ -93,6 +106,11 @@ def negotiate_submission(info: dict, request: dict, operation: str) -> dict:
                 "interface_radiated_pressure" in info.get("optional_output_quantities", []),
                 "interface radiation output is unavailable; update BEAT Engine.",
             )
+        if any(output["quantity"] == "radiation_impedance_matrix" for output in request["outputs"]):
+            _require(
+                "radiation_impedance_matrix" in info.get("optional_output_quantities", []),
+                "radiation_impedance_matrix output is unavailable; update BEAT Engine.",
+            )
         options = request["solver_options"]
         kinds = {region["kind"] for region in request["compiled_system"]["regions"]}
         kind = (
@@ -104,6 +122,11 @@ def negotiate_submission(info: dict, request: dict, operation: str) -> dict:
         )
         _require(kind in info["solve_kinds"], f"solve kind {kind!r} is unavailable.")
         for component in request["compiled_system"]["components"]:
+            if kind == "exterior_bem":
+                _require(
+                    component["kind"] in info.get("exterior_component_kinds", ["ideal_velocity_source"]),
+                    f"exterior component kind {component['kind']!r} is unavailable; update the engine worker.",
+                )
             if component["kind"] != "ideal_velocity_source":
                 continue
             profile = component["parameters"].get("motion_profile", "uniform_normal")

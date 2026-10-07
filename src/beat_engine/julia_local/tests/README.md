@@ -165,6 +165,14 @@ closure types used by the Metal runtime precompile inventory from their captured
 fields, using the same lookup and field tuples. It requires no GPU or Metal
 package and performs no solves or kernel launches.
 
+`field_output_points_tests.jl` checks the compiled driver's request-level point
+parser's inferred types, exact values and shape errors without a solve or
+accelerator. It reuses the compiled bundle in `runtests.jl` and can run standalone:
+
+```sh
+julia --threads=2 --startup-file=no --project=src/beat_engine/julia_local src/beat_engine/julia_local/tests/field_output_points_tests.jl
+```
+
 Compiled exterior CPU `direct_system` now reaches the existing fused assembler,
 regular/singular SIMD kernels and transposed scatter, with the existing CPU LU
 solve policy. `operator_matrices` remains an explicit route (regular SIMD,

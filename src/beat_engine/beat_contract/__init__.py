@@ -14,7 +14,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-COMPILED_SYSTEM_VERSION = 2
+COMPILED_SYSTEM_VERSION = 3
 SYSTEM_SOLVE_REQUEST_VERSION = 1
 SYSTEM_RESULT_VERSION = 2
 SUPPORTED_SYSTEM_RESULT_VERSIONS = frozenset({1, SYSTEM_RESULT_VERSION})
@@ -118,7 +118,7 @@ def _mesh_validator():
 
 
 def _source_profile_version(system: dict) -> None:
-    if system["contract_version"] == 2:
+    if system["contract_version"] >= 2:
         return
     for component in system["components"]:
         if component["kind"] != "ideal_velocity_source":
@@ -129,6 +129,84 @@ def _source_profile_version(system: dict) -> None:
                 f"compiled_system.components.{component['id']}.parameters",
                 "source motion profiles require compiled-system contract version 2",
             )
+
+
+def _component_support(system: dict) -> None:
+    exterior = not any(region["kind"] == "bounded_air" for region in system["regions"])
+    for component in system["components"]:
+        path = f"compiled_system.components.{component['id']}"
+        if component["kind"] == "passive_radiator":
+            _fail(path, "passive_radiator is not implemented")
+        if exterior and component["kind"] == "electrodynamic_transducer" and system["contract_version"] != 3:
+            _fail(path, "exterior electrodynamic_transducer requires compiled-system contract version 3")
+
+
+def _impedance_outputs(request: dict) -> None:
+    system = request["compiled_system"]
+    excited = {
+        port["component_id"] for port in system["excitation_ports"] if port["id"] in request["excitation_port_ids"]
+    }
+    components = {component["id"]: component for component in system["components"]}
+    exterior_transducers = not any(region["kind"] == "bounded_air" for region in system["regions"]) and any(
+        component["kind"] == "electrodynamic_transducer" for component in components.values()
+    )
+    options = request["solver_options"]
+    if "transducer_reference_voltage_v" in options:
+        voltage = options["transducer_reference_voltage_v"]
+        if (
+            isinstance(voltage, bool)
+            or not isinstance(voltage, (int, float))
+            or not math.isfinite(voltage)
+            or voltage <= 0
+        ):
+            _fail(
+                "request.solver_options.transducer_reference_voltage_v",
+                "transducer_reference_voltage_v must be finite and positive",
+            )
+    if exterior_transducers:
+        if str(options.get("bem_backend", "cpu")).lower() == "metal":
+            _fail(
+                "request.solver_options.bem_backend",
+                "exterior electrodynamic_transducers cannot use Metal: float64 BEM is unsupported; use CPU",
+            )
+        if str(options.get("precision", "float32")).lower() != "float64":
+            _fail(
+                "request.solver_options.precision", "exterior electrodynamic_transducers require float64 BEM precision"
+            )
+        if str(options.get("symmetry", "off")).strip().lower() not in ("off", "ground"):
+            _fail(
+                "request.solver_options.symmetry",
+                "exterior electrodynamic_transducers support only off and ground symmetry",
+            )
+    for output in request["outputs"]:
+        if output["quantity"] == "radiation_impedance_matrix":
+            if any(region["kind"] == "bounded_air" for region in system["regions"]) or any(
+                component["kind"] not in ("ideal_velocity_source", "electrodynamic_transducer")
+                for component in components.values()
+            ):
+                _fail(
+                    "request.outputs",
+                    "radiation_impedance_matrix requires an exterior system with supported component kinds",
+                )
+            targets = output["target_ids"]
+            _references(targets, components, "request.outputs.target_ids")
+            if any(
+                target not in excited and components[target]["kind"] != "electrodynamic_transducer"
+                for target in targets
+            ):
+                _fail("request.outputs.target_ids", "radiation_impedance_matrix targets must be excited")
+        elif output["quantity"] == "radiation_impedance" and not any(
+            region["kind"] == "bounded_air" for region in system["regions"]
+        ):
+            if any(
+                component_id not in excited
+                for component_id, component in components.items()
+                if component["kind"] == "ideal_velocity_source"
+            ):
+                _fail(
+                    "request.outputs",
+                    "radiation_impedance requires every compiled component to be excited; radiator axis remains compiled component order",
+                )
 
 
 def _graph(system: dict) -> None:
@@ -172,6 +250,7 @@ def validate_compiled_system(raw: dict) -> None:
     _validate(raw, _schema()["$defs"]["compiled_system"], "compiled_system")
     _source_profile_version(raw)
     _graph(raw)
+    _component_support(raw)
 
 
 def validate_solve_request(raw: dict) -> None:
@@ -179,9 +258,11 @@ def validate_solve_request(raw: dict) -> None:
     _validate(raw, _schema()["$defs"]["solve_request"], "request")
     _source_profile_version(raw["compiled_system"])
     _graph(raw["compiled_system"])
+    _component_support(raw["compiled_system"])
     _references(
         raw["excitation_port_ids"],
         {port["id"]: port for port in raw["compiled_system"]["excitation_ports"]},
         "request.excitation_port_ids",
     )
     _unique([output["id"] for output in raw["outputs"]], "request.outputs")
+    _impedance_outputs(raw)

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from beat_engine.beat_contract import validate_compiled_system, validate_solve_request
+from beat_engine.beat_contract import COMPILED_SYSTEM_VERSION, validate_compiled_system, validate_solve_request
 
 CONTRACT = Path(__file__).resolve().parents[1] / "src/beat_engine/beat_contract"
 CORPUS = json.loads((CONTRACT / "conformance.json").read_text())
@@ -67,8 +67,10 @@ def test_engine_conformance_cases(case):
     if case["valid"]:
         validate_solve_request(request)
     else:
-        with pytest.raises(ValueError, match="BEAT contract"):
+        with pytest.raises(ValueError, match="BEAT contract") as error:
             validate_solve_request(request)
+        if "expected_message" in case:
+            assert case["expected_message"] in str(error.value)
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), object()])
@@ -130,3 +132,28 @@ def test_axial_source_requires_compiled_v2_and_v1_normal_remains_valid():
     source["parameters"] = {"motion_axis": [0, 0, 1]}
     with pytest.raises(ValueError, match="contract version 2"):
         validate_solve_request(request)
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_passive_radiator_rejected_in_every_region_kind(bounded):
+    request = copy.deepcopy(CORPUS["base_request"])
+    system = request["compiled_system"]
+    if bounded:
+        system["regions"][0]["kind"] = "bounded_air"
+    system["components"][0]["kind"] = "passive_radiator"
+    with pytest.raises(ValueError, match="passive_radiator is not implemented"):
+        validate_compiled_system(system)
+    with pytest.raises(ValueError, match="passive_radiator is not implemented"):
+        validate_solve_request(request)
+
+
+def test_matrix_refused_for_bounded_request():
+    request = copy.deepcopy(CORPUS["base_request"])
+    request["compiled_system"]["regions"][0]["kind"] = "bounded_air"
+    request["outputs"] = [{"id": "z", "quantity": "radiation_impedance_matrix", "target_ids": [], "options": {}}]
+    with pytest.raises(ValueError, match="requires an exterior system"):
+        validate_solve_request(request)
+
+
+def test_current_compiled_contract_version():
+    assert COMPILED_SYSTEM_VERSION == 3

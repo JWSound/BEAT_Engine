@@ -14,7 +14,8 @@
     ],
     "compiled_system": [
       1,
-      2
+      2,
+      3
     ],
     "system_result": [
       2
@@ -59,10 +60,15 @@
   ],
   "optional_output_quantities": [
     "interface_average_normal_velocity",
-    "interface_radiated_pressure"
+    "interface_radiated_pressure",
+    "radiation_impedance_matrix"
   ],
   "request_transports": [
     "file",
     "inline_json"
+  ],
+  "exterior_component_kinds": [
+    "ideal_velocity_source",
+    "electrodynamic_transducer"
   ]
 }

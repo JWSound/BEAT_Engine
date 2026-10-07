@@ -1,11 +1,15 @@
 include(joinpath(@__DIR__, "deploy_cpu_tests.jl"))
 include(joinpath(@__DIR__, "compiled_workload_tests.jl"))
 include(joinpath(@__DIR__, "compiled_driver_closure_tests.jl"))
+include(joinpath(@__DIR__, "field_output_points_tests.jl"))
+include(joinpath(@__DIR__, "regular_quadrature_default_tests.jl"))
 using Test
 using StaticArrays
 using LinearAlgebra
 
 include(joinpath(@__DIR__, "contract_tests.jl"))
+include(joinpath(@__DIR__, "exterior_impedance_matrix_tests.jl"))
+include(joinpath(@__DIR__, "exterior_transducer_tests.jl"))
 include(joinpath(@__DIR__, "worker_cleanup_tests.jl"))
 include(joinpath(@__DIR__, "deploy_rhs_policy_tests.jl"))
 include(joinpath(@__DIR__, "exterior_rhs_policy_tests.jl"))
@@ -89,6 +93,7 @@ include(joinpath(@__DIR__, "coupled_solver_tests.jl"))
 include(joinpath(@__DIR__, "speaker_rom_tests.jl"))
 include(joinpath(@__DIR__, "coupled_condensed_tests.jl"))
 include(joinpath(@__DIR__, "cpu_simd_kernel_tests.jl"))
+include(joinpath(@__DIR__, "cpu_refinement_tests.jl"))
 include(joinpath(@__DIR__, "phasor_tests.jl"))
 include(joinpath(@__DIR__, "axial_source_tests.jl"))
 

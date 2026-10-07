@@ -123,13 +123,63 @@ function references(values, available, path)
 end
 
 function source_profile_version(system)
-    system["contract_version"] == 2 && return nothing
+    system["contract_version"] >= 2 && return nothing
     for component in system["components"]
         component["kind"] == "ideal_velocity_source" || continue
         parameters = component["parameters"]
         haskey(parameters, "motion_profile") || haskey(parameters, "motion_axis") || continue
         fail("compiled_system.components.$(component["id"]).parameters",
             "source motion profiles require compiled-system contract version 2")
+    end
+    return nothing
+end
+
+function component_support(system)
+    exterior = !any(region["kind"] == "bounded_air" for region in system["regions"])
+    for component in system["components"]
+        path = "compiled_system.components.$(component["id"])"
+        component["kind"] == "passive_radiator" && fail(path, "passive_radiator is not implemented")
+        exterior && component["kind"] == "electrodynamic_transducer" && system["contract_version"] != 3 &&
+            fail(path, "exterior electrodynamic_transducer requires compiled-system contract version 3")
+    end
+    return nothing
+end
+
+function impedance_outputs(request)
+    system = request["compiled_system"]
+    excited = Set(port["component_id"] for port in system["excitation_ports"]
+        if port["id"] in request["excitation_port_ids"])
+    components = Dict(component["id"] => component for component in system["components"])
+    exterior = !any(region["kind"] == "bounded_air" for region in system["regions"])
+    options = request["solver_options"]
+    if haskey(options, "transducer_reference_voltage_v")
+        voltage = options["transducer_reference_voltage_v"]
+        voltage isa Real && !(voltage isa Bool) && isfinite(voltage) && voltage > 0 ||
+            fail("request.solver_options.transducer_reference_voltage_v",
+                "transducer_reference_voltage_v must be finite and positive")
+    end
+    if exterior && any(component["kind"] == "electrodynamic_transducer" for component in values(components))
+        lowercase(String(get(options, "bem_backend", "cpu"))) == "metal" &&
+            fail("request.solver_options.bem_backend",
+                "exterior electrodynamic_transducers cannot use Metal: float64 BEM is unsupported; use CPU")
+        lowercase(String(get(options, "precision", "float32"))) == "float64" ||
+            fail("request.solver_options.precision", "exterior electrodynamic_transducers require float64 BEM precision")
+        lowercase(strip(String(get(options, "symmetry", "off")))) in ("off", "ground") ||
+            fail("request.solver_options.symmetry", "exterior electrodynamic_transducers support only off and ground symmetry")
+    end
+    for output in request["outputs"]
+        quantity = output["quantity"]
+        if quantity == "radiation_impedance_matrix"
+            exterior && all(component["kind"] in ("ideal_velocity_source", "electrodynamic_transducer") for component in values(components)) ||
+                fail("request.outputs", "radiation_impedance_matrix requires an exterior system with supported component kinds")
+            targets = output["target_ids"]
+            references(targets, components, "request.outputs.target_ids")
+            all(target in excited || components[target]["kind"] == "electrodynamic_transducer" for target in targets) ||
+                fail("request.outputs.target_ids", "radiation_impedance_matrix targets must be excited")
+        elseif quantity == "radiation_impedance" && exterior
+            all(id in excited for (id, component) in components if component["kind"] == "ideal_velocity_source") || fail("request.outputs",
+                "radiation_impedance requires every compiled component to be excited; radiator axis remains compiled component order")
+        end
     end
     return nothing
 end
@@ -172,8 +222,10 @@ function validate_system_request(request)
     validate(request, SCHEMA["\$defs"]["solve_request"], "request")
     source_profile_version(request["compiled_system"])
     graph(request["compiled_system"])
+    component_support(request["compiled_system"])
     references(request["excitation_port_ids"], Dict(port["id"] => port for port in request["compiled_system"]["excitation_ports"]), "request.excitation_port_ids")
     unique_ids([output["id"] for output in request["outputs"]], "request.outputs")
+    impedance_outputs(request)
     return nothing
 end
 
