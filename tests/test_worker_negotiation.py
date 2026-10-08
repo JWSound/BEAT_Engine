@@ -29,6 +29,54 @@ def payload():
     return json.loads((CONTRACT / "example-exterior-request.json").read_text())
 
 
+def enable_wall_loss(payload):
+    system = payload["compiled_system"]
+    system["regions"][0]["kind"] = "bounded_air"
+    wall = copy.deepcopy(system["boundaries"][0])
+    wall.update(id="boundary:wall", kind="rigid", parameters={"thermoviscous_wall_losses": "thin_boundary_layer"})
+    wall["group"]["tag"] = 3
+    system["boundaries"].append(wall)
+    return wall
+
+
+@pytest.mark.parametrize("capability", ["fem_wall_loss_models", "fem_wall_loss_scopes"])
+@pytest.mark.parametrize("advertised", [None, [], ["future_value"]])
+def test_thermoviscous_model_requires_explicit_capability(ready, payload, advertised, capability):
+    wall = enable_wall_loss(payload)
+    if advertised is None:
+        ready.pop(capability)
+    else:
+        ready[capability] = advertised
+    with pytest.raises(WorkerCompatibilityError, match="thermoviscous wall loss model"):
+        negotiate_submission(ready, payload, "solve")
+    wall["parameters"]["thermoviscous_wall_losses"] = "off"
+    negotiate_submission(ready, payload, "solve")
+
+
+@pytest.mark.parametrize("capability", ["fem_wall_loss_models", "fem_wall_loss_scopes"])
+def test_thermoviscous_capability_accepts_enabled_model_and_rejects_invalid_handshake(ready, payload, capability):
+    enable_wall_loss(payload)
+    negotiate_submission(ready, payload, "solve")
+    ready[capability] = "thin_boundary_layer"
+    with pytest.raises(WorkerCompatibilityError, match=f"invalid {capability}"):
+        negotiate_submission(ready, payload, "solve")
+
+
+@pytest.mark.parametrize("capability", ["fem_wall_loss_models", "fem_wall_loss_scopes"])
+def test_thermoviscous_incompatible_request_never_reaches_worker(tmp_path, ready, payload, capability):
+    ready.pop(capability)
+    enable_wall_loss(payload)
+    worker, received = fake_worker(tmp_path, ready)
+    path = tmp_path / "thermoviscous.json"
+    path.write_text(json.dumps(payload))
+    try:
+        with pytest.raises(WorkerCompatibilityError, match="thermoviscous wall loss model"):
+            worker.submit(path)
+        assert not received.exists()
+    finally:
+        worker.terminate()
+
+
 def test_selects_current_formats_and_accepts_future_advertised_versions(ready, payload):
     ready["contracts"]["system_result"].append(3)
     ready["future_extension"] = True

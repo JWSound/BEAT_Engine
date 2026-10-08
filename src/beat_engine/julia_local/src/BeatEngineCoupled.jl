@@ -35,6 +35,12 @@ export VolumeMesh,
     blend_fem_mass_matrix,
     assemble_fem_dynamic_stiffness,
     assemble_boundary_mass_matrix,
+    assemble_boundary_tangential_stiffness,
+    prepare_thermoviscous_operator,
+    thermoviscous_surface_operator,
+    thermoviscous_coefficients,
+    add_thermoviscous_terms,
+    thermoviscous_diagnostics,
     miki_rigid_backed_surface_admittance,
     assemble_prescribed_velocity_load,
     sealed_cavity_modes,
@@ -704,6 +710,8 @@ function assemble_boundary_mass_matrix(
     return sparse(rows, cols, values, length(mesh.vertices), length(boundary_vertex_indices))
 end
 
+include("BeatEngineThermoviscous.jl")
+
 function assemble_prescribed_velocity_load(
     mesh::VolumeMesh{T},
     boundary_tag::Int,
@@ -1081,6 +1089,7 @@ function prepare_coupled_cache(
     coupled_bem_assembly::Symbol=:auto,
     bulk_loss_factor_by_vertex=zeros(T, length(fem_mesh.vertices)),
     wall_impedances=NamedTuple[],
+    thermoviscous_walls=NamedTuple[],
 ) where {T<:AbstractFloat}
     is_quadratic(fem_mesh) && error(
         "Quadratic tetrahedra are currently supported only by the pure interior FEM solve.",
@@ -1116,6 +1125,8 @@ function prepare_coupled_cache(
         end
         for spec in wall_impedances
     ]
+    thermoviscous_operator = prepare_thermoviscous_operator(
+        fem_mesh, thermoviscous_walls; symmetry_mode=normalized_symmetry)
     fem_matrix_cache_s = (time_ns() - fem_matrix_started) / 1.0e9
 
     interface_started = time_ns()
@@ -1269,6 +1280,10 @@ function prepare_coupled_cache(
                 build_sparse_cache(operator.matrix)
                 for operator in wall_impedance_operators
             ],
+            thermoviscous=isnothing(thermoviscous_operator) ? [] : [
+                build_sparse_cache(thermoviscous_operator.stiffness),
+                build_sparse_cache(thermoviscous_operator.mass),
+            ],
             fem_load=build_sparse_cache(interface_operators.fem_load),
             fem_trace=build_sparse_cache(interface_operators.fem_trace),
             bem_trace=build_sparse_cache(interface_operators.bem_trace),
@@ -1312,6 +1327,7 @@ function prepare_coupled_cache(
         bulk_loss_mass=bulk_loss_mass,
         bulk_loss_factor_by_vertex=T.(collect(bulk_loss_factor_by_vertex)),
         wall_impedance_operators=wall_impedance_operators,
+        thermoviscous_operator=thermoviscous_operator,
         interface_operators=interface_operators,
         p1=p1,
         dp0=dp0,
@@ -1368,7 +1384,7 @@ function release_coupled_cache!(cache)
         release_rocm_burton_miller_identity_cache!(cache.device_identity_cache)
         BeatEngineCore.amdgpu_module().unsafe_free!(cache.device_bem_flux)
         for (name, sparse_cache) in pairs(cache.device_sparse_blocks)
-            if name == :wall_impedance
+            if name in (:wall_impedance, :thermoviscous)
                 for wall_cache in sparse_cache
                     release_rocm_sparse_scatter_cache!(wall_cache)
                 end
@@ -1445,7 +1461,7 @@ function release_coupled_cache!(cache)
     cache.device_bem_flux === nothing || BeatEngineCore.cuda_module().unsafe_free!(cache.device_bem_flux)
     BeatEngineCore.release_cuda_bem_flux_cache!(cache.device_bem_flux_sparse)
     for (name, sparse_cache) in pairs(cache.device_sparse_blocks)
-        if name == :wall_impedance
+        if name in (:wall_impedance, :thermoviscous)
             for wall_cache in sparse_cache
                 release_cuda_sparse_scatter_cache!(wall_cache)
             end
@@ -2060,6 +2076,7 @@ function build_coupled_system(
     bulk_loss_factor::T=zero(T),
     bulk_loss_factor_by_vertex=nothing,
     wall_impedances=NamedTuple[],
+    thermoviscous_walls=NamedTuple[],
     transducers::AbstractVector{ElectrodynamicTransducer{T}}=ElectrodynamicTransducer{T}[],
     transducer_operators=nothing,
     prescribed_bem_normal_velocity=nothing,
@@ -2107,6 +2124,7 @@ function build_coupled_system(
             bulk_loss_factor_by_vertex
         ),
         wall_impedances=wall_impedances,
+        thermoviscous_walls=thermoviscous_walls,
     ) : cache
     prepared.bem_backend == bem_backend ||
         error("Coupled cache backend does not match requested BEM backend.")
@@ -2122,6 +2140,8 @@ function build_coupled_system(
         wavenumber;
         bulk_loss_mass=prepared.bulk_loss_mass,
     )
+    fem_system = add_thermoviscous_terms(
+        fem_system, prepared.thermoviscous_operator, frequency_hz, sound_speed, density)
     wall_admittances = Complex{T}[
         miki_rigid_backed_surface_admittance(
             frequency_hz,
@@ -2373,6 +2393,13 @@ function build_coupled_system(
                     alpha=Complex{T}(0, -propagation_sign() * (wavenumber^2)),
                     add=true,
                 )
+                if !isnothing(prepared.thermoviscous_operator)
+                    tv = thermoviscous_coefficients(frequency_hz, sound_speed, density)
+                    for (block, coefficient) in zip(prepared.device_sparse_blocks.thermoviscous,
+                                                     (tv.viscous, tv.thermal))
+                        scatter_sparse!(d_coupled, block; alpha=coefficient, add=true)
+                    end
+                end
                 for (wall_cache, admittance) in zip(
                     prepared.device_sparse_blocks.wall_impedance,
                     wall_admittances,
