@@ -362,7 +362,8 @@ function _fem_system_float64(store, fem_mesh::VolumeMesh, prepared, frequency_hz
     walls = [operator.matrix for operator in prepared.wall_impedance_operators]
     cached = !isnothing(store) && haskey(store, :matrices) &&
              store[:vertices] == fem_mesh.vertices && store[:tetrahedra] == fem_mesh.tetrahedra &&
-             store[:bulk_loss] == prepared.bulk_loss_factor_by_vertex && store[:walls] == walls
+             store[:bulk_loss] == prepared.bulk_loss_factor_by_vertex && store[:walls] == walls &&
+             store[:thermoviscous] == prepared.thermoviscous_operator
     matrices = cached ? store[:matrices] : nothing
     if isnothing(matrices)
         mesh = VolumeMesh{Float64}(
@@ -385,12 +386,15 @@ function _fem_system_float64(store, fem_mesh::VolumeMesh, prepared, frequency_hz
             mass=mass,
             bulk_loss_mass=spdiagm(0 => Float64.(prepared.bulk_loss_factor_by_vertex)) * mass,
             walls=[SparseMatrixCSC{Float64,Int}(operator.matrix) for operator in prepared.wall_impedance_operators],
+            thermoviscous=isnothing(prepared.thermoviscous_operator) ? nothing :
+                thermoviscous_surface_operator(mesh, prepared.thermoviscous_operator.face_indices),
         )
         if !isnothing(store)
             store[:vertices] = copy(fem_mesh.vertices)
             store[:tetrahedra] = copy(fem_mesh.tetrahedra)
             store[:bulk_loss] = copy(prepared.bulk_loss_factor_by_vertex)
             store[:walls] = [copy(matrix) for matrix in walls]
+            store[:thermoviscous] = deepcopy(prepared.thermoviscous_operator)
             store[:matrices] = matrices
         end
     end
@@ -401,6 +405,8 @@ function _fem_system_float64(store, fem_mesh::VolumeMesh, prepared, frequency_hz
         omega / Float64(sound_speed);
         bulk_loss_mass=matrices.bulk_loss_mass,
     )
+    system = add_thermoviscous_terms(system, matrices.thermoviscous,
+        Float64(frequency_hz), Float64(sound_speed), Float64(density))
     for (operator, matrix) in zip(prepared.wall_impedance_operators, matrices.walls)
         admittance = miki_rigid_backed_surface_admittance(
             Float64(frequency_hz),
@@ -1606,6 +1612,7 @@ function prepare_condensed_coupled_cache(
     retained_fem_vertices=interface_map.fem_vertex_indices,
     bulk_loss_factor_by_vertex=zeros(T, length(fem_mesh.vertices)),
     wall_impedances=NamedTuple[],
+    thermoviscous_walls=NamedTuple[],
     bem_backend::Symbol=:cpu,
 ) where {T<:AbstractFloat}
     # The condensed solver's linear algebra is CPU-only; the BEM operators may
@@ -1623,6 +1630,7 @@ function prepare_condensed_coupled_cache(
         retained_fem_vertices=retained_fem_vertices,
         bulk_loss_factor_by_vertex=bulk_loss_factor_by_vertex,
         wall_impedances=wall_impedances,
+        thermoviscous_walls=thermoviscous_walls,
     )
     # The base order is always carried, whether or not any frequency selects it: with the q1 tier
     # enabled and a base order of 4, every frequency can select 1 or 2 and leave the base out of
@@ -1943,6 +1951,7 @@ function build_condensed_coupled_system(
     bulk_loss_factor::T=zero(T),
     bulk_loss_factor_by_vertex=nothing,
     wall_impedances=NamedTuple[],
+    thermoviscous_walls=NamedTuple[],
     transducers::AbstractVector{ElectrodynamicTransducer{T}}=ElectrodynamicTransducer{T}[],
     transducer_operators=nothing,
     prescribed_bem_normal_velocity=nothing,
@@ -1999,6 +2008,7 @@ function build_condensed_coupled_system(
             bulk_loss_factor_by_vertex
         ),
         wall_impedances=wall_impedances,
+        thermoviscous_walls=thermoviscous_walls,
     ) : cache
     if !isnothing(cache)
         # Orders are compared as integers. `TriangleRule` defines no `==`, so comparing rules here
@@ -2036,6 +2046,8 @@ function build_condensed_coupled_system(
         wavenumber;
         bulk_loss_mass=prepared.bulk_loss_mass,
     )
+    fem_system = add_thermoviscous_terms(
+        fem_system, prepared.thermoviscous_operator, frequency_hz, sound_speed, density)
     wall_admittances = Complex{T}[
         miki_rigid_backed_surface_admittance(
             frequency_hz,
