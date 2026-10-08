@@ -3032,6 +3032,820 @@
           "value": 1
         }
       ]
+    },
+    {
+      "name": "thermoviscous selected wall accepted",
+      "valid": true,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "regions",
+            0,
+            "kind"
+          ],
+          "value": "bounded_air"
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries"
+          ],
+          "value": [
+            {
+              "id": "boundary:source",
+              "name": "Source",
+              "kind": "moving",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 2,
+                "name": null
+              },
+              "parameters": {}
+            },
+            {
+              "id": "boundary:wall",
+              "name": "Source",
+              "kind": "rigid",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 3,
+                "name": null
+              },
+              "parameters": {
+                "thermoviscous_wall_losses": "thin_boundary_layer"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "thermoviscous moving rejected",
+      "valid": false,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "regions",
+            0,
+            "kind"
+          ],
+          "value": "bounded_air"
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries"
+          ],
+          "value": [
+            {
+              "id": "boundary:source",
+              "name": "Source",
+              "kind": "moving",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 2,
+                "name": null
+              },
+              "parameters": {}
+            },
+            {
+              "id": "boundary:wall",
+              "name": "Source",
+              "kind": "rigid",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 3,
+                "name": null
+              },
+              "parameters": {
+                "thermoviscous_wall_losses": "thin_boundary_layer"
+              }
+            }
+          ]
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries",
+            1,
+            "kind"
+          ],
+          "value": "moving"
+        }
+      ]
+    },
+    {
+      "name": "thermoviscous interface rejected",
+      "valid": false,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "regions",
+            0,
+            "kind"
+          ],
+          "value": "bounded_air"
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries"
+          ],
+          "value": [
+            {
+              "id": "boundary:source",
+              "name": "Source",
+              "kind": "moving",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 2,
+                "name": null
+              },
+              "parameters": {}
+            },
+            {
+              "id": "boundary:wall",
+              "name": "Source",
+              "kind": "rigid",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 3,
+                "name": null
+              },
+              "parameters": {
+                "thermoviscous_wall_losses": "thin_boundary_layer"
+              }
+            }
+          ]
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries",
+            1,
+            "kind"
+          ],
+          "value": "interface"
+        }
+      ]
+    },
+    {
+      "name": "thermoviscous plane_wave_tube_termination rejected",
+      "valid": false,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "regions",
+            0,
+            "kind"
+          ],
+          "value": "bounded_air"
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries"
+          ],
+          "value": [
+            {
+              "id": "boundary:source",
+              "name": "Source",
+              "kind": "moving",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 2,
+                "name": null
+              },
+              "parameters": {}
+            },
+            {
+              "id": "boundary:wall",
+              "name": "Source",
+              "kind": "rigid",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 3,
+                "name": null
+              },
+              "parameters": {
+                "thermoviscous_wall_losses": "thin_boundary_layer"
+              }
+            }
+          ]
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries",
+            1,
+            "kind"
+          ],
+          "value": "plane_wave_tube_termination"
+        }
+      ]
+    },
+    {
+      "name": "thermoviscous impedance rejected",
+      "valid": false,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "regions",
+            0,
+            "kind"
+          ],
+          "value": "bounded_air"
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries"
+          ],
+          "value": [
+            {
+              "id": "boundary:source",
+              "name": "Source",
+              "kind": "moving",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 2,
+                "name": null
+              },
+              "parameters": {}
+            },
+            {
+              "id": "boundary:wall",
+              "name": "Source",
+              "kind": "rigid",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 3,
+                "name": null
+              },
+              "parameters": {
+                "thermoviscous_wall_losses": "thin_boundary_layer"
+              }
+            }
+          ]
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries",
+            1,
+            "kind"
+          ],
+          "value": "impedance"
+        }
+      ]
+    },
+    {
+      "name": "thermoviscous unused rejected",
+      "valid": false,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "regions",
+            0,
+            "kind"
+          ],
+          "value": "bounded_air"
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries"
+          ],
+          "value": [
+            {
+              "id": "boundary:source",
+              "name": "Source",
+              "kind": "moving",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 2,
+                "name": null
+              },
+              "parameters": {}
+            },
+            {
+              "id": "boundary:wall",
+              "name": "Source",
+              "kind": "rigid",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 3,
+                "name": null
+              },
+              "parameters": {
+                "thermoviscous_wall_losses": "thin_boundary_layer"
+              }
+            }
+          ]
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries",
+            1,
+            "kind"
+          ],
+          "value": "unused"
+        }
+      ]
+    },
+    {
+      "name": "thermoviscous exterior rejected",
+      "valid": false,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "regions",
+            0,
+            "kind"
+          ],
+          "value": "bounded_air"
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries"
+          ],
+          "value": [
+            {
+              "id": "boundary:source",
+              "name": "Source",
+              "kind": "moving",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 2,
+                "name": null
+              },
+              "parameters": {}
+            },
+            {
+              "id": "boundary:wall",
+              "name": "Source",
+              "kind": "rigid",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 3,
+                "name": null
+              },
+              "parameters": {
+                "thermoviscous_wall_losses": "thin_boundary_layer"
+              }
+            }
+          ]
+        },
+        {
+          "path": [
+            "compiled_system",
+            "regions",
+            0,
+            "kind"
+          ],
+          "value": "unbounded_air"
+        }
+      ]
+    },
+    {
+      "name": "thermoviscous lining rejected",
+      "valid": false,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "regions",
+            0,
+            "kind"
+          ],
+          "value": "bounded_air"
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries"
+          ],
+          "value": [
+            {
+              "id": "boundary:source",
+              "name": "Source",
+              "kind": "moving",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 2,
+                "name": null
+              },
+              "parameters": {}
+            },
+            {
+              "id": "boundary:wall",
+              "name": "Source",
+              "kind": "rigid",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 3,
+                "name": null
+              },
+              "parameters": {
+                "thermoviscous_wall_losses": "thin_boundary_layer"
+              }
+            }
+          ]
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries",
+            1,
+            "parameters",
+            "wall_impedance"
+          ],
+          "value": {
+            "model": "miki"
+          }
+        }
+      ]
+    },
+    {
+      "name": "thermoviscous component wall rejected",
+      "valid": false,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "regions",
+            0,
+            "kind"
+          ],
+          "value": "bounded_air"
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries"
+          ],
+          "value": [
+            {
+              "id": "boundary:source",
+              "name": "Source",
+              "kind": "moving",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 2,
+                "name": null
+              },
+              "parameters": {}
+            },
+            {
+              "id": "boundary:wall",
+              "name": "Source",
+              "kind": "rigid",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 3,
+                "name": null
+              },
+              "parameters": {
+                "thermoviscous_wall_losses": "thin_boundary_layer"
+              }
+            }
+          ]
+        },
+        {
+          "path": [
+            "compiled_system",
+            "components",
+            0,
+            "boundary_ids"
+          ],
+          "value": [
+            "boundary:wall"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "thermoviscous invalid enum 'unknown'",
+      "valid": false,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "regions",
+            0,
+            "kind"
+          ],
+          "value": "bounded_air"
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries"
+          ],
+          "value": [
+            {
+              "id": "boundary:source",
+              "name": "Source",
+              "kind": "moving",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 2,
+                "name": null
+              },
+              "parameters": {}
+            },
+            {
+              "id": "boundary:wall",
+              "name": "Source",
+              "kind": "rigid",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 3,
+                "name": null
+              },
+              "parameters": {
+                "thermoviscous_wall_losses": "thin_boundary_layer"
+              }
+            }
+          ]
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries",
+            1,
+            "parameters",
+            "thermoviscous_wall_losses"
+          ],
+          "value": "unknown"
+        }
+      ]
+    },
+    {
+      "name": "thermoviscous invalid enum True",
+      "valid": false,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "regions",
+            0,
+            "kind"
+          ],
+          "value": "bounded_air"
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries"
+          ],
+          "value": [
+            {
+              "id": "boundary:source",
+              "name": "Source",
+              "kind": "moving",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 2,
+                "name": null
+              },
+              "parameters": {}
+            },
+            {
+              "id": "boundary:wall",
+              "name": "Source",
+              "kind": "rigid",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 3,
+                "name": null
+              },
+              "parameters": {
+                "thermoviscous_wall_losses": "thin_boundary_layer"
+              }
+            }
+          ]
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries",
+            1,
+            "parameters",
+            "thermoviscous_wall_losses"
+          ],
+          "value": true
+        }
+      ]
+    },
+    {
+      "name": "thermoviscous invalid enum 3",
+      "valid": false,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "regions",
+            0,
+            "kind"
+          ],
+          "value": "bounded_air"
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries"
+          ],
+          "value": [
+            {
+              "id": "boundary:source",
+              "name": "Source",
+              "kind": "moving",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 2,
+                "name": null
+              },
+              "parameters": {}
+            },
+            {
+              "id": "boundary:wall",
+              "name": "Source",
+              "kind": "rigid",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 3,
+                "name": null
+              },
+              "parameters": {
+                "thermoviscous_wall_losses": "thin_boundary_layer"
+              }
+            }
+          ]
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries",
+            1,
+            "parameters",
+            "thermoviscous_wall_losses"
+          ],
+          "value": 3
+        }
+      ]
+    },
+    {
+      "name": "thermoviscous invalid enum None",
+      "valid": false,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "regions",
+            0,
+            "kind"
+          ],
+          "value": "bounded_air"
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries"
+          ],
+          "value": [
+            {
+              "id": "boundary:source",
+              "name": "Source",
+              "kind": "moving",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 2,
+                "name": null
+              },
+              "parameters": {}
+            },
+            {
+              "id": "boundary:wall",
+              "name": "Source",
+              "kind": "rigid",
+              "region_id": "region:exterior",
+              "group": {
+                "mesh_id": "mesh:exterior",
+                "dimension": 2,
+                "tag": 3,
+                "name": null
+              },
+              "parameters": {
+                "thermoviscous_wall_losses": "thin_boundary_layer"
+              }
+            }
+          ]
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries",
+            1,
+            "parameters",
+            "thermoviscous_wall_losses"
+          ],
+          "value": null
+        }
+      ]
+    },
+    {
+      "name": "thermoviscous off allowed on exterior moving boundary",
+      "valid": true,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "boundaries",
+            0,
+            "parameters"
+          ],
+          "value": {
+            "thermoviscous_wall_losses": "off"
+          }
+        }
+      ]
+    },
+    {
+      "name": "thermoviscous old region assignment rejected",
+      "valid": false,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "regions",
+            0,
+            "loss_model"
+          ],
+          "value": {
+            "thermoviscous_wall_losses": "thin_boundary_layer"
+          }
+        }
+      ]
     }
   ]
 }
