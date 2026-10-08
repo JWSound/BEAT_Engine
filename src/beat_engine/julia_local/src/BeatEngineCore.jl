@@ -151,6 +151,7 @@ export BoundaryMesh,
     release_metal_burton_miller_system!,
     assemble_regular_galerkin_operators_metal_regular,
     evaluate_galerkin_field_metal,
+    evaluate_galerkin_field_metal_outputs,
     fibonacci_sphere,
     helmholtz_adjoint_double_layer_kernel,
     helmholtz_double_layer_kernel,
@@ -1679,6 +1680,7 @@ for name in (
     :release_metal_burton_miller_system!,
     :assemble_regular_galerkin_operators_metal_regular,
     :evaluate_galerkin_field_metal,
+    :evaluate_galerkin_field_metal_outputs,
     :metal_sweep_memory_available,
 )
     @eval function $(name)(args...; kwargs...)

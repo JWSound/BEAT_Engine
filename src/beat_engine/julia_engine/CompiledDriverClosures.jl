@@ -12,11 +12,11 @@ function compiled_driver_closure_type(fields, driver::Module=@__MODULE__)
     return only(matches)
 end
 
-# Keep the captured-field inventory shared with the hardware-free CI gate.
+# Keep the producer and Neumann closure inventory shared with the hardware-free
+# CI gate. Exterior field outputs use a plain loop and explicit method signatures.
 function compiled_driver_closure_types(driver::Module=@__MODULE__)
     producer = compiled_driver_closure_type((:system, :metal_fused_kwargs, :frequencies_hz,
         :base_rule, :dp0_space, :p1_space, :excitations, :mesh, :density, :sound_speed, :FloatType), driver)
     neumann = compiled_driver_closure_type((:omega, :mesh, :density), driver)
-    field_values = compiled_driver_closure_type((:mesh, :backend, :selected_field_cache, :wavenumber, :points), driver)
-    return (; producer, neumann, field_values)
+    return (; producer, neumann)
 end

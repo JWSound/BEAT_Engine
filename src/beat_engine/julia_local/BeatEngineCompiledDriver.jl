@@ -961,6 +961,70 @@ function parse_field_output_points(outputs, ::Type{T}) where {T<:AbstractFloat}
     return points_by_output
 end
 
+# Weighted outputs retain synthesis before their separate field evaluation.
+function per_excitation_field_output(output)
+    String(output["quantity"]) == "exterior_pressure" || return false
+    options = get(output, "options", Dict{String,Any}())
+    return !haskey(options, "excitation_weights") && !haskey(options, "excitation_weights_sweep")
+end
+
+# Only batch kernels whose per-point source reduction is independent of the
+# observation count. Metal chooses source chunks from that count, so its separate
+# output batching helper below retains each output's chunk partition.
+function exterior_field_output_batch(outputs, points_by_output::Dict{String,Vector{SVector{3,T}}}, backend) where {T<:AbstractFloat}
+    backend == :metal && return nothing
+    points = SVector{3,T}[]
+    ranges = Dict{String,UnitRange{Int}}()
+    for output in outputs
+        per_excitation_field_output(output) || continue
+        id = String(output["id"])
+        first_point = length(points) + 1
+        append!(points, points_by_output[id])
+        ranges[id] = first_point:length(points)
+    end
+    return (; points, ranges)
+end
+
+function exterior_metal_field_output_batch(outputs, points_by_output::Dict{String,Vector{SVector{3,T}}}, backend) where {T<:AbstractFloat}
+    backend == :metal && T === Float32 &&
+        BeatEngineCore.METAL_MODULE !== nothing || return nothing
+    point_sets = Vector{SVector{3,T}}[]
+    indices = Dict{String,Int}()
+    for output in outputs
+        per_excitation_field_output(output) || continue
+        id = String(output["id"])
+        push!(point_sets, points_by_output[id])
+        indices[id] = length(point_sets)
+    end
+    return (; point_sets, indices)
+end
+
+# One dictionary per frequency and excitation. Populate the eligible batch on
+# its first output; weighted outputs and unsupported kernels use their own call.
+function exterior_output_fields!(fields, output_id, points_by_output, mesh, pressure, neumann,
+                                 wavenumber, cache, backend, field_batch, metal_field_batch;
+                                 cpu_kernel=:scalar, metal_field_points=nothing)
+    haskey(fields, output_id) && return fields[output_id]
+    if metal_field_batch !== nothing && haskey(metal_field_batch.indices, output_id)
+        evaluated = evaluate_galerkin_field_metal_outputs(
+            metal_field_batch.point_sets, pressure, neumann, wavenumber, cache;
+            point_cache=metal_field_points)
+        for (id, index) in metal_field_batch.indices
+            fields[id] = evaluated[index]
+        end
+    elseif field_batch !== nothing && haskey(field_batch.ranges, output_id)
+        evaluated = exterior_field(field_batch.points, mesh, pressure, neumann,
+                                   wavenumber, cache, backend; cpu_kernel=cpu_kernel)
+        for (id, range) in field_batch.ranges
+            fields[id] = evaluated[range]
+        end
+    else
+        fields[output_id] = exterior_field(points_by_output[output_id], mesh, pressure, neumann,
+                                          wavenumber, cache, backend; cpu_kernel=cpu_kernel)
+    end
+    return fields[output_id]
+end
+
 function solve_exterior_request(request, system, unbounded_region; event_mode=false)
     meshes = system["meshes"]
     boundaries = system["boundaries"]
@@ -1006,6 +1070,8 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     )
     outputs = get(request, "outputs", Any[])
     field_points_by_output = parse_field_output_points(outputs, FloatType)
+    field_batch = exterior_field_output_batch(outputs, field_points_by_output, backend)
+    metal_field_batch = exterior_metal_field_output_batch(outputs, field_points_by_output, backend)
     mesh_setup_started = time_ns()
     bem_domain = aggregate_bem_region(meshes, unbounded_region, boundaries, FloatType)
     mesh = snap_symmetry_planes(bem_domain.mesh, symmetry_mode)
@@ -1156,10 +1222,14 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     # 1.21 s with a core given back). A sequential sweep solves on the same
     # count, because LU rounds differently on a different number of threads and
     # the overlap must not change the answer.
+    metal_field_points = nothing
     process_blas_threads = BLAS.get_num_threads()
     sweep_blas_threads = direct_metal_assembly && Threads.nthreads() > 1 ?
                          max(1, process_blas_threads - 1) : process_blas_threads
     try
+        if metal_field_batch !== nothing
+            metal_field_points = BeatEngineCore.prepare_metal_field_output_points(metal_field_batch.point_sets)
+        end
         if sweep_blas_threads != process_blas_threads
             BLAS.set_num_threads(sweep_blas_threads)
             cpu_blas_threads = BLAS.get_num_threads()
@@ -1320,23 +1390,19 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
             end
             quantities = Dict{String,Any}[]
             field_s = 0.0
+            fields_by_excitation = [Dict{String,Any}() for _ in pressures]
             for output in outputs
                 quantity = String(output["quantity"])
                 if quantity == "exterior_pressure"
                     field_started = time_ns()
-                    points = field_points_by_output[String(output["id"])]
-                    values = [
-                        exterior_field(
-                            points,
-                            mesh,
-                            pressure,
-                            neumann,
-                            wavenumber,
-                            selected_field_cache,
-                            backend;
+                    values = Vector{Vector{Complex{FloatType}}}()
+                    for (fields, pressure, neumann) in zip(fields_by_excitation, pressures, neumann_values)
+                        push!(values, exterior_output_fields!(fields, String(output["id"]),
+                            field_points_by_output, mesh, pressure, neumann, wavenumber,
+                            selected_field_cache, backend, field_batch, metal_field_batch;
                             cpu_kernel=backend == :cpu ? BeatEngineCore.beat_cpu_field_kernel() : :scalar,
-                        ) for (pressure, neumann) in zip(pressures, neumann_values)
-                    ]
+                            metal_field_points=metal_field_points))
+                    end
                     push!(
                         quantities,
                         quantity_wire(
@@ -1515,6 +1581,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
             device_cache === nothing || release_rocm_regular_assembly_cache!(device_cache)
         end
         if backend == :metal
+            metal_field_points === nothing || BeatEngineCore.release_metal_field_output_points!(metal_field_points)
             device_singular_cache === nothing ||
                 release_metal_singular_correction_cache!(device_singular_cache)
             field_cache === cpu_field_cache || release_metal_field_evaluation_cache!(field_cache)
@@ -2713,6 +2780,8 @@ function solve_request_impl(request; event_mode=false)
     )
     outputs = get(request, "outputs", Any[])
     field_points_by_output = parse_field_output_points(outputs, FloatType)
+    field_batch = exterior_field_output_batch(outputs, field_points_by_output, bem_backend)
+    metal_field_batch = exterior_metal_field_output_batch(outputs, field_points_by_output, bem_backend)
     mesh_setup_started = time_ns()
     fem_domains = aggregate_fem_domains(
         meshes,
@@ -3054,8 +3123,12 @@ function solve_request_impl(request; event_mode=false)
     pipeline_in_flight_bytes = sizeof(Complex{FloatType}) * length(bem_mesh.vertices) * (
         length(bem_mesh.vertices) + length(bem_mesh.faces) + length(interface_map.fem_vertex_indices)
     )
+    metal_field_points = nothing
     pipeline_candidate = use_condensed_solver && coupled_cache !== nothing && length(pipeline_frequencies) > 1
     try
+        if metal_field_batch !== nothing
+            metal_field_points = BeatEngineCore.prepare_metal_field_output_points(metal_field_batch.point_sets)
+        end
         for (frequency_index, frequency_value) in enumerate(request["frequencies_hz"])
             if cancel_requested()
                 cancelled = true
@@ -3214,6 +3287,7 @@ function solve_request_impl(request; event_mode=false)
                     include_other=radiation_has_other) for solution in solutions
             ] : nothing
             field_s += (time_ns() - radiation_started) / 1.0e9
+            fields_by_excitation = [Dict{String,Any}() for _ in solutions]
             for output in outputs
                 quantity = String(output["quantity"])
                 if quantity == "fem_nodal_pressure"
@@ -3410,46 +3484,11 @@ function solve_request_impl(request; event_mode=false)
                                   get(options, "excitation_weights", Any[]) :
                                   raw_weight_sweep[frequency_index]
                     if isempty(raw_weights)
-                        pressures = [
-                            if bem_backend == :cuda
-                                evaluate_galerkin_field_cuda(
-                                    points,
-                                    bem_mesh,
-                                    solution.bem_pressure,
-                                    solution.bem_neumann,
-                                    coupled_system.wavenumber,
-                                    coupled_system.field_cache,
-                                )
-                            elseif bem_backend == :rocm
-                                evaluate_galerkin_field_rocm(
-                                    points,
-                                    bem_mesh,
-                                    solution.bem_pressure,
-                                    solution.bem_neumann,
-                                    coupled_system.wavenumber,
-                                    coupled_system.field_cache,
-                                )
-                            elseif bem_backend == :metal
-                                evaluate_galerkin_field_metal(
-                                    points,
-                                    bem_mesh,
-                                    solution.bem_pressure,
-                                    solution.bem_neumann,
-                                    coupled_system.wavenumber,
-                                    coupled_system.field_cache,
-                                )
-                            else
-                                evaluate_galerkin_field_cpu(
-                                    points,
-                                    bem_mesh,
-                                    solution.bem_pressure,
-                                    solution.bem_neumann,
-                                    coupled_system.wavenumber,
-                                    coupled_system.field_cache,
-                                )
-                            end
-                            for solution in solutions
-                        ]
+                        pressures = [exterior_output_fields!(fields, String(output["id"]),
+                            field_points_by_output, bem_mesh, solution.bem_pressure, solution.bem_neumann,
+                            coupled_system.wavenumber, coupled_system.field_cache, bem_backend,
+                            field_batch, metal_field_batch; metal_field_points=metal_field_points)
+                            for (fields, solution) in zip(fields_by_excitation, solutions)]
                         push!(
                             quantities,
                             quantity_wire(
@@ -3470,6 +3509,8 @@ function solve_request_impl(request; event_mode=false)
                             )
                             for raw_weight in raw_weights
                         ]
+                        # Preserve synthesis before field evaluation: combining the
+                        # per-excitation fields instead would change floating-point sums.
                         combined_pressure = similar(first(solutions).bem_pressure)
                         combined_neumann = similar(first(solutions).bem_neumann)
                         fill!(combined_pressure, zero(Complex{FloatType}))
@@ -3792,6 +3833,7 @@ function solve_request_impl(request; event_mode=false)
             use_condensed_solver ? release_condensed_coupled_system!(coupled_system) :
             release_coupled_system!(coupled_system)
         end
+        metal_field_points === nothing || BeatEngineCore.release_metal_field_output_points!(metal_field_points)
         if coupled_cache !== nothing
             use_condensed_solver ? release_condensed_coupled_cache!(coupled_cache) :
             release_coupled_cache!(coupled_cache)
