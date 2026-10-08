@@ -29,36 +29,43 @@ def payload():
     return json.loads((CONTRACT / "example-exterior-request.json").read_text())
 
 
-@pytest.mark.parametrize("advertised", [None, [], ["future_model"]])
-def test_thermoviscous_model_requires_explicit_capability(ready, payload, advertised):
-    region = payload["compiled_system"]["regions"][0]
-    region["kind"] = "bounded_air"
-    region["loss_model"] = {"thermoviscous_wall_losses": "thin_boundary_layer"}
+def enable_wall_loss(payload):
+    system = payload["compiled_system"]
+    system["regions"][0]["kind"] = "bounded_air"
+    wall = copy.deepcopy(system["boundaries"][0])
+    wall.update(id="boundary:wall", kind="rigid", parameters={"thermoviscous_wall_losses": "thin_boundary_layer"})
+    wall["group"]["tag"] = 3
+    system["boundaries"].append(wall)
+    return wall
+
+
+@pytest.mark.parametrize("capability", ["fem_wall_loss_models", "fem_wall_loss_scopes"])
+@pytest.mark.parametrize("advertised", [None, [], ["future_value"]])
+def test_thermoviscous_model_requires_explicit_capability(ready, payload, advertised, capability):
+    wall = enable_wall_loss(payload)
     if advertised is None:
-        ready.pop("fem_wall_loss_models")
+        ready.pop(capability)
     else:
-        ready["fem_wall_loss_models"] = advertised
+        ready[capability] = advertised
     with pytest.raises(WorkerCompatibilityError, match="thermoviscous wall loss model"):
         negotiate_submission(ready, payload, "solve")
-    region["loss_model"]["thermoviscous_wall_losses"] = "off"
+    wall["parameters"]["thermoviscous_wall_losses"] = "off"
     negotiate_submission(ready, payload, "solve")
 
 
-def test_thermoviscous_capability_accepts_enabled_model_and_rejects_invalid_handshake(ready, payload):
-    region = payload["compiled_system"]["regions"][0]
-    region["kind"] = "bounded_air"
-    region["loss_model"] = {"thermoviscous_wall_losses": "thin_boundary_layer"}
+@pytest.mark.parametrize("capability", ["fem_wall_loss_models", "fem_wall_loss_scopes"])
+def test_thermoviscous_capability_accepts_enabled_model_and_rejects_invalid_handshake(ready, payload, capability):
+    enable_wall_loss(payload)
     negotiate_submission(ready, payload, "solve")
-    ready["fem_wall_loss_models"] = "thin_boundary_layer"
-    with pytest.raises(WorkerCompatibilityError, match="invalid fem_wall_loss_models"):
+    ready[capability] = "thin_boundary_layer"
+    with pytest.raises(WorkerCompatibilityError, match=f"invalid {capability}"):
         negotiate_submission(ready, payload, "solve")
 
 
-def test_thermoviscous_incompatible_request_never_reaches_worker(tmp_path, ready, payload):
-    ready.pop("fem_wall_loss_models")
-    payload["compiled_system"]["regions"][0].update(
-        kind="bounded_air", loss_model={"thermoviscous_wall_losses": "thin_boundary_layer"}
-    )
+@pytest.mark.parametrize("capability", ["fem_wall_loss_models", "fem_wall_loss_scopes"])
+def test_thermoviscous_incompatible_request_never_reaches_worker(tmp_path, ready, payload, capability):
+    ready.pop(capability)
+    enable_wall_loss(payload)
     worker, received = fake_worker(tmp_path, ready)
     path = tmp_path / "thermoviscous.json"
     path.write_text(json.dumps(payload))

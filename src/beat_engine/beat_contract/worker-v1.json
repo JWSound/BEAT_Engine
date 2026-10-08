@@ -73,5 +73,8 @@
   ],
   "fem_wall_loss_models": [
     "thin_boundary_layer"
+  ],
+  "fem_wall_loss_scopes": [
+    "boundary"
   ]
 }

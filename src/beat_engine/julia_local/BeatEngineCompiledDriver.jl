@@ -1626,9 +1626,6 @@ function aggregate_fem_domains(
             error("All bounded FEM regions must use the same tetrahedron order.")
         end
         loss_model = get(region, "loss_model", Dict{String,Any}())
-        thermoviscous_model = get(loss_model, "thermoviscous_wall_losses", "off")
-        thermoviscous_model in ("off", "thin_boundary_layer") || error(
-            "Unsupported thermoviscous wall loss model: $thermoviscous_model")
         bulk_loss_factor = T(get(loss_model, "bulk_loss_factor", 0.0))
         isfinite(bulk_loss_factor) && zero(T) <= bulk_loss_factor <= one(T) || error(
             "Bounded-region FEM bulk loss factor must be finite and between 0 and 1.",
@@ -1653,8 +1650,13 @@ function aggregate_fem_domains(
             domain_by_boundary_id[boundary_id] = length(domains) + 1
             parameters = get(boundary, "parameters", Dict{String,Any}())
             boundary_kind = String(boundary["kind"])
-            if thermoviscous_model == "thin_boundary_layer" && boundary_kind == "rigid" &&
-               !haskey(parameters, "wall_impedance") && !(boundary_id in moving_boundary_ids)
+            thermoviscous_model = get(parameters, "thermoviscous_wall_losses", "off")
+            thermoviscous_model in ("off", "thin_boundary_layer") || error(
+                "Unsupported thermoviscous wall loss model: $thermoviscous_model")
+            if thermoviscous_model == "thin_boundary_layer"
+                boundary_kind == "rigid" && !haskey(parameters, "wall_impedance") &&
+                    !(boundary_id in moving_boundary_ids) || error(
+                        "Thermoviscous wall losses require an unlined, stationary rigid wall.")
                 push!(thermoviscous_walls, (boundary_id=boundary_id, tag=solver_tag))
             end
             if boundary_kind == "plane_wave_tube_termination"

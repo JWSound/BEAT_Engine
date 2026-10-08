@@ -1,10 +1,10 @@
 # Thermoviscous wall losses: implementation notes
 
-The opt-in `loss_model.thermoviscous_wall_losses` region field accepts `off`
+The opt-in `parameters.thermoviscous_wall_losses` boundary field accepts `off`
 (also the default when omitted) or `thin_boundary_layer`. It is valid only for
-bounded air. Workers advertise `fem_wall_loss_models: ["thin_boundary_layer"]`;
+unlined, stationary rigid walls in bounded air. Workers advertise `fem_wall_loss_models: ["thin_boundary_layer"]`;
 the Python engine client rejects enabled requests before submission unless the
-worker advertises that model. Off requests remain compatible with older workers.
+worker advertises that model and `fem_wall_loss_scopes: ["boundary"]`. Off requests remain compatible with older workers.
 
 The pressure-only Wentzell operator follows equation (31) of Berggren,
 Bernland and Noreland, *Acoustic boundary layers as boundary conditions*,
@@ -32,11 +32,13 @@ viscosity 1.84e-5 Pa s, thermal conductivity 0.0257 W/(m K), specific heat
 the request. It assumes stationary no-slip isothermal walls, linear acoustics,
 and non-overlapping thin layers. It does not model sharp-edge corrections,
 nonlinear port losses, mean flow, or overlapping layers in narrow gaps.
-No automatic gap-validity claim is made.
+No automatic gap-validity claim is made. Untreated walls retain their existing
+boundary condition; patch transitions do not resolve detailed edge layers.
+The superseded draft region-level field is rejected rather than silently ignored.
 
-Compilation selects explicit rigid boundaries in enabled regions, excluding
-Miki-lined boundaries and boundaries referenced by moving components. Interfaces,
-terminations and moving assignments are excluded. Assembly additionally removes
+Compilation selects only explicitly enabled boundaries. Enabling losses on
+Miki-lined walls, component-referenced boundaries, exterior walls, interfaces,
+terminations or moving assignments is rejected. Assembly additionally removes
 faces on active x/xy symmetry cuts. Unassigned faces are not automatically
 interpreted as treated solid walls. Existing bulk loss remains independent;
 empirical factors fitted to wall dissipation can double-count that loss.

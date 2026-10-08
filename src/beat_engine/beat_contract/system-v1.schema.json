@@ -123,16 +123,7 @@
           "exclusiveMinimum": 0
         },
         "loss_model": {
-          "type": "object",
-          "properties": {
-            "thermoviscous_wall_losses": {
-              "type": "string",
-              "enum": [
-                "off",
-                "thin_boundary_layer"
-              ]
-            }
-          }
+          "type": "object"
         }
       },
       "required": [
@@ -176,7 +167,16 @@
           "$ref": "#/$defs/group"
         },
         "parameters": {
-          "type": "object"
+          "type": "object",
+          "properties": {
+            "thermoviscous_wall_losses": {
+              "type": "string",
+              "enum": [
+                "off",
+                "thin_boundary_layer"
+              ]
+            }
+          }
         }
       },
       "required": [

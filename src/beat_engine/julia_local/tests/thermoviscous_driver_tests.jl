@@ -6,8 +6,8 @@ include(joinpath(ENGINE_DIR, "..", "julia_engine", "CompiledCoupledWorkload.jl")
 
 function tv_request()
     request = JSON.parse(JSON.json(coupled_workload_request(; tiny=true)))
-    region = only(filter(r -> r["kind"] == "bounded_air", request["compiled_system"]["regions"]))
-    region["loss_model"] = Dict{String,Any}("thermoviscous_wall_losses" => "thin_boundary_layer")
+    wall = only(filter(b -> b["id"] == "boundary:wall", request["compiled_system"]["boundaries"]))
+    wall["parameters"] = Dict{String,Any}("thermoviscous_wall_losses" => "thin_boundary_layer")
     request["solver_options"]["phasor_convention"] = "exp(+i omega t)"
     return request
 end
@@ -25,15 +25,50 @@ decode(q) = copy(reinterpret(q["values"]["dtype"] == "complex64" ? ComplexF32 : 
     domains = aggregate()
     @test [w.boundary_id for w in domains.thermoviscous_walls] == ["boundary:wall"]
     wall = only(filter(b -> b["id"] == "boundary:wall", system["boundaries"]))
-    wall["parameters"] = Dict("wall_impedance" => Dict("model" => "miki"))
-    @test isempty(aggregate().thermoviscous_walls)
-    wall["parameters"] = Dict()
+    wall["parameters"]["wall_impedance"] = Dict("model" => "miki")
+    @test_throws ErrorException validate_system_request(request)
+    @test_throws ErrorException aggregate()
+    delete!(wall["parameters"], "wall_impedance")
     push!(system["components"][1]["boundary_ids"], "boundary:wall")
-    @test isempty(aggregate().thermoviscous_walls)
+    @test_throws ErrorException validate_system_request(request)
+    @test_throws ErrorException aggregate()
+    pop!(system["components"][1]["boundary_ids"])
     for model in ("unknown", true)
-        regions[1]["loss_model"]["thermoviscous_wall_losses"] = model
+        wall["parameters"]["thermoviscous_wall_losses"] = model
         @test_throws ErrorException validate_system_request(request)
     end
+
+end
+
+@testset "thermoviscous independent walls within one region" begin
+    request = tv_request()
+    system = request["compiled_system"]
+    filter!(r -> r["kind"] == "bounded_air", system["regions"])
+    filter!(m -> m["purpose"] == "fem_volume", system["meshes"])
+    filter!(b -> b["region_id"] == "region:interior", system["boundaries"])
+    empty!(system["interfaces"])
+    second = only(filter(b -> b["kind"] == "interface", system["boundaries"]))
+    second["kind"] = "rigid"
+    wall = only(filter(b -> b["id"] == "boundary:wall", system["boundaries"]))
+    aggregate() = aggregate_fem_domains(system["meshes"], system["regions"], system["boundaries"], Float64)
+    operator(d) = prepare_thermoviscous_operator(d.mesh, d.thermoviscous_walls)
+    first = aggregate()
+    @test [w.boundary_id for w in first.thermoviscous_walls] == [wall["id"]]
+    first_op = operator(first)
+    second["parameters"]["thermoviscous_wall_losses"] = "thin_boundary_layer"
+    both = aggregate()
+    @test Set(w.boundary_id for w in both.thermoviscous_walls) == Set([wall["id"], second["id"]])
+    both_op = operator(both)
+    wall["parameters"]["thermoviscous_wall_losses"] = "off"
+    second_only = aggregate()
+    @test [w.boundary_id for w in second_only.thermoviscous_walls] == [second["id"]]
+    second_op = operator(second_only)
+    @test isempty(intersect(first_op.face_indices, second_op.face_indices))
+    @test isapprox(both_op.stiffness, first_op.stiffness + second_op.stiffness)
+    @test isapprox(both_op.mass, first_op.mass + second_op.mass)
+    @test isapprox(both_op.area_m2, first_op.area_m2 + second_op.area_m2)
+    empty!(second["parameters"])
+    @test isempty(aggregate().thermoviscous_walls)
 end
 
 @testset "thermoviscous coupled production sweep and Float64 reassembly" begin
@@ -57,7 +92,7 @@ end
             @test decode(qa) ≈ decode(qb) rtol=5e-4
         end
         # Explicit Off must agree exactly with omission, including repeated worker use.
-        loss = request["compiled_system"]["regions"][2]["loss_model"]
+        loss = only(filter(b -> b["id"] == "boundary:wall", request["compiled_system"]["boundaries"]))["parameters"]
         loss["thermoviscous_wall_losses"] = "off"
         disabled = solve_coupled_workload(request)
         empty!(loss)
@@ -117,7 +152,7 @@ end
     request["solver_options"]["phasor_convention"] = "exp(-i omega t)"
     negative = solve_coupled_workload(request)
     for (a,b) in zip(positive.results, negative.results)
-        @test a["diagnostics"]["thermoviscous_wall_losses"]["treated_face_count"] == 3
+        @test a["diagnostics"]["thermoviscous_wall_losses"]["treated_face_count"] == 2
         @test decode(only(a["quantities"])) ≈ conj.(decode(only(b["quantities"]))) rtol=1e-10
     end
 end
