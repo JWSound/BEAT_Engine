@@ -2053,7 +2053,7 @@
     },
     {
       "name": "v3_exterior_float32",
-      "valid": false,
+      "valid": true,
       "changes": [
         {
           "path": [
@@ -2115,12 +2115,11 @@
           ],
           "value": "float32"
         }
-      ],
-      "expected_message": "require float64 BEM precision"
+      ]
     },
     {
       "name": "v3_exterior_default_precision",
-      "valid": false,
+      "valid": true,
       "changes": [
         {
           "path": [
@@ -2182,75 +2181,7 @@
           ],
           "remove": true
         }
-      ],
-      "expected_message": "require float64 BEM precision"
-    },
-    {
-      "name": "v3_exterior_x_deferred",
-      "valid": false,
-      "changes": [
-        {
-          "path": [
-            "compiled_system",
-            "contract_version"
-          ],
-          "value": 3
-        },
-        {
-          "path": [
-            "compiled_system",
-            "components",
-            0,
-            "kind"
-          ],
-          "value": "electrodynamic_transducer"
-        },
-        {
-          "path": [
-            "compiled_system",
-            "components",
-            0,
-            "parameters"
-          ],
-          "value": {
-            "re_ohm": 6.0,
-            "le_h": 0.0005,
-            "bl_n_per_a": 7.0,
-            "mmd_kg": 0.015,
-            "cms_m_per_n": 0.0005,
-            "rms_n_s_per_m": 1.0,
-            "motion_axis": [
-              0,
-              0,
-              1
-            ]
-          }
-        },
-        {
-          "path": [
-            "compiled_system",
-            "excitation_ports",
-            0,
-            "kind"
-          ],
-          "value": "voltage"
-        },
-        {
-          "path": [
-            "solver_options",
-            "precision"
-          ],
-          "value": "float64"
-        },
-        {
-          "path": [
-            "solver_options",
-            "symmetry"
-          ],
-          "value": "x"
-        }
-      ],
-      "expected_message": "support only off and ground symmetry"
+      ]
     },
     {
       "name": "v3_passive_refused",
@@ -3844,6 +3775,224 @@
           "value": {
             "thermoviscous_wall_losses": "thin_boundary_layer"
           }
+        }
+      ]
+    },
+    {
+      "name": "v3_exterior_x_accepted",
+      "valid": true,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "contract_version"
+          ],
+          "value": 3
+        },
+        {
+          "path": [
+            "compiled_system",
+            "components",
+            0,
+            "kind"
+          ],
+          "value": "electrodynamic_transducer"
+        },
+        {
+          "path": [
+            "compiled_system",
+            "components",
+            0,
+            "parameters"
+          ],
+          "value": {
+            "re_ohm": 6.0,
+            "le_h": 0.0005,
+            "bl_n_per_a": 7.0,
+            "mmd_kg": 0.015,
+            "cms_m_per_n": 0.0005,
+            "rms_n_s_per_m": 1.0,
+            "motion_axis": [
+              0,
+              0,
+              1
+            ],
+            "surface_completion_factor": 2,
+            "physical_driver_orbit_count": 1,
+            "symmetry_role": "fractional_driver",
+            "fractional_symmetry_axes": [
+              "x"
+            ]
+          }
+        },
+        {
+          "path": [
+            "compiled_system",
+            "excitation_ports",
+            0,
+            "kind"
+          ],
+          "value": "voltage"
+        },
+        {
+          "path": [
+            "solver_options",
+            "precision"
+          ],
+          "value": "float64"
+        },
+        {
+          "path": [
+            "solver_options",
+            "symmetry"
+          ],
+          "value": "x"
+        }
+      ]
+    },
+    {
+      "name": "v3_exterior_xy_accepted",
+      "valid": true,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "contract_version"
+          ],
+          "value": 3
+        },
+        {
+          "path": [
+            "compiled_system",
+            "components",
+            0,
+            "kind"
+          ],
+          "value": "electrodynamic_transducer"
+        },
+        {
+          "path": [
+            "compiled_system",
+            "components",
+            0,
+            "parameters"
+          ],
+          "value": {
+            "re_ohm": 6.0,
+            "le_h": 0.0005,
+            "bl_n_per_a": 7.0,
+            "mmd_kg": 0.015,
+            "cms_m_per_n": 0.0005,
+            "rms_n_s_per_m": 1.0,
+            "motion_axis": [
+              0,
+              0,
+              1
+            ],
+            "surface_completion_factor": 4,
+            "physical_driver_orbit_count": 1,
+            "symmetry_role": "fractional_driver",
+            "fractional_symmetry_axes": [
+              "x",
+              "y"
+            ]
+          }
+        },
+        {
+          "path": [
+            "compiled_system",
+            "excitation_ports",
+            0,
+            "kind"
+          ],
+          "value": "voltage"
+        },
+        {
+          "path": [
+            "solver_options",
+            "precision"
+          ],
+          "value": "float64"
+        },
+        {
+          "path": [
+            "solver_options",
+            "symmetry"
+          ],
+          "value": "xy"
+        }
+      ]
+    },
+    {
+      "name": "v3_exterior_metal_float32_accepted",
+      "valid": true,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "contract_version"
+          ],
+          "value": 3
+        },
+        {
+          "path": [
+            "compiled_system",
+            "components",
+            0,
+            "kind"
+          ],
+          "value": "electrodynamic_transducer"
+        },
+        {
+          "path": [
+            "compiled_system",
+            "components",
+            0,
+            "parameters"
+          ],
+          "value": {
+            "re_ohm": 6.0,
+            "le_h": 0.0005,
+            "bl_n_per_a": 7.0,
+            "mmd_kg": 0.015,
+            "cms_m_per_n": 0.0005,
+            "rms_n_s_per_m": 1.0,
+            "motion_axis": [
+              0,
+              0,
+              1
+            ]
+          }
+        },
+        {
+          "path": [
+            "compiled_system",
+            "excitation_ports",
+            0,
+            "kind"
+          ],
+          "value": "voltage"
+        },
+        {
+          "path": [
+            "solver_options",
+            "precision"
+          ],
+          "value": "float64"
+        },
+        {
+          "path": [
+            "solver_options",
+            "bem_backend"
+          ],
+          "value": "metal"
+        },
+        {
+          "path": [
+            "solver_options",
+            "precision"
+          ],
+          "value": "float32"
         }
       ]
     }

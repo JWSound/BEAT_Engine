@@ -66,6 +66,31 @@ end
     end
 end
 
+@testset "compiled exterior transducer host workload" begin
+    bundle = CompiledWorkloadBundle
+    mktempdir() do directory
+        for symmetry in ("off", "xy"), precision in ("float64", "float32")
+            path = joinpath(directory, "driver-$symmetry.msh")
+            write(path, bundle.workload_transducer_mesh(symmetry))
+            request = bundle.JSON.parse(bundle.JSON.json(bundle.transducer_workload_request(path, symmetry; precision=precision)))
+            @test bundle.BeatEngineContract.validate_system_request(request) === nothing
+            events = joinpath(directory, "events.jsonl")
+            outcome = open(events, "w") do io
+                redirect_stdout(io) do
+                    bundle.solve_request(request; event_mode=true)
+                end
+            end
+            results = [e["result"] for e in bundle.JSON.parse.(readlines(events)) if haskey(e,"result")]
+            @test outcome.solved_count == length(results) == 2
+            for result in results
+                @test length(result["quantities"]) == 4
+                @test result["diagnostics"]["exterior_lumped_network"]["termination"] == "shorted"
+                @test result["quantities"][3]["metadata"]["row_weights"] == [1.]
+            end
+        end
+    end
+end
+
 @testset "compiled coupled workload contract and condensed host coverage" begin
     bundle = CompiledWorkloadBundle
     # Validate the actual packaged fixture request without solving the large

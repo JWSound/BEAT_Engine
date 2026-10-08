@@ -11,6 +11,8 @@ using LinearAlgebra
 include(joinpath(@__DIR__, "contract_tests.jl"))
 include(joinpath(@__DIR__, "exterior_impedance_matrix_tests.jl"))
 include(joinpath(@__DIR__, "exterior_transducer_tests.jl"))
+include(joinpath(@__DIR__, "exterior_transducer_symmetry_tests.jl"))
+include(joinpath(@__DIR__, "exterior_transducer_precision_tests.jl"))
 include(joinpath(@__DIR__, "worker_cleanup_tests.jl"))
 include(joinpath(@__DIR__, "deploy_rhs_policy_tests.jl"))
 include(joinpath(@__DIR__, "exterior_rhs_policy_tests.jl"))
@@ -88,6 +90,10 @@ end
     @test dp0.global_dof_count == length(mesh.faces)
     @test length(rule.points) == length(rule.weights)
     @test singular_cache.pair_count > 0
+end
+
+if metal_available()
+    include(joinpath(@__DIR__, "exterior_transducer_metal_tests.jl"))
 end
 
 include(joinpath(@__DIR__, "coupled_solver_tests.jl"))

@@ -160,12 +160,11 @@ function impedance_outputs(request)
     end
     if exterior && any(component["kind"] == "electrodynamic_transducer" for component in values(components))
         lowercase(String(get(options, "bem_backend", "cpu"))) == "metal" &&
+            lowercase(String(get(options, "precision", "float32"))) == "float64" &&
             fail("request.solver_options.bem_backend",
                 "exterior electrodynamic_transducers cannot use Metal: float64 BEM is unsupported; use CPU")
-        lowercase(String(get(options, "precision", "float32"))) == "float64" ||
-            fail("request.solver_options.precision", "exterior electrodynamic_transducers require float64 BEM precision")
-        lowercase(strip(String(get(options, "symmetry", "off")))) in ("off", "ground") ||
-            fail("request.solver_options.symmetry", "exterior electrodynamic_transducers support only off and ground symmetry")
+        lowercase(strip(String(get(options, "symmetry", "off")))) in ("off", "ground", "x", "xy") ||
+            fail("request.solver_options.symmetry", "exterior electrodynamic_transducers support only off, ground, x and xy symmetry")
     end
     for output in request["outputs"]
         quantity = output["quantity"]

@@ -804,6 +804,8 @@ function exterior_excitations(ports, components, boundaries, boundary_tag_by_id,
 end
 
 function exterior_neumann(mesh, excitation, density::T, omega::T) where {T<:AbstractFloat}
+    motion = get(excitation, :bem_normal_velocity, nothing)
+    motion === nothing || return neumann_scale(density, omega) .* T.(motion)
     values = zeros(Complex{T}, length(mesh.faces))
     for (tag, amplitude) in zip(excitation.tags, excitation.amplitudes)
         for face_index in eachindex(mesh.faces)
@@ -1035,10 +1037,9 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     FloatType = precision_name == "float64" ? Float64 : precision_name == "float32" ? Float32 :
                 error("Exterior precision must be float32 or float64.")
     has_transducers = any(component["kind"] == "electrodynamic_transducer" for component in components)
-    has_transducers && FloatType !== Float64 && error("Exterior electrodynamic_transducers require float64 BEM precision.")
     backend = Symbol(lowercase(String(get(options, "bem_backend", "cpu"))))
     backend in (:cpu, :cuda, :rocm, :metal) || error("Exterior BEM backend must be cpu, cuda, rocm, or metal.")
-    has_transducers && backend == :metal && error(
+    has_transducers && backend == :metal && FloatType === Float64 && error(
         "Exterior electrodynamic_transducers cannot use Metal: float64 BEM is unsupported; use CPU.",
     )
     reference_voltage = Float64(get(options, "transducer_reference_voltage_v", DEFAULT_TRANSDUCER_REFERENCE_VOLTAGE_V))
@@ -1074,7 +1075,8 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     metal_field_batch = exterior_metal_field_output_batch(outputs, field_points_by_output, backend)
     mesh_setup_started = time_ns()
     bem_domain = aggregate_bem_region(meshes, unbounded_region, boundaries, FloatType)
-    mesh = snap_symmetry_planes(bem_domain.mesh, symmetry_mode)
+    symmetry_tolerance = symmetry_plane_tolerance(bem_domain.mesh.vertices)
+    mesh = snap_symmetry_planes(bem_domain.mesh, symmetry_mode; tolerance=symmetry_tolerance)
     validate_symmetry_fundamental_domain!(mesh, symmetry_mode)
     validate_compiled_ground_domain!(
         mesh, symmetry_mode;
@@ -1083,6 +1085,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     excitation_port_ids = String.(request["excitation_port_ids"])
     lumped = has_transducers ? exterior_motion_basis(
         system, excitation_port_ids, boundaries, bem_domain, mesh, unbounded_region, symmetry_mode,
+        symmetry_tolerance=symmetry_tolerance,
     ) : nothing
     excitations = has_transducers ? lumped.basis : exterior_excitations(
         excitation_port_ids,
@@ -1204,7 +1207,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     produce_metal_system = function (index)
         omega = FloatType(2pi) * FloatType(frequencies_hz[index])
         wavenumber = omega / sound_speed
-        # Metal is ideal-only: preserve the precompiled producer/generator captures.
+        # Face motion travels in each excitation, preserving the ideal producer/generator captures.
         neumann_values = [exterior_neumann(mesh, excitation, density, omega) for excitation in excitations]
         system, assembly_s = assemble_exterior_direct_metal(
             mesh, p1_space, dp0_space, neumann_values, wavenumber, base_rule; metal_fused_kwargs...,
@@ -1381,7 +1384,9 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 q = hcat(neumann_values...)
                 z = transpose(lumped.force) * p
                 network_solution = solve_exterior_lumped_network(
-                    z, lumped.transducers, excitations, port_objects, excitation_port_ids, omega, density, sound_speed,
+                    z, lumped.transducers, excitations, port_objects, excitation_port_ids,
+                    2pi * Float64(raw_frequency), Float64(unbounded_region["density_kg_per_m3"]),
+                    Float64(unbounded_region["sound_speed_m_per_s"]),
                     reference_voltage,
                 )
                 pressures = collect(eachcol(p * network_solution.velocity))

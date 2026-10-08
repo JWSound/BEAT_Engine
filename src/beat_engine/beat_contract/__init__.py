@@ -164,19 +164,18 @@ def _impedance_outputs(request: dict) -> None:
                 "transducer_reference_voltage_v must be finite and positive",
             )
     if exterior_transducers:
-        if str(options.get("bem_backend", "cpu")).lower() == "metal":
+        if (
+            str(options.get("bem_backend", "cpu")).lower() == "metal"
+            and str(options.get("precision", "float32")).lower() == "float64"
+        ):
             _fail(
                 "request.solver_options.bem_backend",
                 "exterior electrodynamic_transducers cannot use Metal: float64 BEM is unsupported; use CPU",
             )
-        if str(options.get("precision", "float32")).lower() != "float64":
-            _fail(
-                "request.solver_options.precision", "exterior electrodynamic_transducers require float64 BEM precision"
-            )
-        if str(options.get("symmetry", "off")).strip().lower() not in ("off", "ground"):
+        if str(options.get("symmetry", "off")).strip().lower() not in ("off", "ground", "x", "xy"):
             _fail(
                 "request.solver_options.symmetry",
-                "exterior electrodynamic_transducers support only off and ground symmetry",
+                "exterior electrodynamic_transducers support only off, ground, x and xy symmetry",
             )
     for output in request["outputs"]:
         if output["quantity"] == "radiation_impedance_matrix":
