@@ -193,6 +193,9 @@ function graph(system)
     end
     meshes, regions, boundaries, components = (collections[key] for key in ("meshes", "regions", "boundaries", "components"))
     for region in values(regions)
+        if get(region["loss_model"], "thermoviscous_wall_losses", "off") != "off" && region["kind"] != "bounded_air"
+            fail("region.loss_model", "thermoviscous wall losses require bounded air")
+        end
         references(region["mesh_ids"], meshes, "region $(region["id"]).mesh_ids")
         for group in region["volume_groups"]
             group["mesh_id"] in region["mesh_ids"] && group["dimension"] == 3 || fail("volume_groups", "must reference a volume group on a region mesh")

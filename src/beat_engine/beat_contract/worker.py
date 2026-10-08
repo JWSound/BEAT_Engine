@@ -63,6 +63,12 @@ def validate_worker_ready(info: dict) -> None:
             and all(isinstance(profile, str) and bool(profile.strip()) for profile in profiles),
             "invalid exterior_source_profiles capabilities; expected a list of non-empty strings.",
         )
+    if "fem_wall_loss_models" in info:
+        models = info["fem_wall_loss_models"]
+        _require(
+            isinstance(models, list) and all(isinstance(model, str) and bool(model.strip()) for model in models),
+            "invalid fem_wall_loss_models capabilities; expected a list of non-empty strings.",
+        )
     if "optional_output_quantities" in info:
         quantities = info["optional_output_quantities"]
         _require(
@@ -111,6 +117,13 @@ def negotiate_submission(info: dict, request: dict, operation: str) -> dict:
                 "radiation_impedance_matrix" in info.get("optional_output_quantities", []),
                 "radiation_impedance_matrix output is unavailable; update BEAT Engine.",
             )
+        for region in request["compiled_system"]["regions"]:
+            model = region["loss_model"].get("thermoviscous_wall_losses", "off")
+            if model != "off":
+                _require(
+                    model in info.get("fem_wall_loss_models", []),
+                    f"thermoviscous wall loss model {model!r} is unavailable; update BEAT Engine.",
+                )
         options = request["solver_options"]
         kinds = {region["kind"] for region in request["compiled_system"]["regions"]}
         kind = (

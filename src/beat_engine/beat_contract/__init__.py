@@ -219,6 +219,8 @@ def _graph(system: dict) -> None:
         collections[key] for key in ("meshes", "regions", "boundaries", "components")
     )
     for region in regions.values():
+        if region["loss_model"].get("thermoviscous_wall_losses", "off") != "off" and region["kind"] != "bounded_air":
+            _fail(f"region {region['id']}.loss_model", "thermoviscous wall losses require bounded air")
         _references(region["mesh_ids"], meshes, f"region {region['id']}.mesh_ids")
         for group in region["volume_groups"]:
             if group["mesh_id"] not in region["mesh_ids"] or group["dimension"] != 3:

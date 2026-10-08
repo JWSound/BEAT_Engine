@@ -1842,3 +1842,6 @@ if cuda_available()
 end
 
 include(joinpath(@__DIR__, "interface_velocity_tests.jl"))
+
+include(joinpath(@__DIR__, "thermoviscous_tests.jl"))
+include(joinpath(@__DIR__, "thermoviscous_driver_tests.jl"))

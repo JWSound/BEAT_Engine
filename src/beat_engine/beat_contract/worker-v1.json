@@ -70,5 +70,8 @@
   "exterior_component_kinds": [
     "ideal_velocity_source",
     "electrodynamic_transducer"
+  ],
+  "fem_wall_loss_models": [
+    "thin_boundary_layer"
   ]
 }

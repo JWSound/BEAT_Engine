@@ -3032,6 +3032,83 @@
           "value": 1
         }
       ]
+    },
+    {
+      "name": "thermoviscous off remains compatible with exterior",
+      "valid": true,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "regions",
+            0,
+            "loss_model"
+          ],
+          "value": {
+            "thermoviscous_wall_losses": "off"
+          }
+        }
+      ]
+    },
+    {
+      "name": "thermoviscous thin layer accepted on bounded air",
+      "valid": true,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "regions",
+            0,
+            "loss_model"
+          ],
+          "value": {
+            "thermoviscous_wall_losses": "thin_boundary_layer"
+          }
+        },
+        {
+          "path": [
+            "compiled_system",
+            "regions",
+            0,
+            "kind"
+          ],
+          "value": "bounded_air"
+        }
+      ]
+    },
+    {
+      "name": "thermoviscous thin layer rejected on exterior",
+      "valid": false,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "regions",
+            0,
+            "loss_model"
+          ],
+          "value": {
+            "thermoviscous_wall_losses": "thin_boundary_layer"
+          }
+        }
+      ]
+    },
+    {
+      "name": "unknown thermoviscous model rejected",
+      "valid": false,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "regions",
+            0,
+            "loss_model"
+          ],
+          "value": {
+            "thermoviscous_wall_losses": "unknown"
+          }
+        }
+      ]
     }
   ]
 }

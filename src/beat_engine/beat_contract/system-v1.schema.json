@@ -123,7 +123,16 @@
           "exclusiveMinimum": 0
         },
         "loss_model": {
-          "type": "object"
+          "type": "object",
+          "properties": {
+            "thermoviscous_wall_losses": {
+              "type": "string",
+              "enum": [
+                "off",
+                "thin_boundary_layer"
+              ]
+            }
+          }
         }
       },
       "required": [

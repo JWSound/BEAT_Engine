@@ -29,6 +29,47 @@ def payload():
     return json.loads((CONTRACT / "example-exterior-request.json").read_text())
 
 
+@pytest.mark.parametrize("advertised", [None, [], ["future_model"]])
+def test_thermoviscous_model_requires_explicit_capability(ready, payload, advertised):
+    region = payload["compiled_system"]["regions"][0]
+    region["kind"] = "bounded_air"
+    region["loss_model"] = {"thermoviscous_wall_losses": "thin_boundary_layer"}
+    if advertised is None:
+        ready.pop("fem_wall_loss_models")
+    else:
+        ready["fem_wall_loss_models"] = advertised
+    with pytest.raises(WorkerCompatibilityError, match="thermoviscous wall loss model"):
+        negotiate_submission(ready, payload, "solve")
+    region["loss_model"]["thermoviscous_wall_losses"] = "off"
+    negotiate_submission(ready, payload, "solve")
+
+
+def test_thermoviscous_capability_accepts_enabled_model_and_rejects_invalid_handshake(ready, payload):
+    region = payload["compiled_system"]["regions"][0]
+    region["kind"] = "bounded_air"
+    region["loss_model"] = {"thermoviscous_wall_losses": "thin_boundary_layer"}
+    negotiate_submission(ready, payload, "solve")
+    ready["fem_wall_loss_models"] = "thin_boundary_layer"
+    with pytest.raises(WorkerCompatibilityError, match="invalid fem_wall_loss_models"):
+        negotiate_submission(ready, payload, "solve")
+
+
+def test_thermoviscous_incompatible_request_never_reaches_worker(tmp_path, ready, payload):
+    ready.pop("fem_wall_loss_models")
+    payload["compiled_system"]["regions"][0].update(
+        kind="bounded_air", loss_model={"thermoviscous_wall_losses": "thin_boundary_layer"}
+    )
+    worker, received = fake_worker(tmp_path, ready)
+    path = tmp_path / "thermoviscous.json"
+    path.write_text(json.dumps(payload))
+    try:
+        with pytest.raises(WorkerCompatibilityError, match="thermoviscous wall loss model"):
+            worker.submit(path)
+        assert not received.exists()
+    finally:
+        worker.terminate()
+
+
 def test_selects_current_formats_and_accepts_future_advertised_versions(ready, payload):
     ready["contracts"]["system_result"].append(3)
     ready["future_extension"] = True

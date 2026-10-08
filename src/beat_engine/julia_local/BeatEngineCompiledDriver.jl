@@ -1585,7 +1585,8 @@ function aggregate_fem_domains(
     meshes,
     bounded_regions,
     boundaries,
-    ::Type{T},
+    ::Type{T};
+    moving_boundary_ids=Set{String}(),
 ) where {T<:AbstractFloat}
     vertices = SVector{3,T}[]
     tetrahedra = NTuple{4,Int}[]
@@ -1598,6 +1599,7 @@ function aggregate_fem_domains(
     domains = NamedTuple[]
     bulk_loss_factor_by_vertex = T[]
     wall_impedances = NamedTuple[]
+    thermoviscous_walls = NamedTuple[]
     plane_wave_terminations = NamedTuple[]
     fem_boundary_tag_by_id = Dict{String,Int}()
     domain_by_boundary_id = Dict{String,Int}()
@@ -1624,6 +1626,9 @@ function aggregate_fem_domains(
             error("All bounded FEM regions must use the same tetrahedron order.")
         end
         loss_model = get(region, "loss_model", Dict{String,Any}())
+        thermoviscous_model = get(loss_model, "thermoviscous_wall_losses", "off")
+        thermoviscous_model in ("off", "thin_boundary_layer") || error(
+            "Unsupported thermoviscous wall loss model: $thermoviscous_model")
         bulk_loss_factor = T(get(loss_model, "bulk_loss_factor", 0.0))
         isfinite(bulk_loss_factor) && zero(T) <= bulk_loss_factor <= one(T) || error(
             "Bounded-region FEM bulk loss factor must be finite and between 0 and 1.",
@@ -1648,6 +1653,10 @@ function aggregate_fem_domains(
             domain_by_boundary_id[boundary_id] = length(domains) + 1
             parameters = get(boundary, "parameters", Dict{String,Any}())
             boundary_kind = String(boundary["kind"])
+            if thermoviscous_model == "thin_boundary_layer" && boundary_kind == "rigid" &&
+               !haskey(parameters, "wall_impedance") && !(boundary_id in moving_boundary_ids)
+                push!(thermoviscous_walls, (boundary_id=boundary_id, tag=solver_tag))
+            end
             if boundary_kind == "plane_wave_tube_termination"
                 isempty(parameters) || error(
                     "Plane-wave tube termination $(repr(boundary_id)) does not accept parameters.",
@@ -1756,6 +1765,7 @@ function aggregate_fem_domains(
         domain_by_boundary_id=domain_by_boundary_id,
         bulk_loss_factor_by_vertex=bulk_loss_factor_by_vertex,
         wall_impedances=wall_impedances,
+        thermoviscous_walls=thermoviscous_walls,
         plane_wave_terminations=plane_wave_terminations,
     )
 end
@@ -2225,7 +2235,8 @@ function solve_interior_request(request, system, bounded_regions; event_mode=fal
     density = FloatType(reference_density)
 
     mesh_setup_started = time_ns()
-    fem_domains = aggregate_fem_domains(meshes, bounded_regions, boundaries, FloatType)
+    fem_domains = aggregate_fem_domains(meshes, bounded_regions, boundaries, FloatType;
+        moving_boundary_ids=Set(String(id) for component in components for id in component["boundary_ids"]))
     fem_mesh = fem_domains.mesh
     symmetry_tolerance = symmetry_plane_tolerance(fem_mesh.vertices)
     fem_mesh = VolumeMesh(
@@ -2274,6 +2285,8 @@ function solve_interior_request(request, system, bounded_regions; event_mode=fal
         end
         for spec in fem_domains.wall_impedances
     ]
+    thermoviscous_operator = prepare_thermoviscous_operator(
+        fem_mesh, fem_domains.thermoviscous_walls; symmetry_mode=symmetry_mode)
     termination_operators = [
         begin
             face_indices = findall(==(Int(spec.tag)), fem_mesh.boundary_physical_tags)
@@ -2379,6 +2392,8 @@ function solve_interior_request(request, system, bounded_regions; event_mode=fal
             wavenumber;
             bulk_loss_mass=bulk_loss_mass,
         )
+        fem_system = add_thermoviscous_terms(
+            fem_system, thermoviscous_operator, frequency_hz, sound_speed, density)
         for operator in wall_operators
             admittance = miki_rigid_backed_surface_admittance(
                 frequency_hz,
@@ -2536,6 +2551,8 @@ function solve_interior_request(request, system, bounded_regions; event_mode=fal
                 operator.boundary_id for operator in termination_operators
             ],
             "wall_impedance_boundary_ids" => [operator.boundary_id for operator in wall_operators],
+            thermoviscous_diagnostics(thermoviscous_operator, fem_domains.thermoviscous_walls,
+                frequency_hz, sound_speed, density)...,
             "relative_residual" => relative_residual,
             "timings" => Dict(
                 "assembly_s" => assembly_s,
@@ -2699,7 +2716,8 @@ function solve_request_impl(request; event_mode=false)
         meshes,
         bounded_regions,
         boundaries,
-        FloatType,
+        FloatType;
+        moving_boundary_ids=Set(String(id) for component in components for id in component["boundary_ids"]),
     )
     fem_mesh = fem_domains.mesh
     bem_domain = aggregate_bem_region(meshes, unbounded_region, boundaries, FloatType)
@@ -2979,6 +2997,7 @@ function solve_request_impl(request; event_mode=false)
                 retained_fem_vertices=retained_fem_vertices,
                 bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
                 wall_impedances=fem_domains.wall_impedances,
+                thermoviscous_walls=fem_domains.thermoviscous_walls,
                 bem_backend=bem_backend,
             )
         else
@@ -2994,6 +3013,7 @@ function solve_request_impl(request; event_mode=false)
                 retained_fem_vertices=retained_fem_vertices,
                 bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
                 wall_impedances=fem_domains.wall_impedances,
+                thermoviscous_walls=fem_domains.thermoviscous_walls,
             )
         end
         cache_setup_s = (time_ns() - cache_setup_started) / 1.0e9
@@ -3059,6 +3079,7 @@ function solve_request_impl(request; event_mode=false)
                     symmetry_mode=symmetry_mode,
                     bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
                     wall_impedances=fem_domains.wall_impedances,
+                    thermoviscous_walls=fem_domains.thermoviscous_walls,
                     transducers=transducers,
                     transducer_operators=transducer_operators,
                     prescribed_bem_normal_velocity=prescribed_bem_normal_velocity,
@@ -3089,6 +3110,7 @@ function solve_request_impl(request; event_mode=false)
                     coupled_bem_max_registers=coupled_bem_max_registers,
                     bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
                     wall_impedances=fem_domains.wall_impedances,
+                    thermoviscous_walls=fem_domains.thermoviscous_walls,
                     transducers=transducers,
                     transducer_operators=transducer_operators,
                     prescribed_bem_normal_velocity=prescribed_bem_normal_velocity,
@@ -3606,6 +3628,9 @@ function solve_request_impl(request; event_mode=false)
                     for region in bounded_regions
                 ),
                 "wall_impedance_boundary_ids" => [spec.boundary_id for spec in fem_domains.wall_impedances],
+                thermoviscous_diagnostics(
+                    (use_condensed_solver ? coupled_system.cache.base : coupled_system.cache).thermoviscous_operator,
+                    fem_domains.thermoviscous_walls, frequency_hz, sound_speed, density)...,
                 "static_condensation_requested" => static_condensation_requested,
                 "static_condensation_active" => static_condensation,
                 "fem_condensation_backend" => isnothing(coupled_system.condensation) ?
