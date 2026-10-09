@@ -79,7 +79,7 @@ end
         for result in enabled.results
             diagnostics = result["diagnostics"]["thermoviscous_wall_losses"]
             @test diagnostics["boundary_ids"] == ["boundary:wall"]
-            @test diagnostics["treated_face_count"] == 2
+            @test diagnostics["treated_face_count"] == 8
             @test diagnostics["treated_area_m2"] > 0
             @test diagnostics["viscous_boundary_layer_m"] > 0
             @test all(q -> all(isfinite, decode(q)), result["quantities"])
@@ -152,7 +152,7 @@ end
     request["solver_options"]["phasor_convention"] = "exp(-i omega t)"
     negative = solve_coupled_workload(request)
     for (a,b) in zip(positive.results, negative.results)
-        @test a["diagnostics"]["thermoviscous_wall_losses"]["treated_face_count"] == 2
+        @test a["diagnostics"]["thermoviscous_wall_losses"]["treated_face_count"] == 8
         @test decode(only(a["quantities"])) ≈ conj.(decode(only(b["quantities"]))) rtol=1e-10
     end
 end
@@ -168,7 +168,7 @@ if get(ENV, "BEAT_RUN_THERMOVISCOUS_CUDA", "0") == "1"
             request["solver_options"]["bem_backend"] = "cuda"
             gpu = only(solve_coupled_workload(request).results)
             @test gpu["diagnostics"]["static_condensation_active"] == condensed
-            @test gpu["diagnostics"]["thermoviscous_wall_losses"]["treated_face_count"] == 2
+            @test gpu["diagnostics"]["thermoviscous_wall_losses"]["treated_face_count"] == 8
             for (a,b) in zip(cpu["quantities"], gpu["quantities"])
                 @test all(isfinite, decode(b))
                 @test decode(a) ≈ decode(b) rtol=5e-4
