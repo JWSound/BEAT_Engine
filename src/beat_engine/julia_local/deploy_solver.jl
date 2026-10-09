@@ -1,5 +1,6 @@
 include(joinpath(@__DIR__, "deploy_cpu.jl"))
 include(joinpath(@__DIR__, "deploy_rhs_policy.jl"))
+include(joinpath(@__DIR__, "deploy_rhs_compression.jl"))
 const DEPLOY_RHS_CALIBRATION = Ref{Any}(nothing)
 
 const DEPLOY_BOUNDARY_STATE = Ref{Any}(nothing)
@@ -769,6 +770,8 @@ function solve_deploy_request_impl(
     cached_q_neumann = nothing
     weighted_sources = nothing
     rom_factorization = nothing
+    compressed_rhs = nothing
+    compression_report = nothing
     rom_iterations = 0
     rom_operator_applications = 0
     rom_residual = FloatType(NaN)
@@ -787,7 +790,9 @@ function solve_deploy_request_impl(
     rom_rhs_calibration_seconds = 0.0
     rom_rhs_operator_used = false
     rom_rhs_mode = String(get_value(request, "rom_feedback_mode", get(ENV, "BEAT_DEPLOY_ROM_FEEDBACK", "auto")))
-    rom_rhs_mode in ("auto", "matrix_free", "cached_operator") || error("Unknown Deploy ROM feedback mode.")
+    rom_rhs_mode in ("auto", "matrix_free", "cached_operator", "compressed") || error("Unknown Deploy ROM feedback mode.")
+    rom_rhs_mode == "compressed" && !(rom_request && beat_backend == :cuda) &&
+        error("Experimental RHS compression requires a Deploy CUDA ROM request")
     rom_feedback_rhs_stage_seconds = Dict{String,Float64}()
     rom_feedback_preconditioner_seconds = 0.0
     rom_feedback_update_seconds = 0.0
@@ -1032,6 +1037,33 @@ function solve_deploy_request_impl(
                             operator_units === nothing || cuda.unsafe_free!(operator_units)
                         end
                     end
+                    if rom_rhs_mode == "compressed"
+                        options = get_value(request, "experimental_rhs_compression", Dict{String,Any}())
+                        units = cuda.ones(Complex{FloatType}, length(cached_q_neumann))
+                        try
+                            assemble_columns = columns -> assemble_burton_miller_rhs_cuda(
+                                mesh, p1_space, dp0_space, units, k, rule;
+                                device_cache=device_cache, singular_cache=singular_cache,
+                                device_singular_cache=device_singular_cache,
+                                device_image_singular_cache=device_image_singular_cache,
+                                near_correction_cache=near_correction_cache,
+                                device_near_correction_cache=device_near_correction_cache,
+                                image_near_correction_cache=ground_near_correction_cache,
+                                device_image_near_correction_cache=device_ground_near_correction_cache,
+                                symmetry_mode=:ground, assemble_operator=true, operator_columns=columns)
+                            rom_rhs_operator_build_seconds += @elapsed begin
+                                compressed_rhs = build_deploy_compressed_rhs(mesh, assemble_columns, options;
+                                    progress=message -> emit_event("status"; message=message))
+                            end
+                            compression_report = Dict(k=>v for (k,v) in compressed_rhs.report if k != "blocks")
+                            if Bool(get(options, "survey_only", false))
+                                release_deploy_compressed_rhs!(compressed_rhs)
+                                compressed_rhs = nothing
+                            end
+                        finally
+                            cuda.unsafe_free!(units)
+                        end
+                    end
                     apply_schur = function(candidate_pressure)
                         candidate_host = nothing
                         rom_feedback_pressure_download_seconds += @elapsed begin
@@ -1057,7 +1089,11 @@ function solve_deploy_request_impl(
                                 if use_operator && rom_rhs_operator === nothing
                                     build_feedback_operator(rhs_stage_timings)
                                 end
-                                if rom_rhs_operator === nothing
+                                if compressed_rhs !== nothing
+                                    rom_rhs_operator_apply_seconds += @elapsed begin
+                                        feedback_rhs = apply_deploy_compressed_rhs(compressed_rhs, feedback_device)
+                                    end
+                                elseif rom_rhs_operator === nothing
                                     feedback_rhs = assemble_burton_miller_rhs_cuda(
                                         mesh,
                                         p1_space,
@@ -1131,6 +1167,38 @@ function solve_deploy_request_impl(
                         rom_operator_applications,
                         rom_initial_relative_residual,
                     ) = gmres_result
+                    if compressed_rhs !== nothing
+                        # Audit the converged pressure using exact quadrature and the
+                        # retained exact exterior LU, independently of compression.
+                        audit_s = @elapsed begin
+                            audit_q = audit_rhs = audit_solution = nothing
+                            try
+                                response = deploy_speaker_rom_response(speaker_rom, Array(rom_pressure); include_drive=false)
+                                audit_q = cuda.CuArray(response.q)
+                                audit_rhs = assemble_burton_miller_rhs_cuda(
+                                    mesh, p1_space, dp0_space, audit_q, k, rule;
+                                    device_cache=device_cache, singular_cache=singular_cache,
+                                    device_singular_cache=device_singular_cache,
+                                    device_image_singular_cache=device_image_singular_cache,
+                                    near_correction_cache=near_correction_cache,
+                                    device_near_correction_cache=device_near_correction_cache,
+                                    image_near_correction_cache=ground_near_correction_cache,
+                                    device_image_near_correction_cache=device_ground_near_correction_cache,
+                                    symmetry_mode=:ground)
+                                audit_solution = rom_factorization \ audit_rhs
+                                audit_solution .= rom_pressure .- audit_solution .- preconditioned_rhs
+                                actual_residual = norm(audit_solution) / max(norm(preconditioned_rhs), eps(FloatType))
+                                compression_report["exact_preconditioned_relative_residual"] = actual_residual
+                                isfinite(actual_residual) && actual_residual <= 1e-3 ||
+                                    error("Experimental compressed RHS failed exact-operator residual gate: $actual_residual")
+                            finally
+                                audit_q === nothing || cuda.unsafe_free!(audit_q)
+                                audit_rhs === nothing || cuda.unsafe_free!(audit_rhs)
+                                audit_solution === nothing || cuda.unsafe_free!(audit_solution)
+                            end
+                        end
+                        compression_report["audit_s"] = audit_s
+                    end
                     # Calibrate once on a successful matrix-free solve, using its actual
                     # iteration count. The first solve pays this probe; later solves/sweep
                     # frequencies choose from measured build/apply costs, not GPU constants.
@@ -1174,6 +1242,7 @@ function solve_deploy_request_impl(
                     end
                     rom_pressure
                 finally
+                    compressed_rhs === nothing || release_deploy_compressed_rhs!(compressed_rhs)
                     rom_rhs_operator === nothing || cuda.unsafe_free!(rom_rhs_operator)
                     cuda.unsafe_free!(preconditioned_rhs)
                 end
@@ -1316,9 +1385,10 @@ function solve_deploy_request_impl(
                 result["diagnostics"]["field_backend"] = "metal"
             end
             if rom_request
-                result["diagnostics"]["rom_feedback_mode"] = rom_rhs_operator_used ? "cached_operator" : "matrix_free"
+                result["diagnostics"]["rom_feedback_mode"] = compressed_rhs !== nothing ? "compressed" : rom_rhs_operator_used ? "cached_operator" : "matrix_free"
+                result["diagnostics"]["rhs_compression"] = compression_report
                 result["diagnostics"]["rom_feedback_requested_mode"] = rom_rhs_mode
-                result["diagnostics"]["rom_rhs_operator_bytes"] = rom_rhs_operator_used ? sizeof(Complex{FloatType}) * length(mesh.vertices) * length(mesh.faces) : 0
+                result["diagnostics"]["rom_rhs_operator_bytes"] = compressed_rhs !== nothing ? compression_report["stored_bytes"] : rom_rhs_operator_used ? sizeof(Complex{FloatType}) * length(mesh.vertices) * length(mesh.faces) : 0
                 result["diagnostics"]["rom_rank_per_sector"] = speaker_rom.rank
                 result["diagnostics"]["rom_sector_count"] = speaker_rom.sector_count
                 result["diagnostics"]["rom_symmetry"] = String(speaker_rom.symmetry)
