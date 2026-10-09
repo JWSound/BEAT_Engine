@@ -170,12 +170,16 @@ end
     end
     identity_cache, image_caches, _ = corrections(mesh, :xy)
     p1, dp0, rule = build_p1_space(mesh), build_dp0_space(mesh), triangle_rule(T, 1)
-    for backend in (:metal, :rocm)
+    for backend in (:rocm,)
         for keyword in (:near_correction_cache, :image_near_correction_cache,
                         :device_near_correction_cache, :device_image_near_correction_cache)
             @test_throws r"Near-singular correction is not implemented" assemble_regular_galerkin_operators(
                 mesh, p1, dp0, K, rule; backend=backend, (keyword=>identity_cache,)...)
         end
+    end
+    for keyword in (:device_near_correction_cache, :device_image_near_correction_cache)
+        @test_throws r"requires host correction caches" assemble_regular_galerkin_operators(
+            mesh, p1, dp0, K, rule; backend=:metal, (keyword=>identity_cache,)...)
     end
     @test_throws r"cache collections are supported only on CPU" assemble_regular_galerkin_operators(
         mesh, p1, dp0, K, rule; backend=:cuda, image_near_correction_cache=image_caches)

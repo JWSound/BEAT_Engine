@@ -14,6 +14,8 @@ function release_deploy_boundary_state!()
         cuda = BeatEngineCore.CUDA_MODULE
         state.pressure isa cuda.CuArray && cuda.unsafe_free!(state.pressure)
         state.q_neumann isa cuda.CuArray && cuda.unsafe_free!(state.q_neumann)
+    elseif state.backend == :metal
+        Bool(get(state, :shared_geometry, false)) || release_metal_field_evaluation_cache!(state.field_cache)
     end
     DEPLOY_BOUNDARY_STATE[] = nothing
     return nothing
@@ -40,6 +42,10 @@ function release_deploy_geometry_state!()
                 value isa cuda.CuArray && cuda.unsafe_free!(value)
             end
         end
+    elseif state.backend == :metal
+        release_metal_field_evaluation_cache!(state.field_cache)
+        release_metal_regular_assembly_cache!(state.device_cache)
+        state.device_singular_cache === nothing || release_metal_singular_correction_cache!(state.device_singular_cache)
     end
     DEPLOY_GEOMETRY_STATE[] = nothing
     return nothing
@@ -555,7 +561,7 @@ function solve_deploy_request_impl(
     schema_version = Int(get_value(request, "schema_version", 1))
     schema_version in (1, 2, 3) || error("Unsupported Deploy solve schema_version $(schema_version).")
     beat_backend = beat_backend_from_request(request)
-    beat_backend in (:cuda, :cpu) || error("Deploy Level 2 currently supports BEAT CUDA or CPU.")
+    beat_backend in (:cuda, :cpu, :metal) || error("Deploy supports BEAT CUDA, CPU or Metal.")
     requested_assembly_mode = lowercase(String(get_value(request, "burton_miller_assembly", "direct_system")))
     requested_assembly_mode in ("direct_system", "operator_matrices") || error(
         "Deploy burton_miller_assembly must be 'direct_system' or 'operator_matrices'.",
@@ -832,6 +838,16 @@ function solve_deploy_request_impl(
                     field_cache = build_cuda_field_evaluation_cache(cpu_field_cache)
                 end
                 cached_q_neumann = BeatEngineCore.CUDA_MODULE.CuArray(q_neumann)
+            elseif beat_backend == :metal
+                if cached_geometry === nothing
+                    emit_event("status"; message="Preparing BEAT Metal geometry caches")
+                    device_cache = build_metal_regular_assembly_cache(mesh, p1_space, dp0_space, rule;
+                        singular_order=singular_order, symmetry_mode=:ground)
+                    if BeatEngineCore._normalized_metal_assembly_mode(nothing) == :native
+                        device_singular_cache = build_metal_singular_correction_cache(singular_cache)
+                    end
+                    field_cache = build_metal_field_evaluation_cache(cpu_field_cache)
+                end
             else
                 cached_geometry === nothing && emit_event("status"; message="Preparing BEAT CPU geometry caches")
             end
@@ -898,8 +914,8 @@ function solve_deploy_request_impl(
                     singular_order=singular_order,
                     backend=beat_backend,
                     device_cache=device_cache,
-                    return_device=beat_backend == :cuda,
-                    accelerator_quadrature=beat_backend == :cuda,
+                    return_device=beat_backend in (:cuda, :metal),
+                    accelerator_quadrature=beat_backend in (:cuda, :metal),
                     singular_cache=singular_cache,
                     device_singular_cache=device_singular_cache,
                     device_image_singular_cache=device_image_singular_cache,
@@ -909,6 +925,9 @@ function solve_deploy_request_impl(
                     device_image_near_correction_cache=device_ground_near_correction_cache,
                     symmetry_mode=:ground,
                 )
+                if beat_backend == :metal
+                    operators = metal_host_operators(operators)
+                end
             end
         end
 
@@ -919,7 +938,7 @@ function solve_deploy_request_impl(
                 "Solving fixed-Neumann exterior system",
         )
         solve_seconds = @elapsed begin
-            pressure = if rom_request && beat_backend == :cpu
+            pressure = if rom_request && beat_backend in (:cpu, :metal)
                 cpu_system = nothing
                 rom_factorization_seconds = @elapsed begin
                     cpu_system = BeatEngineCore.build_burton_miller_neumann_cpu_system(
@@ -1291,6 +1310,11 @@ function solve_deploy_request_impl(
                     "fidelity" => rom_request ? "level3_parity_petrov_galerkin" : "level2",
                 ),
             )
+            if beat_backend == :metal
+                result["diagnostics"]["linear_solver"] = "metal_assembly_cpu_dense_lu"
+                result["diagnostics"]["near_correction_backend"] = "cpu"
+                result["diagnostics"]["field_backend"] = "metal"
+            end
             if rom_request
                 result["diagnostics"]["rom_feedback_mode"] = rom_rhs_operator_used ? "cached_operator" : "matrix_free"
                 result["diagnostics"]["rom_feedback_requested_mode"] = rom_rhs_mode
@@ -1404,6 +1428,15 @@ function solve_deploy_request_impl(
         geometry_resources_retained = retain_geometry_cache && retained_state !== nothing &&
             retained_state.field_cache === field_cache
         if !geometry_resources_retained
+            if beat_backend == :metal
+                device_cache === nothing || release_metal_regular_assembly_cache!(device_cache)
+                device_singular_cache === nothing || release_metal_singular_correction_cache!(device_singular_cache)
+                boundary_state = DEPLOY_BOUNDARY_STATE[]
+                field_retained = boundary_state !== nothing && boundary_state.field_cache === field_cache
+                if !field_retained && field_cache !== cpu_field_cache
+                    release_metal_field_evaluation_cache!(field_cache)
+                end
+            end
             cuda_identity_cache === nothing || release_cuda_burton_miller_identity_cache!(cuda_identity_cache)
             device_image_singular_cache === nothing ||
                 release_cuda_image_singular_correction_cache!(device_image_singular_cache)

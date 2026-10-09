@@ -31,6 +31,7 @@ function emit_event(event_type::String; kwargs...)
     payload["phasor_convention"] = phasor_convention()
     if event_type == "ready"
         payload["phasor_conventions"] = [NEGATIVE_TIME_PHASOR, POSITIVE_TIME_PHASOR]
+        payload["deploy_solver_backends"] = ["cpu", "cuda", "metal"]
     elseif event_type == "result" && haskey(payload, "result")
         get!(payload["result"], "diagnostics", Dict{String,Any}())["phasor_convention"] = phasor_convention()
     end
