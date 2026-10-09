@@ -52,14 +52,42 @@ end
         with_phasor_convention(convention) do
             full = assemble_burton_miller_rhs_cuda(mesh,p1,dp0,units,0.7f0,rule;
                 device_cache=dc,singular_cache=sc,device_singular_cache=dsc,assemble_operator=true,options...)
+            correction_blocks = Dict{Any,Any}()
             for columns in ([4,2], [1], [3,1,4,2])
                 tile = assemble_burton_miller_rhs_cuda(mesh,p1,dp0,units,0.7f0,rule;
                     device_cache=dc,singular_cache=sc,device_singular_cache=dsc,
-                    assemble_operator=true,operator_columns=columns,options...)
+                    assemble_operator=true,operator_columns=columns,block_cache=correction_blocks,options...)
                 @test Array(tile) ≈ Array(full)[:,columns] rtol=2f-5 atol=2f-6
                 cuda.unsafe_free!(tile)
             end
+            for blocks in values(correction_blocks)
+                BeatEngineCore._release_cuda_bm_block_arrays!(blocks)
+            end
             cuda.unsafe_free!(full)
+            # Partitioned shared regular assembly must reconstruct the full L.
+            system = assemble_burton_miller_neumann_system_cuda(mesh,p1,dp0,units,0.7f0,rule;
+                device_cache=dc,singular_cache=sc,device_singular_cache=dsc,options...)
+            matrix = cuda.zeros(ComplexF32,4,4)
+            blocks_cache = Dict{Any,Any}()
+            for columns in ([1,3], [2,4])
+                tile = assemble_burton_miller_rhs_cuda(mesh,p1,dp0,units,0.7f0,rule;
+                    device_cache=dc,singular_cache=sc,device_singular_cache=dsc,
+                    assemble_operator=true,operator_columns=columns,regular_system=matrix,
+                    block_cache=blocks_cache,options...)
+                cuda.unsafe_free!(tile)
+            end
+            finalize_options = symmetry == :off ? (symmetry_mode=:off,) :
+                (symmetry_mode=:ground,device_image_singular_cache=image_cache,
+                 device_image_near_correction_cache=device_near)
+            BeatEngineCore.complete_cuda_bm_matrix!(matrix,mesh,0.7f0,rule;
+                device_cache=dc,singular_cache=sc,device_singular_cache=dsc,
+                block_cache=blocks_cache,finalize_options...)
+            @test isapprox(Array(matrix), Array(system.matrix); rtol=2f-5, atol=2f-6)
+            cuda.unsafe_free!(matrix)
+            release_burton_miller_system_cuda!(system)
+            for b in values(blocks_cache)
+                BeatEngineCore._release_cuda_bm_block_arrays!(b)
+            end
         end
     end
     # Exercise the GPU apply including noncontiguous gather/scatter and complex factors.
