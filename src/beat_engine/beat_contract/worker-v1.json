@@ -40,6 +40,7 @@
     "interior_fem",
     "coupled_fem_bem_lem"
   ],
+  "deploy_solver_backends": ["cpu", "cuda", "metal"],
   "exterior_source_profiles": [
     "uniform_normal",
     "rigid_translation"

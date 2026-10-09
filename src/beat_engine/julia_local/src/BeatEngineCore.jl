@@ -1272,9 +1272,9 @@ function assemble_regular_galerkin_operators(
         )
     end
 
-    # These backends do not consume near-correction caches. Reject them before
+    # ROCm does not consume near-correction caches. Reject them before
     # dispatch, including device-only caches, rather than silently ignoring them.
-    if backend in (:rocm, :metal) && any(cache -> cache !== nothing, (
+    if backend == :rocm && any(cache -> cache !== nothing, (
         near_correction_cache, image_near_correction_cache,
         device_near_correction_cache, device_image_near_correction_cache,
     ))
@@ -1336,6 +1336,8 @@ function assemble_regular_galerkin_operators(
     end
 
     if backend == :metal
+        (device_near_correction_cache === nothing && device_image_near_correction_cache === nothing) ||
+            error("Metal near-singular correction requires host correction caches.")
         accelerator_quadrature || error("Metal regular assembly requires accelerator_quadrature=true.")
         return assemble_regular_galerkin_operators_metal_regular(
             mesh,
@@ -1352,6 +1354,8 @@ function assemble_regular_galerkin_operators(
             timing=timing,
             singular_cache=singular_cache,
             metal_singular_cache=device_singular_cache,
+            near_correction_cache=near_correction_cache,
+            image_near_correction_cache=image_near_correction_cache,
             assembly_mode=metal_assembly_mode,
             symmetry_mode=symmetry_mode,
         )
