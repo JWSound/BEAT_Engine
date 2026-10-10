@@ -3154,6 +3154,7 @@ function solve_request_impl(request; event_mode=false)
                     regular_quadrature_order=quadrature_selections[frequency_index].order,
                     singular_order=singular_order,
                     cache=coupled_cache,
+                    bem_backend=bem_backend,
                     validation_diagnostics=validation_diagnostics,
                     retain_interface_radiation=radiation_requested,
                     symmetry_mode=symmetry_mode,
@@ -3382,6 +3383,9 @@ function solve_request_impl(request; event_mode=false)
                             "Pa/m",
                             ["excitation", "interface_node"],
                             metadata=Dict(
+                                "spatial_representation" => "projected_dp0_coefficients",
+                                "physical_face_value" => "mean_of_three_interface_coefficients",
+                                "normal_orientation" => "bounded_region_outward",
                                 "interface_ids" => [
                                     String(interface["id"]) for interface in interfaces
                                 ],
@@ -3638,6 +3642,10 @@ function solve_request_impl(request; event_mode=false)
                     coupled_system.condensation.analysis_reused,
                 "symmetry" => String(symmetry_mode),
                 "formulation" => String(coupled_system.formulation),
+                "interface_flux_discretization" => "power_consistent_projected_dp0",
+                "flux_conservation_measure" => "FEM geometric area versus BEM geometric area",
+                "interface_transfer_normalized_eigenvalue_floor" =>
+                    max(sqrt(eps(Float64)), 1024 * Float64(eps(FloatType))),
                 "linear_solver" => if coupled_system.formulation == :fem_interface_condensed
                     if coupled_system.linear_backend == :rocm
                         "rocm_hybrid_cpu_sparse_schur_plus_rocsolver_dense_lu"
