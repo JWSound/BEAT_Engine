@@ -493,8 +493,9 @@ function _cuda_duffy_blocks_kernel!(
                 radius = sqrt(radius2)
                 phase = k * radius
                 green_scale = inv(four_pi * radius)
-                single_re = cos(phase) * green_scale
-                single_im = sin(phase) * green_scale
+                phase_sin, phase_cos = sincos(phase)
+                single_re = phase_cos * green_scale
+                single_im = phase_sin * green_scale
                 grad_scale_re = -inv(radius)
                 grad_scale_im = k
                 grad_re = single_re * grad_scale_re - single_im * grad_scale_im
@@ -730,8 +731,9 @@ function _cuda_image_singular_delta_blocks_kernel!(
             if radius2 > zero(T)
                 radius = sqrt(radius2)
                 phase = k * radius
-                single_re = cos(phase) / (four_pi * radius)
-                single_im = sin(phase) / (four_pi * radius)
+                phase_sin, phase_cos = sincos(phase)
+                single_re = phase_cos / (four_pi * radius)
+                single_im = phase_sin / (four_pi * radius)
                 grad_scale_re = -inv(radius)
                 grad_scale_im = k
                 grad_re = single_re * grad_scale_re - single_im * grad_scale_im
@@ -811,8 +813,9 @@ function _cuda_image_singular_delta_blocks_kernel!(
                 if radius2 > zero(T)
                     radius = sqrt(radius2)
                     phase = k * radius
-                    single_re = cos(phase) / (four_pi * radius)
-                    single_im = sin(phase) / (four_pi * radius)
+                    phase_sin, phase_cos = sincos(phase)
+                    single_re = phase_cos / (four_pi * radius)
+                    single_im = phase_sin / (four_pi * radius)
                     grad_scale_re = -inv(radius)
                     grad_scale_im = k
                     grad_re = single_re * grad_scale_re - single_im * grad_scale_im
