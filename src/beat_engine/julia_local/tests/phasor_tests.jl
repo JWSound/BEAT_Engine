@@ -40,6 +40,29 @@
                     device_cache=dc,singular_cache=sc,device_singular_cache=dsc)
                 @test Array(direct.matrix) ≈ a rtol=3f-3 atol=3f-4
                 @test Array(direct.rhs) ≈ b*q rtol=3f-3 atol=3f-4
+                # Fused vs generic regular kernel in this convention. Every tetrahedron
+                # face pair is adjacent, so only the x-image launch (skip_adjacent=false)
+                # runs regular pairs; include the rhs-only 2-D launch Deploy uses.
+                dic = build_cuda_image_singular_correction_cache(mesh,p1,dp0,3,eachindex(mesh.faces),:x)
+                image_kwargs = (device_cache=dc,singular_cache=sc,device_singular_cache=dsc,
+                    device_image_singular_cache=dic,symmetry_mode=:x)
+                units_x = CUDA_MODULE.ones(ComplexF32, length(q))
+                kernels = map(("fused", "generic")) do kernel
+                    withenv("BEAT_CUDA_BM_REGULAR_KERNEL" => kernel) do
+                        system = assemble_burton_miller_neumann_system_cuda(mesh,p1,dp0,dq,k,rule; image_kwargs...)
+                        mapping = assemble_burton_miller_rhs_cuda(mesh,p1,dp0,units_x,k,rule;
+                            image_kwargs..., assemble_operator=true)
+                        result = (matrix=Array(system.matrix), rhs=Array(system.rhs), mapping=Array(mapping))
+                        release_burton_miller_system_cuda!(system)
+                        CUDA_MODULE.unsafe_free!(mapping)
+                        result
+                    end
+                end
+                @test isapprox(kernels[1].matrix, kernels[2].matrix; rtol=2f-5, atol=2f-6)
+                @test isapprox(kernels[1].rhs, kernels[2].rhs; rtol=2f-5, atol=2f-6)
+                @test isapprox(kernels[1].mapping, kernels[2].mapping; rtol=2f-5, atol=2f-6)
+                CUDA_MODULE.unsafe_free!(units_x)
+                release_cuda_image_singular_correction_cache!(dic)
                 rhs = assemble_burton_miller_rhs_cuda(mesh,p1,dp0,dq,k,rule;
                     device_cache=dc,singular_cache=sc,device_singular_cache=dsc)
                 @test Array(rhs) ≈ b*q rtol=3f-3 atol=3f-4
