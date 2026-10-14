@@ -47,6 +47,7 @@ jobs:
       - run: python -m ruff format --check pyproject.toml scripts src tests
       - run: python -m pytest
       - run: python -m beat_engine instantiate --backend cpu
+      - run: julia --startup-file=no src/beat_engine/julia_local/tests/metal_initialization_tests.jl
       - run: julia --threads=2 --startup-file=no --project=src/beat_engine/julia_local src/beat_engine/julia_local/tests/runtests.jl
       - run: julia --threads=2 --startup-file=no --project=src/beat_engine/julia_local src/beat_engine/julia_local/tests/reference_tests.jl
       - run: python -m build
