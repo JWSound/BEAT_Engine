@@ -22,6 +22,7 @@ using Statistics
 using StaticArrays
 
 include(joinpath(@__DIR__, "compiled_ground_contract.jl"))
+include(joinpath(@__DIR__, "worker_backend_availability.jl"))
 
 function emit_event(event_type::String; kwargs...)
     payload = Dict{String,Any}("type" => event_type)
@@ -32,6 +33,9 @@ function emit_event(event_type::String; kwargs...)
     if event_type == "ready"
         payload["phasor_conventions"] = [NEGATIVE_TIME_PHASOR, POSITIVE_TIME_PHASOR]
         payload["deploy_solver_backends"] = ["cpu", "cuda", "metal"]
+        # Supported solve paths are not a claim about this worker/device. Probe
+        # at startup, outside precompilation, and report actual availability.
+        payload["backends"] = worker_backend_availability()
     elseif event_type == "result" && haskey(payload, "result")
         get!(payload["result"], "diagnostics", Dict{String,Any}())["phasor_convention"] = phasor_convention()
     end
@@ -1578,4 +1582,3 @@ function main(args = ARGS)
         fail!(sprint(showerror, exc))
     end
 end
-
