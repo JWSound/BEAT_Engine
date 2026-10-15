@@ -1774,6 +1774,38 @@ end
         )
         @test Array(symmetry_rhs_only) ≈ Array(symmetry_expected_rhs) rtol=5f-4 atol=5f-5
         CUDA_MODULE.unsafe_free!(symmetry_rhs_only)
+        # The fused and generic regular kernels agree to float32 rounding order,
+        # with images, image-singular corrections and the rhs-only launch, for the
+        # rule sizes production uses: order 1 (1 point), 2 (3) and 4 (6, the default).
+        for order in (1, 2, 4)
+            order_rule = triangle_rule(Float32, order)
+            order_cache = build_cuda_regular_assembly_cache(symmetry_mesh, order_rule; element_indices=symmetry_indices)
+            order_kwargs = (
+                device_cache=order_cache,
+                singular_cache=symmetry_singular_cache,
+                device_singular_cache=symmetry_cuda_singular_cache,
+                device_image_singular_cache=image_cache,
+                symmetry_mode=:xy,
+            )
+            by_kernel = map(("fused", "generic")) do kernel
+                withenv("BEAT_CUDA_BM_REGULAR_KERNEL" => kernel) do
+                    system = assemble_burton_miller_neumann_system_cuda(
+                        symmetry_mesh, symmetry_p1, symmetry_dp0, d_symmetry_q, k, order_rule; order_kwargs...,
+                    )
+                    rhs_only = assemble_burton_miller_rhs_cuda(
+                        symmetry_mesh, symmetry_p1, symmetry_dp0, d_symmetry_q, k, order_rule; order_kwargs...,
+                    )
+                    result = (matrix=Array(system.matrix), rhs=Array(system.rhs), rhs_only=Array(rhs_only))
+                    release_burton_miller_system_cuda!(system)
+                    CUDA_MODULE.unsafe_free!(rhs_only)
+                    result
+                end
+            end
+            @test length(order_rule.weights) == (order == 1 ? 1 : order == 2 ? 3 : 6)
+            @test by_kernel[1].matrix ≈ by_kernel[2].matrix rtol=2f-5 atol=2f-6
+            @test by_kernel[1].rhs ≈ by_kernel[2].rhs rtol=2f-5 atol=2f-6
+            @test by_kernel[1].rhs_only ≈ by_kernel[2].rhs_only rtol=2f-5 atol=2f-6
+        end
         # The Spark-style path: x/xy images, image-singular corrections and row
         # weights, with every excitation taken from the mapping in one assembly.
         symmetry_units = CUDA_MODULE.ones(ComplexF32, symmetry_dp0.global_dof_count)
