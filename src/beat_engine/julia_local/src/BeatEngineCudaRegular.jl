@@ -382,6 +382,263 @@ function _cuda_regular_kernel!(
     return nothing
 end
 
+# Fused direct Burton-Miller regular kernel.
+#
+# `_cuda_regular_kernel!` in direct-system mode accumulates S, D, D' and H
+# separately (48 floats per element pair) and combines them only in the scatter.
+# This kernel applies the Burton-Miller combination per quadrature point pair,
+# the way the Metal fused assembler does, so it carries what the final system
+# needs:
+#
+#   lhs_ab = sum tb_a rb_b [-dG/dn_y - i k (n.n') G] w  +  (i/k) curl_ab sum G w
+#   rhs_a  = sum tb_a [-G - (i/k) dG/dn_x] w
+#
+# Per test point, the trial points fold into 10 live floats (three lhs partial
+# columns, one rhs partial, sum G w), expanded by the test basis once per test
+# point into the 18 + 6 pair accumulators. The curl term is loop-invariant and
+# added once from sum G w. The trial quadrature points are formed once per
+# element pair instead of once per point pair, and the rule size is a
+# compile-time constant so the trial fold unrolls and its points stay in
+# registers. Results match `_cuda_regular_kernel!` to float32 rounding order.
+
+# Fold over the trial quadrature points, unrolled at compile time so the trial
+# points are indexed with constants.
+@inline _cuda_bm_trial_fold(acc, context, ::Val{0}, ::Val{R}, lhs::Val) where {R} = acc
+@inline function _cuda_bm_trial_fold(acc, context, ::Val{N}, ::Val{R}, lhs::Val) where {N,R}
+    acc = _cuda_bm_trial_fold(acc, context, Val(N - 1), Val(R), lhs)
+    return _cuda_bm_trial_term(acc, context, Val(N), Val(R), lhs)
+end
+
+@inline function _cuda_bm_trial_term(acc, context, ::Val{Q}, ::Val{R}, ::Val{LHS}) where {Q,R,LHS}
+    v1_re, v1_im, v2_re, v2_im, v3_re, v3_im, c_re, c_im, g_re, g_im = acc
+    (; x, y, z, test_nx, test_ny, test_nz, trial_nx, trial_ny, trial_nz,
+        k, inverse_k, k_normal, test_weight, trial_points, rule_points, rule_weights) = context
+    T = typeof(k)
+    @inbounds rb2 = rule_points[Q]
+    @inbounds rb3 = rule_points[Q + R]
+    rb1 = one(T) - rb2 - rb3
+    @inbounds weight = test_weight * rule_weights[Q]
+    sx, sy, sz = trial_points[Q]
+    dx = sx - x
+    dy = sy - y
+    dz = sz - z
+    radius = sqrt(dx * dx + dy * dy + dz * dz)
+    if radius > zero(T)
+        inv_radius = one(T) / radius
+        phase_sin, phase_cos = sincos(k * radius)
+        green_scale = inv_radius * weight
+        green_re = phase_cos * green_scale
+        green_im = phase_sin * green_scale
+        # dG/dr = G (i k - 1/r), weighted.
+        grad_re = -green_re * inv_radius - green_im * k
+        grad_im = green_re * k - green_im * inv_radius
+        test_dot = -(dx * test_nx + dy * test_ny + dz * test_nz) * inv_radius
+        # rhs: -G - (i/k) dG/dn_x
+        c_re += -green_re + inverse_k * (grad_im * test_dot)
+        c_im += -green_im - inverse_k * (grad_re * test_dot)
+        if LHS
+            trial_dot = (dx * trial_nx + dy * trial_ny + dz * trial_nz) * inv_radius
+            # lhs without the curl term: -dG/dn_y - i k (n.n') G
+            u_re = -grad_re * trial_dot + k_normal * green_im
+            u_im = -grad_im * trial_dot - k_normal * green_re
+            v1_re += rb1 * u_re
+            v1_im += rb1 * u_im
+            v2_re += rb2 * u_re
+            v2_im += rb2 * u_im
+            v3_re += rb3 * u_re
+            v3_im += rb3 * u_im
+            g_re += green_re
+            g_im += green_im
+        end
+    end
+    return (v1_re, v1_im, v2_re, v2_im, v3_re, v3_im, c_re, c_im, g_re, g_im)
+end
+
+@inline function _cuda_bm_add_rhs_coefficient!(rhs_re, rhs_im, row, coefficient_re, coefficient_im, q, face)
+    row = ndims(rhs_re) == 2 ? row + (face - 1) * size(rhs_re, 1) : row
+    q_re = real(q)
+    q_im = imag(q)
+    _cuda_atomic_add!(rhs_re, row, coefficient_re * q_re - coefficient_im * q_im)
+    _cuda_atomic_add!(rhs_im, row, coefficient_re * q_im + coefficient_im * q_re)
+    return nothing
+end
+
+function _cuda_bm_fused_regular_kernel!(
+    system_re,
+    system_im,
+    rhs_re,
+    rhs_im,
+    q_neumann,
+    face_vertices,
+    normals,
+    areas,
+    faces,
+    curls,
+    test_indices,
+    trial_indices,
+    rule_points,
+    rule_weights,
+    k,
+    p1_dof_count,
+    face_count,
+    total_pairs,
+    skip_adjacent,
+    trial_sign_x,
+    trial_sign_y,
+    trial_sign_z,
+    trial_curl_sign_x,
+    trial_curl_sign_y,
+    trial_curl_sign_z,
+    ::Val{R},
+    ::Val{LHS},
+) where {R,LHS}
+    T = typeof(k)
+    pair = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    stride = blockDim().x * gridDim().x
+    inverse_k = one(T) / k
+    index_count = length(test_indices)
+
+    @inbounds while pair <= total_pairs
+        test_index = test_indices[((pair - 1) % index_count) + 1]
+        trial_index = trial_indices[((pair - 1) ÷ index_count) + 1]
+
+        t1 = faces[test_index]
+        t2 = faces[test_index + face_count]
+        t3 = faces[test_index + 2 * face_count]
+        r1 = faces[trial_index]
+        r2 = faces[trial_index + face_count]
+        r3 = faces[trial_index + 2 * face_count]
+        adjacent = t1 == r1 || t1 == r2 || t1 == r3 ||
+            t2 == r1 || t2 == r2 || t2 == r3 ||
+            t3 == r1 || t3 == r2 || t3 == r3
+
+        if !skip_adjacent || !adjacent
+            tv1x = face_vertices[test_index]
+            tv1y = face_vertices[test_index + face_count]
+            tv1z = face_vertices[test_index + 2 * face_count]
+            tv2x = face_vertices[test_index + 3 * face_count]
+            tv2y = face_vertices[test_index + 4 * face_count]
+            tv2z = face_vertices[test_index + 5 * face_count]
+            tv3x = face_vertices[test_index + 6 * face_count]
+            tv3y = face_vertices[test_index + 7 * face_count]
+            tv3z = face_vertices[test_index + 8 * face_count]
+
+            rv1x = trial_sign_x * face_vertices[trial_index]
+            rv1y = trial_sign_y * face_vertices[trial_index + face_count]
+            rv1z = trial_sign_z * face_vertices[trial_index + 2 * face_count]
+            rv2x = trial_sign_x * face_vertices[trial_index + 3 * face_count]
+            rv2y = trial_sign_y * face_vertices[trial_index + 4 * face_count]
+            rv2z = trial_sign_z * face_vertices[trial_index + 5 * face_count]
+            rv3x = trial_sign_x * face_vertices[trial_index + 6 * face_count]
+            rv3y = trial_sign_y * face_vertices[trial_index + 7 * face_count]
+            rv3z = trial_sign_z * face_vertices[trial_index + 8 * face_count]
+            # Trial quadrature points, once per element pair.
+            trial_points = ntuple(Val(R)) do q
+                @inbounds b2 = rule_points[q]
+                @inbounds b3 = rule_points[q + R]
+                b1 = one(T) - b2 - b3
+                (b1 * rv1x + b2 * rv2x + b3 * rv3x,
+                 b1 * rv1y + b2 * rv2y + b3 * rv3y,
+                 b1 * rv1z + b2 * rv2z + b3 * rv3z)
+            end
+
+            test_nx = normals[test_index]
+            test_ny = normals[test_index + face_count]
+            test_nz = normals[test_index + 2 * face_count]
+            trial_nx = trial_sign_x * normals[trial_index]
+            trial_ny = trial_sign_y * normals[trial_index + face_count]
+            trial_nz = trial_sign_z * normals[trial_index + 2 * face_count]
+            k_normal = k * (test_nx * trial_nx + test_ny * trial_ny + test_nz * trial_nz)
+            # 4 A_t A_r / (4 pi): the Green's function's 1/(4 pi) folded in once per
+            # pair, which removes a full-precision division from every point pair.
+            jac_scale = areas[test_index] * areas[trial_index] * T(0.3183098861837907)
+
+            lhs_re = zero(SVector{9,T})
+            lhs_im = zero(SVector{9,T})
+            rhs_coefficient_re = zero(SVector{3,T})
+            rhs_coefficient_im = zero(SVector{3,T})
+            green_total_re = zero(T)
+            green_total_im = zero(T)
+
+            test_q = 1
+            while test_q <= R
+                tb2 = rule_points[test_q]
+                tb3 = rule_points[test_q + R]
+                tb1 = one(T) - tb2 - tb3
+                context = (
+                    x=tb1 * tv1x + tb2 * tv2x + tb3 * tv3x,
+                    y=tb1 * tv1y + tb2 * tv2y + tb3 * tv3y,
+                    z=tb1 * tv1z + tb2 * tv2z + tb3 * tv3z,
+                    test_nx=test_nx, test_ny=test_ny, test_nz=test_nz,
+                    trial_nx=trial_nx, trial_ny=trial_ny, trial_nz=trial_nz,
+                    k=k, inverse_k=inverse_k, k_normal=k_normal,
+                    test_weight=rule_weights[test_q] * jac_scale,
+                    trial_points=trial_points, rule_points=rule_points, rule_weights=rule_weights,
+                )
+                z0 = zero(T)
+                v1_re, v1_im, v2_re, v2_im, v3_re, v3_im, c_re, c_im, g_re, g_im = _cuda_bm_trial_fold(
+                    (z0, z0, z0, z0, z0, z0, z0, z0, z0, z0), context, Val(R), Val(R), Val(LHS),
+                )
+                test_basis = SVector(tb1, tb2, tb3)
+                rhs_coefficient_re += test_basis * c_re
+                rhs_coefficient_im += test_basis * c_im
+                if LHS
+                    # Column-major 3x3: entry (a, b) = test basis a x trial column b.
+                    lhs_re += SVector(
+                        tb1 * v1_re, tb2 * v1_re, tb3 * v1_re,
+                        tb1 * v2_re, tb2 * v2_re, tb3 * v2_re,
+                        tb1 * v3_re, tb2 * v3_re, tb3 * v3_re,
+                    )
+                    lhs_im += SVector(
+                        tb1 * v1_im, tb2 * v1_im, tb3 * v1_im,
+                        tb1 * v2_im, tb2 * v2_im, tb3 * v2_im,
+                        tb1 * v3_im, tb2 * v3_im, tb3 * v3_im,
+                    )
+                    green_total_re += g_re
+                    green_total_im += g_im
+                end
+                test_q += 1
+            end
+
+            q = q_neumann[trial_index]
+            _cuda_bm_add_rhs_coefficient!(rhs_re, rhs_im, t1, rhs_coefficient_re[1], rhs_coefficient_im[1], q, trial_index)
+            _cuda_bm_add_rhs_coefficient!(rhs_re, rhs_im, t2, rhs_coefficient_re[2], rhs_coefficient_im[2], q, trial_index)
+            _cuda_bm_add_rhs_coefficient!(rhs_re, rhs_im, t3, rhs_coefficient_re[3], rhs_coefficient_im[3], q, trial_index)
+
+            if LHS
+                # (i/k) curl_ab sum G w, read after the loop so the nine curl
+                # products are not live registers during it.
+                tc = SVector(
+                    SVector(curls[test_index], curls[test_index + face_count], curls[test_index + 2 * face_count]),
+                    SVector(curls[test_index + 3 * face_count], curls[test_index + 4 * face_count], curls[test_index + 5 * face_count]),
+                    SVector(curls[test_index + 6 * face_count], curls[test_index + 7 * face_count], curls[test_index + 8 * face_count]),
+                )
+                rc = SVector(
+                    SVector(trial_curl_sign_x * curls[trial_index], trial_curl_sign_y * curls[trial_index + face_count],
+                        trial_curl_sign_z * curls[trial_index + 2 * face_count]),
+                    SVector(trial_curl_sign_x * curls[trial_index + 3 * face_count], trial_curl_sign_y * curls[trial_index + 4 * face_count],
+                        trial_curl_sign_z * curls[trial_index + 5 * face_count]),
+                    SVector(trial_curl_sign_x * curls[trial_index + 6 * face_count], trial_curl_sign_y * curls[trial_index + 7 * face_count],
+                        trial_curl_sign_z * curls[trial_index + 8 * face_count]),
+                )
+                curl_re = -inverse_k * green_total_im
+                curl_im = inverse_k * green_total_re
+                rows = (t1, t2, t3)
+                columns = (r1, r2, r3)
+                # Constant indices throughout, so nothing here spills to local memory.
+                Base.Cartesian.@nexprs 3 b -> Base.Cartesian.@nexprs 3 a -> begin
+                    curl = tc[a][1] * rc[b][1] + tc[a][2] * rc[b][2] + tc[a][3] * rc[b][3]
+                    index = rows[a] + (columns[b] - 1) * p1_dof_count
+                    _cuda_atomic_add!(system_re, index, lhs_re[a + 3 * (b - 1)] + curl * curl_re)
+                    _cuda_atomic_add!(system_im, index, lhs_im[a + 3 * (b - 1)] + curl * curl_im)
+                end
+            end
+        end
+        pair += stride
+    end
+    return nothing
+end
+
 function _cuda_regular_quadrature_kernel!(
     slp_re,
     slp_im,
