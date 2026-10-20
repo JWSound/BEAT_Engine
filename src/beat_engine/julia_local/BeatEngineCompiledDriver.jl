@@ -1231,7 +1231,8 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                          max(1, process_blas_threads - 1) : process_blas_threads
     try
         if metal_field_batch !== nothing
-            metal_field_points = BeatEngineCore.prepare_metal_field_output_points(metal_field_batch.point_sets)
+            metal_field_points = BeatEngineCore.prepare_metal_field_output_points(
+                metal_field_batch.point_sets, field_cache.source_count)
         end
         if sweep_blas_threads != process_blas_threads
             BLAS.set_num_threads(sweep_blas_threads)
@@ -3154,6 +3155,7 @@ function solve_request_impl(request; event_mode=false)
                     regular_quadrature_order=quadrature_selections[frequency_index].order,
                     singular_order=singular_order,
                     cache=coupled_cache,
+                    bem_backend=bem_backend,
                     validation_diagnostics=validation_diagnostics,
                     retain_interface_radiation=radiation_requested,
                     symmetry_mode=symmetry_mode,
@@ -3382,6 +3384,9 @@ function solve_request_impl(request; event_mode=false)
                             "Pa/m",
                             ["excitation", "interface_node"],
                             metadata=Dict(
+                                "spatial_representation" => "projected_dp0_coefficients",
+                                "physical_face_value" => "mean_of_three_interface_coefficients",
+                                "normal_orientation" => "bounded_region_outward",
                                 "interface_ids" => [
                                     String(interface["id"]) for interface in interfaces
                                 ],
@@ -3638,6 +3643,10 @@ function solve_request_impl(request; event_mode=false)
                     coupled_system.condensation.analysis_reused,
                 "symmetry" => String(symmetry_mode),
                 "formulation" => String(coupled_system.formulation),
+                "interface_flux_discretization" => "power_consistent_projected_dp0",
+                "flux_conservation_measure" => "FEM geometric area versus BEM geometric area",
+                "interface_transfer_normalized_eigenvalue_floor" =>
+                    max(sqrt(eps(Float64)), 1024 * Float64(eps(FloatType))),
                 "linear_solver" => if coupled_system.formulation == :fem_interface_condensed
                     if coupled_system.linear_backend == :rocm
                         "rocm_hybrid_cpu_sparse_schur_plus_rocsolver_dense_lu"
@@ -4143,31 +4152,7 @@ function evaluate_bem_field_request_impl(request, request_path)
     )
 end
 
-function worker_backend_availability()
-    backends = Dict{String,Any}("cpu" => Dict("available" => true, "reason" => ""))
-    for (name, accelerator) in (
-        ("cuda", BeatEngineCore.CUDA_MODULE),
-        ("rocm", BeatEngineCore.AMDGPU_MODULE),
-        ("metal", BeatEngineCore.METAL_MODULE),
-    )
-        available, reason = try
-            if accelerator === nothing
-                (false, "Package is not loaded in this Julia environment.")
-            else
-                functional = accelerator.functional()
-                if functional && name == "rocm"
-                    functional = accelerator.functional(:rocblas) && accelerator.functional(:rocsolver)
-                end
-                (functional, functional ? "" : "Runtime/device or required solver libraries are not functional.")
-            end
-        catch exception
-            (false, sprint(showerror, exception))
-        end
-        backends[name] = Dict("available" => available, "reason" => reason,
-            "phasor_conventions" => name == "rocm" ? [NEGATIVE_TIME_PHASOR] : [NEGATIVE_TIME_PHASOR, POSITIVE_TIME_PHASOR])
-    end
-    return backends
-end
+include(joinpath(@__DIR__, "worker_backend_availability.jl"))
 
 function run_worker()
     ready = worker_ready(worker_backend_availability())

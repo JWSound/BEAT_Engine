@@ -57,16 +57,7 @@ else
     end
 end
 
-const METAL_MODULE = if BEAT_ACCELERATOR_HINT in ("cuda", "rocm", "none")
-    nothing
-else
-    try
-        @eval import Metal
-        Metal
-    catch
-        nothing
-    end
-end
+const METAL_MODULE = include("BeatEngineMetalLoad.jl")
 
 export BoundaryMesh,
     combine_boundary_meshes,

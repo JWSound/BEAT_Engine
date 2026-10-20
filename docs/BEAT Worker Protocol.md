@@ -7,6 +7,16 @@ before opening the request file. No matrix assembly is needed for negotiation.
 
 ## Handshake and version ownership
 
+The source-entry Deploy worker (`solver.jl`) also reports a `backends` map at
+runtime. Its `deploy_solver_backends` list describes supported solve paths;
+clients must separately check `backends.metal.available` before accepting a
+Metal solve. Device availability is evaluated at worker startup, not during
+package precompilation. A selected Metal environment requires its Metal package:
+dependency import and bundle compilation failures propagate with their original
+error instead of caching an engine with a missing accelerator. CPU-only loading
+does not require Metal. The standalone regression gate is
+`julia --startup-file=no src/beat_engine/julia_local/tests/metal_initialization_tests.jl`.
+
 [worker-v1.json](../src/beat_engine/beat_contract/worker-v1.json) is the engine-owned
 announcement template. Julia adds `runtime.julia_version` and `backends` at startup,
 then emits the resulting object as a single JSON line on stdout, with `type: ready`.
