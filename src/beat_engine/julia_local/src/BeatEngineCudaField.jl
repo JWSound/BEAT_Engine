@@ -280,8 +280,9 @@ function _cuda_field_eval_kernel!(
             radius = sqrt(radius2)
             phase = k * radius
             green_scale = inv(four_pi * radius)
-            green_re = cos(phase) * green_scale
-            green_im = sin(phase) * green_scale
+            phase_sin, phase_cos = sincos(phase)
+            green_re = phase_cos * green_scale
+            green_im = phase_sin * green_scale
             grad_scale_re = -inv(radius)
             grad_scale_im = k
             normal = (
