@@ -83,6 +83,13 @@ restoration of the default convention. Run either file directly under the
 `julia_rocm` project when diagnosing a failure. Neither gate establishes warmed
 performance or arbitrary-geometry accuracy.
 
+`rocm_exterior_transducer_tests.jl` is also part of the ROCm hardware runner.
+It reuses the analytical exterior BEM/LEM and symmetry gates with an explicit
+ROCm backend and checks the reported ROCm dense solve for every GPU request.
+Additional Float32/Float64 comparisons with CPU cover both phasors, ground
+reflection, boundary traces, radiation impedance, diaphragm velocity, current,
+and field outputs. The ordinary tests keep their CPU default.
+
 The Metal gate runs with the `julia_metal` project on Apple Silicon. Its
 `metal production pipeline` testset solves `off`, `x` and `xy` on the meshes
 that are fundamental domains for each, checks the operators land on the GPU
