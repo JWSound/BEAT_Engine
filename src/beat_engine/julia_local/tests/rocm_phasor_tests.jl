@@ -131,18 +131,29 @@ function coupled_case(::Type{T}) where {T}
     end
 end
 
-@testset "ROCm native phasor hardware qualification" begin
-    for T in (Float32, Float64), symmetry in (:off, :x, :xy, :ground)
-        @testset "$T $symmetry" begin
-            exterior_case(T, symmetry)
+try
+    @testset "ROCm native phasor hardware qualification" begin
+        for T in (Float32, Float64), symmetry in (:off, :x, :xy, :ground)
+            @testset "$T $symmetry" begin
+                exterior_case(T, symmetry)
+            end
         end
     end
-end
-@testset "ROCm coupled phasors near a cavity pole" begin
-    for T in (Float32, Float64)
-        @testset "$T" begin
-            coupled_case(T)
+    @testset "ROCm coupled phasors near a cavity pole" begin
+        for T in (Float32, Float64)
+            @testset "$T" begin
+                coupled_case(T)
+            end
         end
     end
+finally
+    # Finish pending work and release pooled allocations while Julia and HIP are
+    # still fully initialized. Keep teardown failures visible to qualification.
+    accelerator = BeatEngineCore.amdgpu_module()
+    accelerator.synchronize()
+    GC.gc(true)
+    accelerator.reclaim()
+    println("ROCM_PHASOR_TEARDOWN_COMPLETE")
+    flush(stdout)
 end
 end
