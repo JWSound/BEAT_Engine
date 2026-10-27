@@ -156,9 +156,19 @@ by the sum of each face's maximum vertex radius about its centroid.
 with separation. Singular pairs retain their existing Duffy correction. Enabled
 requests use four-operator assembly, bypassing the fused Burton-Miller path,
 and report applied pair count, maximum order and selected image-transform count
-in result diagnostics. The source option rejects CUDA, ROCm and Metal before
+in result diagnostics. CPU and ROCm accept the source option; CUDA and Metal are rejected before
 loading geometry or devices. Existing explicit compiled proximity inputs and
 CUDA single-cache entry points retain their contracts.
+
+ROCm applies correction-minus-regular paired quadrature through its native GPU
+pair kernels before symmetry row weights. Host near-cache collections support
+all image transforms; difference rules are rebuilt against the current regular
+rule. Its explicit host-staged assembly mode forwards the same caches to CPU
+assembly. CUDA device correction caches remain unsupported on ROCm.
+`rocm_near_correction_tests.jl` compares both ROCm assembly modes with CPU across
+Float32/Float64, both phasors, regular-rule changes, and off/X/XY/ground symmetry.
+`rocm_near_source_tests.jl` also checks source-request CPU parity, diagnostics,
+and an empty selection. Both are required by the ROCm hardware runner.
 
 
 ## Compiled-worker dispatch qualification
