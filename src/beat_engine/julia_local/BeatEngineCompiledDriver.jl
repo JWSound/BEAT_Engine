@@ -83,8 +83,10 @@ const SPEAKER_ROM_QUANTITIES = Set([
 ])
 
 function speaker_interior_state_layout(system)
-    gamma_count = length(system.gamma_range)
-    interface_count = length(system.flux_range)
+    # ROM state includes the retained pressure and interface flux even when the
+    # production solve has eliminated them from its unknown vector.
+    gamma_count = length(system.retained_fem_vertices)
+    interface_count = size(system.interface_operators.fem_trace, 1)
     transducer_count = length(system.transducers)
     gamma_range = 1:gamma_count
     flux_range = (gamma_count + 1):(gamma_count + interface_count)
