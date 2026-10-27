@@ -7,6 +7,7 @@ import math
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +22,42 @@ def load_script(name):
 
 benchmark = load_script("benchmark_worker")
 compare = load_script("compare_benchmarks")
+
+
+@pytest.mark.parametrize("failure", [None, "open", "query"])
+def test_windows_reader_uses_current_bytes_and_closes_handles(monkeypatch, failure):
+    closed = []
+    handle = 2**40 + 123  # Catch accidental truncation of a 64-bit HANDLE.
+
+    def query(process, pointer, size):
+        assert process == handle
+        pointer._obj.PeakWorkingSetSize = 64 * 2**20
+        pointer._obj.WorkingSetSize = 8 * 2**20
+        return failure != "query"
+
+    kernel = SimpleNamespace(
+        OpenProcess=lambda *args: 0 if failure == "open" else handle,
+        K32GetProcessMemoryInfo=query,
+        CloseHandle=lambda process: closed.append(process),
+    )
+    monkeypatch.setattr(benchmark.ctypes, "WinDLL", lambda *args, **kwargs: kernel, raising=False)
+    value = benchmark.windows_working_set_reader(1234)()
+    assert value == (8 * 2**20 if failure is None else None)
+    assert closed == ([] if failure == "open" else [handle])
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="native Windows working-set API")
+def test_windows_memory_tracks_touched_allocation():
+    memory = benchmark.PeakMemory(os.getpid())
+    before = memory.current_mb()
+    assert before is not None and before > 0
+    with memory:
+        allocation = bytearray(32 * 2**20)
+        allocation[::4096] = b"x" * (len(allocation) // 4096)
+        during = memory.current_mb()
+    assert during > before + 16
+    assert memory.peak_mb > before + 16
+    assert allocation[0] == ord("x")
 
 
 def wire(values, shape=None):
