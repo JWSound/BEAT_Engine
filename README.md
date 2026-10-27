@@ -95,6 +95,13 @@ in both precisions and phasor conventions, against CPU condensation with interfa
 elimination explicitly disabled. It does not qualify exported ROM artifacts or
 claim faster rank analysis.
 
+The ROCm ROM export gate reconstructs physical responses from the exported
+Petrov-Galerkin matrices, including direct affine terms and padded sector states.
+It compares boundary flux, diaphragm velocity, and voice-coil current with full
+interior solves and CPU exports for complex voltage and exterior-velocity drives.
+This checks numerical ROM contents; serialized package and Deploy execution
+qualification are separate.
+
 Exterior-only compiled-system CUDA and Metal solves default to direct
 Burton–Miller assembly. CUDA uses the same assembler as Deploy; Metal uses its
 fused assembler, which forms the system on the GPU and factorizes once on the
