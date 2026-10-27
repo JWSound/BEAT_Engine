@@ -72,6 +72,17 @@ The existing `BLAB_RUN_COUPLED_CUDA=1`, `BLAB_RUN_COUPLED_ROCM=1` and
 hardware and their corresponding Julia projects. CPU reference success does not
 qualify CUDA, ROCm, or Metal.
 
+The ROCm hardware runner also executes `rocm_phasor_tests.jl` and
+`rocm_worker_phasor_tests.jl`; both require a functional device and fail when it
+is unavailable. The native gate checks Float32/Float64 exterior operators,
+complex multi-RHS pressures and fields for off/X/XY/ground symmetry, then
+monolithic and condensed voltage-driven coupled solves on either side of a
+cavity pole. The request gate checks source and compiled requests, CPU parity,
+retained-field cache reuse across negative/positive/negative requests, and
+restoration of the default convention. Run either file directly under the
+`julia_rocm` project when diagnosing a failure. Neither gate establishes warmed
+performance or arbitrary-geometry accuracy.
+
 The Metal gate runs with the `julia_metal` project on Apple Silicon. Its
 `metal production pipeline` testset solves `off`, `x` and `xy` on the meshes
 that are fundamental domains for each, checks the operators land on the GPU

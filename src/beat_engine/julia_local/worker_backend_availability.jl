@@ -19,7 +19,7 @@ function worker_backend_availability()
             (false, sprint(showerror, exception))
         end
         backends[name] = Dict("available" => available, "reason" => reason,
-            "phasor_conventions" => name == "rocm" ? [NEGATIVE_TIME_PHASOR] : [NEGATIVE_TIME_PHASOR, POSITIVE_TIME_PHASOR])
+            "phasor_conventions" => [NEGATIVE_TIME_PHASOR, POSITIVE_TIME_PHASOR])
     end
     return backends
 end

@@ -807,8 +807,6 @@ include(joinpath(@__DIR__, "deploy_solver.jl"))
 
 function solve_request(request)
     convention = get_value(request, "phasor_convention", get_value(get_value(request, "config", Dict()), "phasor_convention", NEGATIVE_TIME_PHASOR))
-    convention == POSITIVE_TIME_PHASOR && beat_backend_from_request(request) == :rocm &&
-        error("Positive-time ROCm solves require hardware qualification; use CPU, CUDA, or Metal.")
     return with_phasor_convention(convention) do
         solve_request_with_convention(request)
     end
