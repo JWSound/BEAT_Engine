@@ -883,8 +883,8 @@ function solve_request_impl(request)
     symmetry_mode = symmetry_mode_from_config(config)
     beat_backend = beat_backend_from_request(request)
     near_enabled = Bool(get_value(config, "near_correction_enabled", false))
-    near_enabled && beat_backend != :cpu && error(
-        "Source-request near-singular correction is supported only on the CPU backend.",
+    near_enabled && !(beat_backend in (:cpu, :rocm)) && error(
+        "Source-request near-singular correction is supported only on CPU and ROCm backends.",
     )
     rocm_assembly_mode = beat_backend == :rocm ? BeatEngineCore._normalized_rocm_assembly_mode(
         get_value(config, "rocm_assembly_mode", nothing),
