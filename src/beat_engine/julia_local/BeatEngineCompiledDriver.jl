@@ -3638,6 +3638,8 @@ function solve_request_impl(request; event_mode=false)
                 "coupled_bem_image_fusion" => hasproperty(coupled_system, :coupled_bem_image_fusion) && coupled_system.coupled_bem_image_fusion,
                 "coupled_bem_max_registers" => hasproperty(coupled_system, :coupled_bem_max_registers) ? coupled_system.coupled_bem_max_registers : 0,
                 "linear_backend" => String(coupled_system.linear_backend),
+                "rocm_dense_factorization_precision" => coupled_system.linear_backend == :rocm ?
+                    (eltype(coupled_system.factorization) == ComplexF64 ? "float64" : "float32") : nothing,
                 "fem_symbolic_analysis_reused" => !isnothing(coupled_system.condensation) &&
                     hasproperty(coupled_system.condensation, :analysis_reused) &&
                     coupled_system.condensation.analysis_reused,
