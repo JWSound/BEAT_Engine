@@ -34,7 +34,11 @@ subprocess.run(
     check=True,
 )
 if backend == "rocm":
-    for test in ("rocm_phasor_tests.jl", "rocm_worker_phasor_tests.jl"):
+    for test in (
+        "rocm_phasor_tests.jl",
+        "rocm_worker_phasor_tests.jl",
+        "rocm_interface_radiation_tests.jl",
+    ):
         subprocess.run(
             [
                 "julia",
