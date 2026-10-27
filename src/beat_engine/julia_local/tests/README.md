@@ -170,6 +170,17 @@ Float32/Float64, both phasors, regular-rule changes, and off/X/XY/ground symmetr
 `rocm_near_source_tests.jl` also checks source-request CPU parity, diagnostics,
 and an empty selection. Both are required by the ROCm hardware runner.
 
+ROCm also accepts opt-in `regular_quadrature_mode="wavelength"` in source and
+compiled exterior/coupled requests. Fixed quadrature remains the default. Each
+selected order uses matching assembly, identity, and field caches; coupled
+variants share the original FEM/interface and direct singular buffers. All
+variant device buffers are released when the request finishes or fails.
+`rocm_wavelength_tests.jl` compares changing/revisited orders with fixed-order
+CPU references for ideal exterior, electrodynamic-transducer, and coupled
+requests, including cached/uncached monolithic and condensed solves.
+`rocm_wavelength_source_tests.jl` covers source sweeps with symmetry and near
+corrections. Both are explicit ROCm hardware gates.
+
 
 ## Compiled-worker dispatch qualification
 
