@@ -41,6 +41,7 @@ if backend == "rocm":
         "rocm_near_source_tests.jl",
         "rocm_wavelength_tests.jl",
         "rocm_wavelength_source_tests.jl",
+        "rocm_thermoviscous_tests.jl",
     ):
         subprocess.run(
             [
