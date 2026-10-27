@@ -19,7 +19,8 @@ function build_rocm_singular_correction_cache(cache::SingularCorrectionCache{T})
         pair_offsets[test_index + 1] = Int32(length(trial_indices) + 1)
     end
 
-    total_rule_points = sum(length(rule.weights) for rule in cache.rules)
+    # A separated ground image has no singular pairs and therefore no rules.
+    total_rule_points = sum(length(rule.weights) for rule in cache.rules; init=0)
     rule_offsets = Vector{Int32}(undef, length(cache.rules) + 1)
     rule_test_points = Matrix{T}(undef, total_rule_points, 2)
     rule_trial_points = Matrix{T}(undef, total_rule_points, 2)

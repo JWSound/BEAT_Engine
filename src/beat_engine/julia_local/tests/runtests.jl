@@ -46,6 +46,10 @@ rocm_available() = AMDGPU_MODULE !== nothing &&
                    AMDGPU_MODULE.functional(:rocblas) &&
                    AMDGPU_MODULE.functional(:rocsolver)
 
+if rocm_available()
+    include(joinpath(@__DIR__, "rocm_ground_tests.jl"))
+end
+
 const METAL_MODULE = try
     @eval import Metal
     Metal
