@@ -158,3 +158,32 @@ def test_cli_rejects_invalid_later_repeat(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         compare.main()
     assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("kind", ["working_set", "mixed", "legacy"])
+def test_cli_labels_memory_and_does_not_mix_measurements(tmp_path, monkeypatch, capsys, kind):
+    for index in range(2):
+        record = {
+            "wall_s": 1.0, "commit": "test", "backend": "rocm", "frequencies": [],
+            "memory_mb": {"before_sweep": 100.0, "peak_sweep": 120.0},
+        }
+        if kind != "legacy":
+            record["memory_measurement"] = {
+                "metric": "resident_set" if kind == "mixed" and index else "working_set",
+                "scope": "worker_process", "peak_kind": "sampled_within_sweep",
+                "poll_interval_s": 0.02, "dedicated_gpu_memory": "not_measured",
+            }
+        (tmp_path / f"run{index}.json").write_text(json.dumps(record))
+    monkeypatch.setattr(sys, "argv", ["compare", "--stage", f"rocm={tmp_path / 'run*.json'}"])
+    compare.main()
+    output = capsys.readouterr().out
+    if kind == "mixed":
+        assert "measurement methods differ" in output
+        assert "peak 120" not in output
+    else:
+        assert "peak 120 MB" in output
+        if kind == "legacy":
+            assert "unspecified (legacy report)" in output
+        else:
+            assert "working_set; worker_process; sampled_within_sweep" in output
+            assert "dedicated GPU: not_measured" in output
