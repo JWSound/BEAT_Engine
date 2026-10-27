@@ -65,6 +65,13 @@ checkout's meshes, so it is not committed here.
   checks every repeat and reports the worst of each metric across repeats.
   Quantities, frequencies, shapes and lengths must match the reference, and
   values must be finite; incomplete or invalid outputs stop the comparison.
+  Benchmark output-key version 2 retains quantity and output ID, sweep index,
+  and the full requested frequency. This preserves multiple pressure outputs,
+  repeated frequencies, and closely spaced frequencies. Returned Float32
+  frequencies are checked against their requested slot before canonicalization.
+  Capture both candidate and reference with the same benchmark-tool version;
+  older reports remain readable together but cannot be compared to version 2
+  output keys. Re-capture old references rather than discard output identities.
 
 ## Overlap, pipelining and offload
 
