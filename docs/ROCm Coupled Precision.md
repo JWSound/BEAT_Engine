@@ -39,10 +39,16 @@ process exit. An earlier run passed its assertions but did not finish shutting
 down promptly and required termination; that lifecycle observation remains a
 qualification limitation, not a numerical pass for that earlier process.
 
-Full hardware qualification and warmed real-project cost measurements are still
-required before this candidate is treated as release-qualified. The local logs
-are under `runs/rx7600-phasor-20261027/`, including the pristine reproduction,
-initial factorization experiment and instrumented lifecycle rerun.
+The full candidate RX 7600 hardware gate passed with normal exit (611.87 s
+including startup), including all 67 coupled assertions. The standalone CPU
+reference gate also passed with normal exit (477.19 s). These elapsed times are
+qualification records, not warmed performance measurements. The local logs are
+under `runs/rx7600-phasor-20261027/`, including the pristine reproduction,
+initial factorization experiment, instrumented lifecycle rerun, and full gates.
+
+Warmed real-project cost measurements remain required before release
+qualification. The earlier terminated Julia process retained a running kernel
+thread consuming CPU time, so profiling is deferred until the machine is idle.
 
 ## Cost and follow-up
 
