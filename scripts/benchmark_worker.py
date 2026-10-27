@@ -130,8 +130,10 @@ def outputs_of(result, *, requested_frequency=None, frequency_index=0) -> dict:
     freq = actual_frequency if requested_frequency is None else float(requested_frequency)
     # Workers may report a Float32 frequency. Preserve the requested Float64
     # identity while checking that the returned row belongs to this sweep slot.
-    if not math.isfinite(freq) or not math.isfinite(actual_frequency) or not math.isclose(
-        actual_frequency, freq, rel_tol=2e-6, abs_tol=1e-5
+    if (
+        not math.isfinite(freq)
+        or not math.isfinite(actual_frequency)
+        or not math.isclose(actual_frequency, freq, rel_tol=2e-6, abs_tol=1e-5)
     ):
         raise ValueError("Returned frequency does not match the requested sweep slot")
     found = {}

@@ -50,11 +50,21 @@ def test_windows_report_preserves_unavailable_memory(tmp_path, monkeypatch, caps
 
 
 def benchmark_result(frequency, values=(1, 2)):
-    return {"freq_hz": frequency, "quantities": [
-        {"id": name, "quantity": "exterior_pressure", "values": {
-            "dtype": "complex128", "shape": [1], "content_base64": wire([value])[0],
-        }} for name, value in zip(("probe@near", "probe@far"), values)
-    ]}
+    return {
+        "freq_hz": frequency,
+        "quantities": [
+            {
+                "id": name,
+                "quantity": "exterior_pressure",
+                "values": {
+                    "dtype": "complex128",
+                    "shape": [1],
+                    "content_base64": wire([value])[0],
+                },
+            }
+            for name, value in zip(("probe@near", "probe@far"), values)
+        ],
+    }
 
 
 def test_benchmark_preserves_same_quantity_outputs_and_close_frequencies():
