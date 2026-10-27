@@ -51,7 +51,10 @@ function captured(r)
             @test !isempty(results)
             for result in results
                 @test result["diagnostics"]["bem_backend"] == "rocm"
-                @test result["diagnostics"]["linear_solver"] == "rocm_rocsolver_dense_lu"
+                # This helper is also reused by coupled wavelength sweeps.
+                @test result["diagnostics"]["linear_solver"] in (
+                    "rocm_rocsolver_dense_lu", "rocm_hybrid_cpu_sparse_schur_plus_rocsolver_dense_lu",
+                )
             end
         end
         results
