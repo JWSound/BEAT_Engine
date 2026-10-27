@@ -72,6 +72,11 @@ The existing `BLAB_RUN_COUPLED_CUDA=1`, `BLAB_RUN_COUPLED_ROCM=1` and
 hardware and their corresponding Julia projects. CPU reference success does not
 qualify CUDA, ROCm, or Metal.
 
+The [RX 7600 native Windows qualification](../../../../docs/ROCm%20RX%207600%20Qualification.md)
+records the tested ROCm stack, dedicated assembly/field/symmetry gates, coupled
+hardware execution, and remaining qualification gaps. The standalone
+`scripts/validate_rocm_coupled.jl` uses the packaged fixtures in this directory.
+
 The Metal gate runs with the `julia_metal` project on Apple Silicon. Its
 `metal production pipeline` testset solves `off`, `x` and `xy` on the meshes
 that are fundamental domains for each, checks the operators land on the GPU
