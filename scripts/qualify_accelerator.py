@@ -43,6 +43,7 @@ if backend == "rocm":
         "rocm_wavelength_source_tests.jl",
         "rocm_exterior_transducer_tests.jl",
         "rocm_interface_radiation_tests.jl",
+        "rocm_speaker_rank_tests.jl",
     ):
         subprocess.run(
             [
