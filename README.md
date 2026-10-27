@@ -81,6 +81,14 @@ backends. Some historical research scripts and the optional noncubic-cavity test
 still require Boundary Lab's extended fixtures; they are not installed runtime
 requirements or part of the portable release gate.
 
+The speaker ROM rank experiment accepts ROCm FEM-interface-condensed systems.
+It copies the retained Schur block to the host and uses CPU LU for rank analysis;
+`interior_factorization_backend` reports this separately from the coupled backend.
+The hardware gate compares all four parity sectors on four reflected cavities,
+in both precisions and phasor conventions, against CPU condensation with interface
+elimination explicitly disabled. It does not qualify exported ROM artifacts or
+claim faster rank analysis.
+
 Exterior-only compiled-system CUDA and Metal solves default to direct
 Burton–Miller assembly. CUDA uses the same assembler as Deploy; Metal uses its
 fused assembler, which forms the system on the GPU and factorizes once on the

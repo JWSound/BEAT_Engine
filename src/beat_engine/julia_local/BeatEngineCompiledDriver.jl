@@ -284,6 +284,8 @@ function _speaker_interior_factorization(system, k_matrix)
         cuda.synchronize()
         return (backend=:cuda, factorization=factorization, storage=device_matrix)
     end
+    # ROCm rank analysis uses the retained Schur block on the host, matching
+    # the existing speaker ROM path. Report this separately from the solve backend.
     return (backend=:cpu, factorization=lu!(k_matrix), storage=nothing)
 end
 
@@ -359,8 +361,8 @@ function speaker_rom_rank_experiment(system, raw_config)
     system.formulation == :fem_interface_condensed || error(
         "Speaker ROM rank experiment requires FEM interface condensation.",
     )
-    system.linear_backend in (:cpu, :cuda) || error(
-        "Speaker ROM rank experiment currently supports CPU or CUDA condensation.",
+    system.linear_backend in (:cpu, :cuda, :rocm) || error(
+        "Speaker ROM rank experiment currently supports CPU, CUDA, or ROCm condensation.",
     )
     train_count = Int(get(raw_config, "train_per_sector", 128))
     test_count = Int(get(raw_config, "test_per_sector", 32))
@@ -474,6 +476,7 @@ function speaker_rom_rank_experiment(system, raw_config)
     ]
     return Dict(
         "method" => "four-sector parity-projected output POD with held-out physical boundary fields",
+        "interior_factorization_backend" => String(factor.backend),
         "frequency_hz" => system.omega / (2pi),
         "precision" => string(T),
         "backend" => String(system.linear_backend),
