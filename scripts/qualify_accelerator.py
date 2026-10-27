@@ -39,6 +39,8 @@ if backend == "rocm":
         "rocm_worker_phasor_tests.jl",
         "rocm_near_correction_tests.jl",
         "rocm_near_source_tests.jl",
+        "rocm_wavelength_tests.jl",
+        "rocm_wavelength_source_tests.jl",
     ):
         subprocess.run(
             [
