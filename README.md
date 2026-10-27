@@ -76,6 +76,12 @@ comparisons. See its [coverage notes](src/beat_engine/julia_local/tests/README.m
 The manual Accelerator qualification workflow uses self-hosted runners labeled
 `cuda`, `rocm`, or `metal`, with Python, Julia, and the matching SDK preinstalled. It requires
 the requested backend to be functional before running the numerical gates.
+ROCm qualification also checks interface-radiation replay against a monolithic
+CPU reference for both precisions and phasor conventions. It verifies complex
+excitations, partition ordering, zero input, direct exterior-source remainders,
+and reconstruction of boundary traces and observation fields for monolithic
+and condensed ROCm solves. Replay uses the shared host factorization; the
+coupled solve and observation-field evaluation use ROCm.
 GPU qualification remains hardware-specific; CPU success does not qualify GPU
 backends. Some historical research scripts and the optional noncubic-cavity test
 still require Boundary Lab's extended fixtures; they are not installed runtime
