@@ -39,7 +39,7 @@ def test_windows_report_preserves_unavailable_memory(tmp_path, monkeypatch, caps
         assert memory.current_mb() is None
     assert memory.peak_mb is None
     args = argparse.Namespace(
-        label="test", backend="cpu", precision="float32", request=None, mesh="test.msh", threads="2"
+        label="test", backend="cpu", precision="float32", request=None, mesh="test.msh", threads="2", frequencies=[]
     )
     out = tmp_path / "run.json"
     benchmark.write_run(out, args, "test", 0, 0, 1, 1, [], None, memory.peak_mb)
@@ -47,6 +47,68 @@ def test_windows_report_preserves_unavailable_memory(tmp_path, monkeypatch, caps
     assert record["memory_mb"] == {"before_sweep": None, "peak_sweep": None}
     assert record["host"] == benchmark.platform.machine()
     assert "peak unavailable" in capsys.readouterr().out
+
+
+def benchmark_result(frequency, values=(1, 2)):
+    return {
+        "freq_hz": frequency,
+        "quantities": [
+            {
+                "id": name,
+                "quantity": "exterior_pressure",
+                "values": {
+                    "dtype": "complex128",
+                    "shape": [1],
+                    "content_base64": wire([value])[0],
+                },
+            }
+            for name, value in zip(("probe@near", "probe@far"), values)
+        ],
+    }
+
+
+def test_benchmark_preserves_same_quantity_outputs_and_close_frequencies():
+    outputs = {}
+    for index, frequency in enumerate((100.0001, 100.0002, 100.0001)):
+        outputs.update(benchmark.outputs_of(benchmark_result(frequency), frequency_index=index))
+    assert len(outputs) == 6
+    metrics = compare.accuracy({"outputs": outputs}, {"outputs": outputs})
+    assert set(metrics) == {"exterior_pressure:probe@near", "exterior_pressure:probe@far"}
+    changed = dict(outputs)
+    key = next(key for key in outputs if "probe@far" in key)
+    changed[key] = wire([4])
+    assert compare.accuracy({"outputs": changed}, {"outputs": outputs})["exterior_pressure:probe@far"][0] > 0
+
+
+def test_benchmark_canonicalizes_float32_frequency_without_rounding_identity():
+    frequency = 123.456789
+    reported = array.array("f", [frequency])[0]
+    actual = benchmark.outputs_of(benchmark_result(reported), requested_frequency=frequency)
+    expected = benchmark.outputs_of(benchmark_result(frequency), requested_frequency=frequency)
+    assert actual == expected
+    with pytest.raises(ValueError, match="frequency"):
+        benchmark.outputs_of(benchmark_result(124), requested_frequency=frequency)
+
+
+def test_benchmark_rejects_duplicate_output_identity():
+    result = benchmark_result(100)
+    result["quantities"].append(result["quantities"][0])
+    with pytest.raises(ValueError, match="Duplicate"):
+        benchmark.outputs_of(result)
+
+
+def test_benchmark_rejects_invalid_output_instead_of_dropping_it():
+    result = benchmark_result(100)
+    result["quantities"][1]["values"] = None
+    with pytest.raises(ValueError, match="Invalid benchmark output"):
+        benchmark.outputs_of(result)
+
+
+def test_benchmark_rejects_missing_sweep_rows(tmp_path):
+    args = argparse.Namespace(frequencies=[100, 200])
+    with pytest.raises(ValueError, match="zip"):
+        benchmark.write_run(tmp_path / "run.json", args, "test", 0, 0, 1, 1, [benchmark_result(100)], None, None)
+    assert not (tmp_path / "run.json").exists()
 
 
 @pytest.mark.parametrize("actual", [run([1]), run([1], [2]), run([1, 2], [1, 2]), {"outputs": {}}])

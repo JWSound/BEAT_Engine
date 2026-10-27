@@ -24,6 +24,7 @@ import array
 import base64
 import ctypes
 import json
+import math
 import platform
 import subprocess
 import sys
@@ -123,14 +124,27 @@ def system_request(path: Path, backend: str, precision: str, frequencies):
     return request
 
 
-def outputs_of(result) -> dict:
-    """Complex outputs as {name@freq: [base64 complex128 little-endian, shape]}."""
-    freq = float(result["freq_hz"])
+def outputs_of(result, *, requested_frequency=None, frequency_index=0) -> dict:
+    """Complex outputs keyed by quantity, output ID, sweep index and frequency."""
+    actual_frequency = float(result["freq_hz"])
+    freq = actual_frequency if requested_frequency is None else float(requested_frequency)
+    # Workers may report a Float32 frequency. Preserve the requested Float64
+    # identity while checking that the returned row belongs to this sweep slot.
+    if (
+        not math.isfinite(freq)
+        or not math.isfinite(actual_frequency)
+        or not math.isclose(actual_frequency, freq, rel_tol=2e-6, abs_tol=1e-5)
+    ):
+        raise ValueError("Returned frequency does not match the requested sweep slot")
     found = {}
     for q in result.get("quantities", []):  # compiled-system results
         values = q.get("values")
-        if isinstance(values, dict) and "content_base64" in values:
-            found[q["quantity"]] = values
+        if not isinstance(values, dict) or "content_base64" not in values:
+            raise ValueError(f"Invalid benchmark output values: {q.get('id')}")
+        name = f"{q['quantity']}:{q['id']}"
+        if name in found:
+            raise ValueError(f"Duplicate benchmark output: {name}")
+        found[name] = values
     for key in ("horizontal_pressure", "vertical_pressure"):  # source-request results
         if isinstance(result.get(key), dict):
             found[key] = result[key]
@@ -149,7 +163,7 @@ def outputs_of(result) -> dict:
                     floats.extend((re, im))
             raw = floats.tobytes()
             shape = [len(rows_re), len(rows_re[0]) if rows_re else 0]
-        packed[f"{name}@{freq:.3f}"] = [base64.b64encode(raw).decode(), shape]
+        packed[f"{name}@{frequency_index}:{freq!r}"] = [base64.b64encode(raw).decode(), shape]
     return packed
 
 
@@ -235,17 +249,18 @@ def main():
 
 def write_run(out, args, commit, startup_s, warmup_s, repeat, wall_s, rows, before_mb, peak_mb):
     frequencies, outputs = [], {}
-    for result in rows:
+    for index, (result, requested_frequency) in enumerate(zip(rows, args.frequencies, strict=True)):
         diagnostics = result.get("diagnostics") or {}
         timings = result.get("timings") or diagnostics.get("timings") or {}
         frequencies.append(
             {
                 "freq_hz": float(result["freq_hz"]),
+                "requested_freq_hz": float(requested_frequency),
                 "timings": {k: v for k, v in timings.items() if isinstance(v, (int, float))},
                 "diagnostics": {k: v for k, v in diagnostics.items() if isinstance(v, (int, float, str, bool))},
             }
         )
-        outputs.update(outputs_of(result))
+        outputs.update(outputs_of(result, requested_frequency=requested_frequency, frequency_index=index))
     record = {
         "label": args.label,
         "commit": commit,
@@ -261,6 +276,7 @@ def write_run(out, args, commit, startup_s, warmup_s, repeat, wall_s, rows, befo
         "memory_mb": {"before_sweep": before_mb, "peak_sweep": peak_mb},
         "frequencies": frequencies,
         "outputs": outputs,
+        "output_key_version": 2,
     }
     out.write_text(json.dumps(record))
     totals = {}
