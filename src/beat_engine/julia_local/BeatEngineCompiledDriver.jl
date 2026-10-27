@@ -2658,8 +2658,6 @@ end
 
 function solve_request(request; event_mode=false)
     convention = get(get(request, "solver_options", Dict()), "phasor_convention", NEGATIVE_TIME_PHASOR)
-    convention == POSITIVE_TIME_PHASOR && get(get(request, "solver_options", Dict()), "bem_backend", "cpu") == "rocm" &&
-        error("Positive-time ROCm solves require hardware qualification; use CPU, CUDA, or Metal.")
     return with_phasor_convention(convention) do
         solve_request_impl(request; event_mode=event_mode)
     end
@@ -4061,8 +4059,6 @@ function retained_bem_field_evaluation_cache(
 end
 
 function evaluate_bem_field_request(request, request_path)
-    get(request, "phasor_convention", NEGATIVE_TIME_PHASOR) == POSITIVE_TIME_PHASOR && get(request, "bem_backend", "cpu") == "rocm" &&
-        error("Positive-time ROCm fields require hardware qualification; use CPU or CUDA.")
     return with_phasor_convention(get(request, "phasor_convention", NEGATIVE_TIME_PHASOR)) do
         evaluate_bem_field_request_impl(request, request_path)
     end
