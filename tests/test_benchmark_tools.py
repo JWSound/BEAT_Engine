@@ -164,14 +164,19 @@ def test_cli_rejects_invalid_later_repeat(tmp_path, monkeypatch):
 def test_cli_labels_memory_and_does_not_mix_measurements(tmp_path, monkeypatch, capsys, kind):
     for index in range(2):
         record = {
-            "wall_s": 1.0, "commit": "test", "backend": "rocm", "frequencies": [],
+            "wall_s": 1.0,
+            "commit": "test",
+            "backend": "rocm",
+            "frequencies": [],
             "memory_mb": {"before_sweep": 100.0, "peak_sweep": 120.0},
         }
         if kind != "legacy":
             record["memory_measurement"] = {
                 "metric": "resident_set" if kind == "mixed" and index else "working_set",
-                "scope": "worker_process", "peak_kind": "sampled_within_sweep",
-                "poll_interval_s": 0.02, "dedicated_gpu_memory": "not_measured",
+                "scope": "worker_process",
+                "peak_kind": "sampled_within_sweep",
+                "poll_interval_s": 0.02,
+                "dedicated_gpu_memory": "not_measured",
             }
         (tmp_path / f"run{index}.json").write_text(json.dumps(record))
     monkeypatch.setattr(sys, "argv", ["compare", "--stage", f"rocm={tmp_path / 'run*.json'}"])

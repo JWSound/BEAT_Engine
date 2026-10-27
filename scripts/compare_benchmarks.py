@@ -113,9 +113,17 @@ def main():
         half_range = (max(walls) - min(walls)) / 2 / median * 100
         memories = [r["memory_mb"] for r in runs]
         memory_kinds = {
-            tuple(r.get("memory_measurement", {}).get(key) for key in (
-                "metric", "scope", "peak_kind", "poll_interval_s", "dedicated_gpu_memory",
-            )) for r in runs
+            tuple(
+                r.get("memory_measurement", {}).get(key)
+                for key in (
+                    "metric",
+                    "scope",
+                    "peak_kind",
+                    "poll_interval_s",
+                    "dedicated_gpu_memory",
+                )
+            )
+            for r in runs
         }
         print(f"{label} ({runs[0]['commit']}, {runs[0]['backend']}, n={len(runs)})")
         print(
