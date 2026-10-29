@@ -105,8 +105,8 @@ differ: CPU condenses transducer surfaces and eliminates interface flux, solving
 3,116 unknowns; ROCm retains those variables and solves 7,933. This architecture
 difference is not evidence that changing only block width will yield a gain.
 
-The next controlled experiment compares the unchanged ROCm candidate's default
-Schur block selection with a 32-column override on S218BP and SAWMOD. Any later
+The controlled block-size experiment below found no demonstrated benefit from
+a 32-column override on S218BP or SAWMOD; the default remains unchanged. Any later
 transducer condensation change must preserve its motion/force corrections,
 arbitrary-load RHS and full interior reconstruction. Interface elimination and
 field batching require separate measurements and qualification. No optimization
@@ -115,6 +115,37 @@ treated as significant.
 
 This baseline does not qualify Boundary Lab Deploy's array workflow. Deploy
 integration and serialized-array qualification remain separate work.
+
+## Schur block-size experiment
+
+The unchanged integrated ROCm Float32 candidate was measured with its default
+Schur block selection and `BLAB_SCHUR_BLOCK=32`, using the same requests and
+thread counts as the baseline. Three fresh workers per setting were interleaved
+on each workload, each with three warmed sweeps. All 12 workers exited normally;
+all 36 sweeps passed per-output/per-frequency accuracy checks against the CPU
+Float64 reference, and diagnostics confirmed the actual block width and
+rocSOLVER dispatch. Default widths were 49 on S218BP and 62 on SAWMOD.
+
+Times below are third-sweep medians [minimum, maximum]. Schur extraction is a
+subset of total wall time. Accuracy covers all nine sweeps per setting.
+
+| Workload | Setting | Wall (s) | Schur extraction (s) | Worst relative L2 |
+|---|---|---:|---:|---:|
+| s218bp-condensed | default | 0.74 [0.69, 0.79] | 0.12 | 5.39e-05 |
+| s218bp-condensed | block32 | 0.70 [0.70, 0.73] | 0.13 | 5.39e-05 |
+| sawmod-condensed | default | 45.44 [44.81, 45.50] | 29.12 | 1.31e-05 |
+| sawmod-condensed | block32 | 44.97 [44.93, 45.22] | 28.38 | 1.31e-05 |
+
+The wall-time ranges overlap on both workloads. This does not establish a
+speedup, so it does not justify a new block-size default. The larger remaining
+target is the retained-system difference described above, which is being
+addressed separately through transducer condensation with independent numerical
+qualification and subsequent real-project measurements.
+
+Local evidence: `runs/rx7600-profiling/schur-block-20261029-152244/`, containing
+the plan, exact worker commands, logs, all output reports, comparisons and
+`probe-audit.json`. Host-memory measurements retain the baseline's sampled
+working-set limitation and exclude dedicated VRAM.
 
 ## Evidence and reproduction
 
