@@ -2590,6 +2590,13 @@ function build_coupled_system(
     elseif validation_diagnostics
         lu(coupled)
     elseif linear_backend == :rocm
+        if T == Float32
+            # Match the CPU policy for badly scaled pressure/flux/LEM blocks.
+            # Keep the factorization on the GPU and cast only returned traces.
+            promoted = ComplexF64.(coupled)
+            BeatEngineCore.amdgpu_module().unsafe_free!(coupled)
+            coupled = promoted
+        end
         rocm_dense_lu!(coupled)
     else
         lu!(coupled)
@@ -2807,7 +2814,7 @@ function _solve_rocm_hybrid_condensed_excitations(
     host_rhs[system.electrical_range, :] = electrical_rhs
     fem_rhs_condensation_s = (time_ns() - rhs_condensation_started) / 1.0e9
 
-    d_rhs = amdgpu.ROCArray(host_rhs)
+    d_rhs = amdgpu.ROCArray(eltype(system.factorization).(host_rhs))
     d_solution = nothing
     host_solution = nothing
     try
@@ -3023,7 +3030,8 @@ function solve_coupled_excitations(system, excitations)
                       BeatEngineCore.cuda_module() : BeatEngineCore.amdgpu_module()
         device_array = system.linear_backend == :cuda ?
                        accelerator.CuArray : accelerator.ROCArray
-        d_rhs = device_array(rhs)
+        device_rhs = system.linear_backend == :rocm ? eltype(system.factorization).(rhs) : rhs
+        d_rhs = device_array(device_rhs)
         d_solution = nothing
         try
             d_solution = system.linear_backend == :rocm ?
