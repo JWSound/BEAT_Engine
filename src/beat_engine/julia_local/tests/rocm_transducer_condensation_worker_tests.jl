@@ -6,7 +6,8 @@ const ENGINE_DIR = normpath(joinpath(@__DIR__, ".."))
 include(joinpath(@__DIR__, "..", "..", "julia_engine", "CompiledCoupledWorkload.jl"))
 
 function capture(request, enabled)
-    return withenv("BLAB_COUPLED_TRANSDUCER_CONDENSATION" => (enabled ? "on" : "off")) do
+    mode = isnothing(enabled) ? nothing : (enabled ? "on" : "off")
+    return withenv("BLAB_COUPLED_TRANSDUCER_CONDENSATION" => mode) do
         mktemp() do _, output
             redirect_stdout(output) do
                 solve_request(request; event_mode=true)
@@ -42,6 +43,9 @@ try
             reference = decoded_outputs(capture(reference_request, false))
             original = capture(request, false)
             candidate = capture(request, true)
+            automatic = capture(request, nothing)
+            @test automatic["diagnostics"]["rocm_transducer_condensation"] == true
+            @test decoded_outputs(automatic) == decoded_outputs(candidate)
             @test original["diagnostics"]["rocm_transducer_condensation"] == false
             diagnostics = candidate["diagnostics"]
             @test diagnostics["rocm_transducer_condensation"] == true
@@ -73,6 +77,9 @@ try
                 "target_ids" => [], "options" => Dict()))
             reference = capture(request, false)
             requested = capture(request, true)
+            automatic = capture(request, nothing)
+            @test automatic["diagnostics"]["rocm_transducer_condensation"] == false
+            @test decoded_outputs(automatic) == decoded_outputs(requested)
             @test requested["diagnostics"]["rocm_transducer_condensation"] == false
             @test requested["diagnostics"]["solved_system_order"] == reference["diagnostics"]["solved_system_order"]
             expected, actual = decoded_outputs(reference), decoded_outputs(requested)

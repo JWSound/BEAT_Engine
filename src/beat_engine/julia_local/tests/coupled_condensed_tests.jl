@@ -1,6 +1,40 @@
 include(joinpath(@__DIR__, "coupled_condensed_test_setup.jl"))
 include(joinpath(@__DIR__, "condensed_backend_tests.jl"))
 
+@testset "ROCm automatic transducer condensation preserves existing cache layouts" begin
+    select = BeatEngineCoupled._rocm_transducer_condensation_enabled
+    drivers = [:driver]
+    interface = [5, 2, 5]
+    compact_cache = (retained_fem_vertices=[2, 5],)
+    retained_cache = (retained_fem_vertices=[2, 4, 5],)
+    for mode in (nothing, "auto", " AUTO ")
+        withenv("BLAB_COUPLED_TRANSDUCER_CONDENSATION" => mode) do
+            @test select(:rocm, true, drivers)
+            @test select(:rocm, true, drivers; cache=compact_cache, interface_vertices=interface)
+            @test !select(:rocm, true, drivers; cache=retained_cache, interface_vertices=interface)
+            @test !select(:rocm, true, drivers; cache=retained_cache)
+            @test !select(:rocm, false, drivers)
+            @test !select(:rocm, true, [])
+            for backend in (:cpu, :cuda, :metal)
+                @test !select(backend, true, drivers)
+            end
+        end
+    end
+    for mode in ("off", "0", "false")
+        withenv("BLAB_COUPLED_TRANSDUCER_CONDENSATION" => mode) do
+            @test !select(:rocm, true, drivers)
+        end
+    end
+    for mode in ("on", "1", "true")
+        withenv("BLAB_COUPLED_TRANSDUCER_CONDENSATION" => mode) do
+            @test select(:rocm, true, drivers; cache=retained_cache, interface_vertices=interface)
+        end
+    end
+    withenv("BLAB_COUPLED_TRANSDUCER_CONDENSATION" => "invalid") do
+        @test_throws ErrorException select(:rocm, true, drivers)
+    end
+end
+
 @testset "Shared transducer elimination against a full complex system" begin
     rng = MersenneTwister(80429)
     acoustic = randn(rng, ComplexF64, 6, 6) + 8I

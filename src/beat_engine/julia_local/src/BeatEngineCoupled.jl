@@ -2170,12 +2170,19 @@ function _release_rocm_hybrid_fem_condensation!(condensation)
     return nothing
 end
 
-# Off until the new path has completed numerical and real-project qualification.
-function _rocm_transducer_condensation_enabled(backend, static_condensation, transducers)
+# Automatic selection preserves caches built with the former retained-surface
+# layout. Explicit on still requires a matching interface-only cache.
+function _rocm_transducer_condensation_enabled(
+    backend, static_condensation, transducers; cache=nothing, interface_vertices=nothing,
+)
     backend == :rocm && static_condensation && !isempty(transducers) || return false
-    value = lowercase(strip(get(ENV, "BLAB_COUPLED_TRANSDUCER_CONDENSATION", "off")))
+    value = lowercase(strip(get(ENV, "BLAB_COUPLED_TRANSDUCER_CONDENSATION", "auto")))
     value in ("0", "off", "false") && return false
-    value in ("1", "on", "true", "auto") && return true
+    value in ("1", "on", "true") && return true
+    if value == "auto"
+        return isnothing(cache) || (!isnothing(interface_vertices) &&
+            cache.retained_fem_vertices == sort(unique(interface_vertices)))
+    end
     error("BLAB_COUPLED_TRANSDUCER_CONDENSATION must be off, on, or auto.")
 end
 
@@ -2201,7 +2208,8 @@ function build_coupled_system(
     transducers::AbstractVector{ElectrodynamicTransducer{T}}=ElectrodynamicTransducer{T}[],
     transducer_operators=nothing,
     transducer_condensation::Bool=_rocm_transducer_condensation_enabled(
-        bem_backend, static_condensation, transducers),
+        bem_backend, static_condensation, transducers;
+        cache=cache, interface_vertices=interface_map.fem_vertex_indices),
     prescribed_bem_normal_velocity=nothing,
     coupled_bem_assembly::Symbol=:auto,
     coupled_bem_image_fusion::Bool=true,

@@ -10,7 +10,8 @@ BeatEngineCore._require_rocm!(rocsolver=true)
 const OUTPUTS = (:fem_pressure, :bem_pressure, :bem_neumann, :interface_flux,
                  :diaphragm_velocity, :voice_coil_current)
 
-function snapshots(::Type{T}, backend, eliminate, cached, convention) where {T}
+function snapshots(::Type{T}, backend, eliminate, cached, convention;
+    frequencies=(250, 700), loss_factor=0, automatic=false) where {T}
     fixtures = joinpath(@__DIR__, "fixtures")
     fem = load_gmsh41_volume(joinpath(fixtures, "femvolume.msh"), T(.001))
     bem = load_gmsh22_with_tags(joinpath(fixtures, "exterior_conforming.msh"), T(.001))
@@ -24,15 +25,17 @@ function snapshots(::Type{T}, backend, eliminate, cached, convention) where {T}
         eliminate ? Int[] : findnz(operators.fem_surface)[1])))
     cache = cached ? prepare_coupled_cache(fem, bem, mapping;
         bem_backend=backend, quadrature_order=1, singular_order=1,
-        retained_fem_vertices=retained) : nothing
+        retained_fem_vertices=retained,
+        bulk_loss_factor_by_vertex=fill(T(loss_factor), length(fem.vertices))) : nothing
     result = []
+    selection = automatic ? (;) : (; transducer_condensation=eliminate)
     try
-        for frequency in (250, 700)
+        for frequency in frequencies
             system = build_coupled_system(fem, bem, mapping, T(frequency), T(343), T(1.21);
                 bem_backend=backend, static_condensation=backend == :rocm,
-                transducer_condensation=eliminate, validation_diagnostics=false,
+                selection..., validation_diagnostics=false,
                 quadrature_order=1, singular_order=1, transducers=transducers,
-                transducer_operators=operators, cache=cache)
+                transducer_operators=operators, cache=cache, bulk_loss_factor=T(loss_factor))
             try
                 @test system.linear_backend == backend
                 @test system.transducer_condensation == eliminate
@@ -102,6 +105,56 @@ try
                 with_phasor_convention(convention) do
                     retained = snapshots(T, :rocm, false, cached, convention)
                     candidate = snapshots(T, :rocm, true, cached, convention)
+                    compare(candidate, references[convention], tolerance)
+                    compare(candidate, retained, tolerance)
+                    for frequency in eachindex(candidate)
+                        @test candidate[frequency].solved_order < retained[frequency].solved_order
+                    end
+                    candidates[convention] = candidate
+                end
+            end
+            compare(candidates[POSITIVE_TIME_PHASOR], candidates[NEGATIVE_TIME_PHASOR], tolerance;
+                conjugate=true)
+        end
+    end
+    @testset "ROCm automatic selection supports new and retained-surface caches" begin
+        withenv("BLAB_COUPLED_TRANSDUCER_CONDENSATION" => nothing) do
+            for T in (Float32, Float64), (eliminate, cached) in ((true, false), (true, true), (false, true))
+                convention = NEGATIVE_TIME_PHASOR
+                expected = snapshots(T, :rocm, eliminate, cached, convention)
+                actual = snapshots(T, :rocm, eliminate, cached, convention; automatic=true)
+                compare(actual, expected, T == Float32 ? 5e-4 : 1e-8)
+                @test [r.solved_order for r in actual] == [r.solved_order for r in expected]
+            end
+        end
+    end
+    # Match the existing phasor gate's detuning and damping, adding independent
+    # CPU and retained-surface comparisons for every complex output and RHS.
+    pole_fem = load_gmsh41_volume(joinpath(@__DIR__, "fixtures", "femvolume.msh"), .001)
+    pole_bem = load_gmsh22_with_tags(joinpath(@__DIR__, "fixtures", "exterior_conforming.msh"), .001)
+    pole_mapping = build_conforming_interface_map(pole_fem, pole_bem,
+        physical_tag(pole_fem, 2, "Interface"), 2)
+    stiffness, mass = assemble_p1_fem_matrices(pole_fem)
+    interior = setdiff(1:length(pole_fem.vertices), unique(pole_mapping.fem_vertex_indices))
+    eigenvalues = eigen(Symmetric(Matrix(stiffness[interior, interior])),
+                        Symmetric(Matrix(mass[interior, interior]))).values
+    pole = 343 * sqrt(first(filter(x -> x > 1e-8 * maximum(abs, eigenvalues), sort(eigenvalues)))) / (2pi)
+    near_pole_frequencies = (pole * .999, pole * 1.001)
+    @info "Transducer condensation CPU parity frequencies" pole near_pole_frequencies
+    @testset "ROCm transducer condensation near a cavity pole: monolithic CPU parity" begin
+        references = Dict()
+        for convention in (NEGATIVE_TIME_PHASOR, POSITIVE_TIME_PHASOR)
+            references[convention] = with_phasor_convention(convention) do
+                snapshots(Float64, :cpu, false, false, convention; frequencies=near_pole_frequencies, loss_factor=1e-4)
+            end
+        end
+        for T in (Float32, Float64), cached in (false, true)
+            tolerance = T == Float32 ? 5e-4 : 1e-8
+            candidates = Dict()
+            for convention in (NEGATIVE_TIME_PHASOR, POSITIVE_TIME_PHASOR)
+                with_phasor_convention(convention) do
+                    retained = snapshots(T, :rocm, false, cached, convention; frequencies=near_pole_frequencies, loss_factor=1e-4)
+                    candidate = snapshots(T, :rocm, true, cached, convention; frequencies=near_pole_frequencies, loss_factor=1e-4)
                     compare(candidate, references[convention], tolerance)
                     compare(candidate, retained, tolerance)
                     for frequency in eachindex(candidate)

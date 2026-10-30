@@ -68,7 +68,7 @@ try
                     for backend in (:cpu,:rocm)
                         options=(;bem_backend=backend,quadrature_order=2,singular_order=2,bulk_loss_factor=T(.01),transducers=[transducer],prescribed_bem_normal_velocity=prescribed)
                         system=backend == :cpu ? build_condensed_coupled_system(fem,bem,mapping,T(500),T(343),T(1.21);options...,allow_transducer_condensation=false) :
-                            build_coupled_system(fem,bem,mapping,T(500),T(343),T(1.21);options...,static_condensation=true,validation_diagnostics=false)
+                            build_coupled_system(fem,bem,mapping,T(500),T(343),T(1.21);options...,static_condensation=true,transducer_condensation=false,validation_diagnostics=false)
                         try
                             @test system.linear_backend == backend
                             matrix,layout=speaker_interior_state_matrix(system)

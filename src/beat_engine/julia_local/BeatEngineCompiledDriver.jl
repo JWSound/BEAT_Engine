@@ -112,7 +112,7 @@ function speaker_interior_state_matrix(system)
     condensation = system.condensation
     hasproperty(condensation, :transducer_condensed) && condensation.transducer_condensed && error(
         "Speaker ROM construction needs transducer surfaces in the retained Schur block; " *
-        "unset BLAB_COUPLED_TRANSDUCER_CONDENSATION.",
+        "build with transducer_condensation=false or set BLAB_COUPLED_TRANSDUCER_CONDENSATION=off.",
     )
     schur = if hasproperty(condensation, :schur)
         condensation.schur
