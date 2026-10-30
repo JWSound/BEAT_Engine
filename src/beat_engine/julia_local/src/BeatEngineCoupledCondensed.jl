@@ -1122,41 +1122,16 @@ function _build_condensation(
     #   mechanical / mechanical:      Rᵢᵀ W          (subtracted, scaled, from Z_m)
     transducer_condensed = !isnothing(motion_surface)
     transducer_started = time_ns()
-    motion_fields = if transducer_condensed
-        surface = SparseMatrixCSC{ComplexF64,Int}(motion_surface)
-        force = SparseMatrixCSC{ComplexF64,Int}(motion_force)
-        size(surface, 1) == size(fem_system, 1) && size(force) == size(surface) ||
-            error("Transducer motion operators must have one row per FEM vertex.")
-        surface_interior = surface[interior_vertices, :]
-        force_interior = force[interior_vertices, :]
-        motion_gamma = Matrix(surface[retained, :])
-        force_gamma = Matrix(force[retained, :])
-        motion_solution = zeros(ComplexF64, interior_count, size(surface, 2))
-        force_solution = zeros(ComplexF64, interior_count, size(surface, 2))
-        if interior_count > 0
-            motion_solution = factorization \ Matrix(surface_interior)
-            force_solution = transpose(factorization) \ Matrix(force_interior)
-            mul!(motion_gamma, retained_interior, motion_solution, -one(ComplexF64), one(ComplexF64))
-            mul!(force_gamma, transpose(interior_retained), force_solution, -one(ComplexF64), one(ComplexF64))
-        end
-        (
-            motion_interior=surface_interior,
-            motion_solution=motion_solution,
-            force_solution=force_solution,
-            motion_gamma=motion_gamma,
-            force_gamma=force_gamma,
-            motion_force_correction=Matrix(transpose(force_interior) * motion_solution),
-        )
-    else
-        (
-            motion_interior=nothing,
-            motion_solution=nothing,
-            force_solution=nothing,
-            motion_gamma=nothing,
-            force_gamma=nothing,
-            motion_force_correction=nothing,
-        )
-    end
+    motion_fields = BeatEngineCoupled._condensed_transducer_motion_fields(
+        factorization,
+        interior_vertices,
+        retained,
+        interior_retained,
+        retained_interior,
+        size(fem_system, 1),
+        motion_surface,
+        motion_force,
+    )
     transducer_solves_s = (time_ns() - transducer_started) / 1.0e9
     schur_extraction_s = (time_ns() - schur_started) / 1.0e9
 
