@@ -2014,10 +2014,65 @@ function _blocked_umfpack_schur_complement(
     )
 end
 
+# Shared host-side low-rank terms for eliminating transducer surface vertices.
+# Preserve nonconjugating transpose: these complex acoustic operators are not
+# Hermitian. Keeping this algebra shared avoids backend-specific force signs.
+function _condensed_transducer_motion_fields(
+    factorization,
+    interior_vertices,
+    retained,
+    interior_retained,
+    retained_interior,
+    fem_count::Int,
+    motion_surface,
+    motion_force,
+)
+    isnothing(motion_surface) == isnothing(motion_force) ||
+        error("Transducer condensation needs both the motion load and the force operator.")
+    interior_count = length(interior_vertices)
+    return if !isnothing(motion_surface)
+        surface = SparseMatrixCSC{ComplexF64,Int}(motion_surface)
+        force = SparseMatrixCSC{ComplexF64,Int}(motion_force)
+        size(surface, 1) == fem_count && size(force) == size(surface) ||
+            error("Transducer motion operators must have one row per FEM vertex.")
+        surface_interior = surface[interior_vertices, :]
+        force_interior = force[interior_vertices, :]
+        motion_gamma = Matrix(surface[retained, :])
+        force_gamma = Matrix(force[retained, :])
+        motion_solution = zeros(ComplexF64, interior_count, size(surface, 2))
+        force_solution = zeros(ComplexF64, interior_count, size(surface, 2))
+        if interior_count > 0
+            motion_solution = factorization \ Matrix(surface_interior)
+            force_solution = transpose(factorization) \ Matrix(force_interior)
+            mul!(motion_gamma, retained_interior, motion_solution, -one(ComplexF64), one(ComplexF64))
+            mul!(force_gamma, transpose(interior_retained), force_solution, -one(ComplexF64), one(ComplexF64))
+        end
+        (
+            motion_interior=surface_interior,
+            motion_solution=motion_solution,
+            force_solution=force_solution,
+            motion_gamma=motion_gamma,
+            force_gamma=force_gamma,
+            motion_force_correction=Matrix(transpose(force_interior) * motion_solution),
+        )
+    else
+        (
+            motion_interior=nothing,
+            motion_solution=nothing,
+            force_solution=nothing,
+            motion_gamma=nothing,
+            force_gamma=nothing,
+            motion_force_correction=nothing,
+        )
+    end
+end
+
 function _build_rocm_hybrid_fem_condensation(
     fem_system::SparseMatrixCSC{Complex{T}},
     interface_operators::InterfaceOperators{T},
-    retained_vertices,
+    retained_vertices;
+    motion_surface=nothing,
+    motion_force=nothing,
 ) where {T<:AbstractFloat}
     amdgpu = BeatEngineCore.amdgpu_module()
     fem_count = size(fem_system, 1)
@@ -2068,6 +2123,13 @@ function _build_rocm_hybrid_fem_condensation(
         )
     end
     schur_extraction_s = (time_ns() - schur_started) / 1.0e9
+    transducer_started = time_ns()
+    motion_fields = _condensed_transducer_motion_fields(
+        factorization, interior_vertices, retained_vertices,
+        interior_to_retained, retained_to_interior, fem_count,
+        motion_surface, motion_force,
+    )
+    transducer_solves_s = (time_ns() - transducer_started) / 1.0e9
 
     upload_started = time_ns()
     device_schur = amdgpu.ROCArray(Complex{T}.(schur_result.schur))
@@ -2075,6 +2137,8 @@ function _build_rocm_hybrid_fem_condensation(
     upload_s = (time_ns() - upload_started) / 1.0e9
     return (
         backend=:rocm_hybrid,
+        transducer_condensed=!isnothing(motion_surface),
+        motion_fields...,
         factorization=factorization,
         device_schur=device_schur,
         interior_vertices=interior_vertices,
@@ -2093,6 +2157,7 @@ function _build_rocm_hybrid_fem_condensation(
             schur_densify_s=schur_result.densify_s,
             schur_solve_s=schur_result.solve_s,
             schur_apply_s=schur_result.apply_s,
+            transducer_solves_s=transducer_solves_s,
             upload_s=upload_s,
         ),
     )
@@ -2103,6 +2168,22 @@ function _release_rocm_hybrid_fem_condensation!(condensation)
     isnothing(condensation.factorization) || finalize(condensation.factorization)
     BeatEngineCore.amdgpu_module().unsafe_free!(condensation.device_schur)
     return nothing
+end
+
+# Automatic selection preserves caches built with the former retained-surface
+# layout. Explicit on still requires a matching interface-only cache.
+function _rocm_transducer_condensation_enabled(
+    backend, static_condensation, transducers; cache=nothing, interface_vertices=nothing,
+)
+    backend == :rocm && static_condensation && !isempty(transducers) || return false
+    value = lowercase(strip(get(ENV, "BLAB_COUPLED_TRANSDUCER_CONDENSATION", "auto")))
+    value in ("0", "off", "false") && return false
+    value in ("1", "on", "true") && return true
+    if value == "auto"
+        return isnothing(cache) || (!isnothing(interface_vertices) &&
+            cache.retained_fem_vertices == sort(unique(interface_vertices)))
+    end
+    error("BLAB_COUPLED_TRANSDUCER_CONDENSATION must be off, on, or auto.")
 end
 
 function build_coupled_system(
@@ -2126,6 +2207,9 @@ function build_coupled_system(
     thermoviscous_walls=NamedTuple[],
     transducers::AbstractVector{ElectrodynamicTransducer{T}}=ElectrodynamicTransducer{T}[],
     transducer_operators=nothing,
+    transducer_condensation::Bool=_rocm_transducer_condensation_enabled(
+        bem_backend, static_condensation, transducers;
+        cache=cache, interface_vertices=interface_map.fem_vertex_indices),
     prescribed_bem_normal_velocity=nothing,
     coupled_bem_assembly::Symbol=:auto,
     coupled_bem_image_fusion::Bool=true,
@@ -2140,6 +2224,8 @@ function build_coupled_system(
     static_condensation && validation_diagnostics && error(
         "FEM static condensation cannot be combined with full-matrix validation diagnostics.",
     )
+    transducer_condensation && !(bem_backend == :rocm && static_condensation) &&
+        error("Hybrid transducer condensation requires ROCm static condensation.")
     fem_stage_started = time_ns()
     resolved_transducer_operators = isnothing(transducer_operators) ?
                                     assemble_transducer_operators(
@@ -2152,9 +2238,10 @@ function build_coupled_system(
     else
         unique(findnz(resolved_transducer_operators.fem_surface)[1])
     end
-    retained_fem_vertices = sort(
-        unique(vcat(interface_map.fem_vertex_indices, transducer_fem_vertices)),
-    )
+    retained_fem_vertices = sort(unique(vcat(
+        interface_map.fem_vertex_indices,
+        transducer_condensation ? Int[] : transducer_fem_vertices,
+    )))
     prepared = isnothing(cache) ? prepare_coupled_cache(
         fem_mesh,
         bem_mesh,
@@ -2355,7 +2442,9 @@ function build_coupled_system(
         _build_rocm_hybrid_fem_condensation(
             fem_system,
             interface_operators,
-            retained_fem_vertices,
+            retained_fem_vertices;
+            motion_surface=transducer_condensation ? resolved_transducer_operators.fem_surface : nothing,
+            motion_force=transducer_condensation ? resolved_transducer_operators.fem_force : nothing,
         )
     end
     fem_condensation_s = (time_ns() - condensation_started) / 1.0e9
@@ -2480,34 +2569,26 @@ function build_coupled_system(
                 alpha=-one(Complex{T}),
             )
             if transducer_count > 0
-                d_fem_motion = device_array(
-                    -normal_derivative_scale .* Complex{T}.(
-                        Matrix(
-                            resolved_transducer_operators.fem_surface[
-                                coupled_fem_vertices,
-                                :,
-                            ],
-                        )
-                    ),
-                )
-                d_fem_force = device_array(
-                    -Complex{T}.(
-                        transpose(
-                            Matrix(
-                                resolved_transducer_operators.fem_force[
-                                    coupled_fem_vertices,
-                                    :,
-                                ],
-                            ),
-                        )
-                    ),
-                )
+                fem_motion = transducer_condensation ? condensation.motion_gamma :
+                             Matrix(resolved_transducer_operators.fem_surface[coupled_fem_vertices, :])
+                fem_force = transducer_condensation ? condensation.force_gamma :
+                            Matrix(resolved_transducer_operators.fem_force[coupled_fem_vertices, :])
+                d_fem_motion = device_array(-normal_derivative_scale .* Complex{T}.(fem_motion))
+                d_fem_force = device_array(-Complex{T}.(transpose(fem_force)))
                 d_bem_force = device_array(
                     Complex{T}.(
                         transpose(Matrix(resolved_transducer_operators.bem_force))
                     ),
                 )
-                d_mechanical = device_array(Matrix(Diagonal(mechanical_impedance)))
+                mechanical_block = if transducer_condensation
+                    Complex{T}.(
+                        ComplexF64.(Matrix(Diagonal(mechanical_impedance))) .-
+                        ComplexF64(normal_derivative_scale) .* condensation.motion_force_correction
+                    )
+                else
+                    Matrix(Diagonal(mechanical_impedance))
+                end
+                d_mechanical = device_array(mechanical_block)
                 d_electrical = device_array(Matrix(Diagonal(electrical_impedance)))
                 d_force_factor = device_array(Matrix(Diagonal(Complex{T}.(force_factor))))
                 append!(
@@ -2626,6 +2707,7 @@ function build_coupled_system(
         formulation=formulation,
         condensation=condensation,
         condensation_timings=isnothing(condensation) ? nothing : condensation.timings,
+        transducer_condensation=transducer_condensation,
         fem_range=fem_range,
         gamma_range=gamma_range,
         retained_fem_vertices=retained_fem_vertices,
@@ -2812,6 +2894,12 @@ function _solve_rocm_hybrid_condensed_excitations(
     host_rhs[system.gamma_range, :] = reduced_fem_rhs
     host_rhs[system.bem_range, :] = bem_rhs
     host_rhs[system.electrical_range, :] = electrical_rhs
+    if condensation.transducer_condensed && condensation.interior_count > 0
+        host_rhs[system.mechanical_range, :] .+= Complex{T}.(
+            transpose(condensation.force_solution) *
+            ComplexF64.(fem_rhs[condensation.interior_vertices, :])
+        )
+    end
     fem_rhs_condensation_s = (time_ns() - rhs_condensation_started) / 1.0e9
 
     d_rhs = amdgpu.ROCArray(eltype(system.factorization).(host_rhs))
@@ -2835,6 +2923,11 @@ function _solve_rocm_hybrid_condensed_excitations(
             ComplexF64.(fem_rhs[condensation.interior_vertices, :]) .-
             condensation.interior_to_retained * ComplexF64.(retained_pressure)
         )
+        if condensation.transducer_condensed
+            interior_rhs .+= ComplexF64(neumann_scale(system.density, system.omega)) .* (
+                condensation.motion_interior * ComplexF64.(view(host_solution, system.mechanical_range, :))
+            )
+        end
         fem_pressure[condensation.interior_vertices, :] .= Complex{T}.(
             condensation.factorization \ interior_rhs
         )

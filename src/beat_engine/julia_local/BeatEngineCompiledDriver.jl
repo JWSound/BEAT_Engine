@@ -112,7 +112,7 @@ function speaker_interior_state_matrix(system)
     condensation = system.condensation
     hasproperty(condensation, :transducer_condensed) && condensation.transducer_condensed && error(
         "Speaker ROM construction needs transducer surfaces in the retained Schur block; " *
-        "unset BLAB_COUPLED_TRANSDUCER_CONDENSATION.",
+        "build with transducer_condensation=false or set BLAB_COUPLED_TRANSDUCER_CONDENSATION=off.",
     )
     schur = if hasproperty(condensation, :schur)
         condensation.schur
@@ -3032,12 +3032,17 @@ function solve_request_impl(request; event_mode=false)
         ),
     )
     static_condensation = static_condensation_requested
+    rom_requested = any(String(output["quantity"]) in SPEAKER_ROM_QUANTITIES for output in outputs)
+    rocm_transducer_condensation = !rom_requested &&
+        isnothing(get(solver_options, "speaker_rom_rank_experiment", nothing)) &&
+        BeatEngineCoupled._rocm_transducer_condensation_enabled(bem_backend, static_condensation, transducers)
     transducer_fem_vertices = isempty(transducers) ?
                               Int[] :
                               unique(findnz(transducer_operators.fem_surface)[1])
-    retained_fem_vertices = sort(
-        unique(vcat(interface_map.fem_vertex_indices, transducer_fem_vertices)),
-    )
+    retained_fem_vertices = sort(unique(vcat(
+        interface_map.fem_vertex_indices,
+        rocm_transducer_condensation ? Int[] : transducer_fem_vertices,
+    )))
     # CPU condensation is deliberately isolated from the accelerator implementations. CUDA
     # continues to use cuDSS and ROCm continues to use the hybrid CPU-Schur/ROCm-dense path in
     # BeatEngineCoupled. Metal has no GPU LU, so it uses the CPU condensed solver with its
@@ -3115,9 +3120,6 @@ function solve_request_impl(request; event_mode=false)
         end
         cache_setup_s = (time_ns() - cache_setup_started) / 1.0e9
     end
-    rom_requested = any(
-        String(output["quantity"]) in SPEAKER_ROM_QUANTITIES for output in outputs
-    )
     radiation_requested = any(String(output["quantity"]) == "interface_radiated_pressure" for output in outputs)
     # Keep source IDs stable when an excitation subset leaves an exterior source
     # silent, or its motion projection happens to be zero.
@@ -3226,6 +3228,7 @@ function solve_request_impl(request; event_mode=false)
                     bem_backend=bem_backend,
                     symmetry_mode=symmetry_mode,
                     static_condensation=static_condensation,
+                    transducer_condensation=rocm_transducer_condensation,
                     coupled_bem_assembly=coupled_bem_assembly,
                     coupled_bem_image_fusion=coupled_bem_image_fusion,
                     coupled_bem_max_registers=coupled_bem_max_registers,
@@ -3677,6 +3680,7 @@ function solve_request_impl(request; event_mode=false)
                 "coupled_bem_image_fusion" => hasproperty(coupled_system, :coupled_bem_image_fusion) && coupled_system.coupled_bem_image_fusion,
                 "coupled_bem_max_registers" => hasproperty(coupled_system, :coupled_bem_max_registers) ? coupled_system.coupled_bem_max_registers : 0,
                 "linear_backend" => String(coupled_system.linear_backend),
+                "rocm_transducer_condensation" => bem_backend == :rocm ? coupled_system.transducer_condensation : nothing,
                 "rocm_dense_factorization_precision" => coupled_system.linear_backend == :rocm ?
                     (eltype(coupled_system.factorization) == ComplexF64 ? "float64" : "float32") : nothing,
                 "fem_symbolic_analysis_reused" => !isnothing(coupled_system.condensation) &&
