@@ -39,10 +39,14 @@ process exit. An earlier run passed its assertions but did not finish shutting
 down promptly and required termination; that lifecycle observation remains a
 qualification limitation, not a numerical pass for that earlier process.
 
-Full hardware qualification and warmed real-project cost measurements are still
-required before this candidate is treated as release-qualified. The local logs
-are under `runs/rx7600-phasor-20261027/`, including the pristine reproduction,
-initial factorization experiment and instrumented lifecycle rerun.
+At this initial experiment stage, full hardware qualification and warmed
+real-project cost measurements were still required. The local logs are under
+`runs/rx7600-phasor-20261027/`, including the pristine reproduction, initial
+factorization experiment and instrumented lifecycle rerun. Subsequent
+[transducer-condensation qualification](ROCm%20Transducer%20Condensation.md#rx-7600-qualification)
+completed the full hardware and CPU reference gates plus headless real-project
+checks on the integrated implementation. Its linked profile reports warmed
+costs; that evidence remains specific to the tested machine and software.
 
 ## Cost and follow-up
 

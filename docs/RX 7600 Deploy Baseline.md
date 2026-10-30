@@ -89,3 +89,6 @@ measured stage would save only about 2.2% on this workload, so migrating host
 Krylov vectors is not the first optimization priority. Trace overhead must remain
 outside these baseline timings. Float64 factors and the qualified numerical
 checks remain required during any subsequent optimization.
+
+A subsequent [warmed RGP capture](RX%207600%20RGP%20Capture.md) records static
+kernel resource evidence and capture limitations separately from these timings.
