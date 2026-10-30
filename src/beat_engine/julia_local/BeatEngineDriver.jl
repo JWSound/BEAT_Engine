@@ -32,7 +32,7 @@ function emit_event(event_type::String; kwargs...)
     payload["phasor_convention"] = phasor_convention()
     if event_type == "ready"
         payload["phasor_conventions"] = [NEGATIVE_TIME_PHASOR, POSITIVE_TIME_PHASOR]
-        payload["deploy_solver_backends"] = ["cpu", "cuda", "metal"]
+        payload["deploy_solver_backends"] = ["cpu", "cuda", "metal", "rocm"]
         # Supported solve paths are not a claim about this worker/device. Probe
         # at startup, outside precompilation, and report actual availability.
         payload["backends"] = worker_backend_availability()

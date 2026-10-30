@@ -47,6 +47,7 @@ if backend == "rocm":
         "rocm_transducer_condensation_worker_tests.jl",
         "rocm_speaker_rank_tests.jl",
         "rocm_speaker_rom_export_tests.jl",
+        "deploy_rocm_tests.jl",
     ):
         subprocess.run(
             [
