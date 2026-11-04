@@ -56,13 +56,14 @@ def validate_worker_ready(info: dict) -> None:
             isinstance(kinds, list) and all(isinstance(kind, str) and bool(kind.strip()) for kind in kinds),
             "invalid exterior_component_kinds capabilities; expected a list of non-empty strings.",
         )
-    if "exterior_source_profiles" in info:
-        profiles = info["exterior_source_profiles"]
-        _require(
-            isinstance(profiles, list)
-            and all(isinstance(profile, str) and bool(profile.strip()) for profile in profiles),
-            "invalid exterior_source_profiles capabilities; expected a list of non-empty strings.",
-        )
+    for name in ("exterior_source_profiles", "coupled_exterior_source_profiles"):
+        if name in info:
+            profiles = info[name]
+            _require(
+                isinstance(profiles, list)
+                and all(isinstance(profile, str) and bool(profile.strip()) for profile in profiles),
+                f"invalid {name} capabilities; expected a list of non-empty strings.",
+            )
     for name in ("fem_wall_loss_models", "fem_wall_loss_scopes"):
         if name in info:
             values = info[name]
@@ -149,10 +150,23 @@ def negotiate_submission(info: dict, request: dict, operation: str) -> dict:
                 continue
             profile = component["parameters"].get("motion_profile", "uniform_normal")
             if profile != "uniform_normal":
-                _require(kind == "exterior_bem", "rigid-translation ideal sources require an exterior BEM solve.")
+                system = request["compiled_system"]
+                exterior_ids = {region["id"] for region in system["regions"] if region["kind"] == "unbounded_air"}
+                boundaries = {boundary["id"]: boundary for boundary in system["boundaries"]}
                 _require(
-                    profile in info.get("exterior_source_profiles", ["uniform_normal"]),
-                    f"exterior source profile {profile!r} is unavailable; update the engine worker.",
+                    bool(component["boundary_ids"])
+                    and all(
+                        boundaries[boundary_id]["region_id"] in exterior_ids
+                        for boundary_id in component["boundary_ids"]
+                    ),
+                    "rigid-translation ideal sources require exterior-only boundary assignments.",
+                )
+                capability = (
+                    "coupled_exterior_source_profiles" if kind == "coupled_fem_bem_lem" else "exterior_source_profiles"
+                )
+                _require(
+                    profile in info.get(capability, ["uniform_normal"]),
+                    f"{kind} exterior source profile {profile!r} is unavailable; update BEAT Engine and restart the worker.",
                 )
         if "cancel_path" in request:
             _require(info.get("cancellation") == "marker_file", "marker-file cancellation is unavailable.")
