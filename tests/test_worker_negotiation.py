@@ -165,7 +165,7 @@ def test_missing_profiles_preserves_old_worker_normal_fallback(ready, payload):
 
 
 @pytest.mark.parametrize("kind", ["interior_fem", "coupled_fem_bem_lem"])
-def test_rigid_ideal_source_rejects_bounded_regions_before_submission(ready, payload, kind):
+def test_rigid_ideal_source_rejects_interior_boundaries_before_submission(ready, payload, kind):
     system = payload["compiled_system"]
     system["contract_version"] = 2
     system["components"][0]["parameters"] = {"motion_profile": "rigid_translation", "motion_axis": [1, 2, 3]}
@@ -175,8 +175,31 @@ def test_rigid_ideal_source_rejects_bounded_regions_before_submission(ready, pay
         interior = copy.deepcopy(system["regions"][0])
         interior.update(id="region:interior", kind="bounded_air")
         system["regions"].append(interior)
-    with pytest.raises(WorkerCompatibilityError, match="exterior BEM solve"):
+        system["boundaries"][0]["region_id"] = interior["id"]
+    with pytest.raises(WorkerCompatibilityError, match="exterior-only boundary assignments"):
         negotiate_submission(ready, payload, "solve")
+
+
+@pytest.mark.parametrize("profiles", [None, {}, "rigid_translation", [1], [""]])
+def test_rejects_malformed_coupled_source_profiles(ready, profiles):
+    ready["coupled_exterior_source_profiles"] = profiles
+    with pytest.raises(WorkerCompatibilityError, match="coupled_exterior_source_profiles"):
+        validate_worker_ready(ready)
+
+
+def test_coupled_exterior_axial_source_requires_worker_capability(ready, payload):
+    system = payload["compiled_system"]
+    system["contract_version"] = 2
+    system["components"][0]["parameters"] = {"motion_profile": "rigid_translation", "motion_axis": [0, 0, 1]}
+    interior = copy.deepcopy(system["regions"][0])
+    interior.update(id="region:interior", kind="bounded_air")
+    system["regions"].append(interior)
+    assert negotiate_submission(ready, payload, "solve")["result_schema_version"] == 2
+    ready.pop("coupled_exterior_source_profiles")
+    with pytest.raises(WorkerCompatibilityError, match="restart the worker"):
+        negotiate_submission(ready, payload, "solve")
+    system["components"][0]["parameters"] = {}
+    assert negotiate_submission(ready, payload, "solve")["result_schema_version"] == 2
 
 
 @pytest.mark.parametrize("version", [None, True, 1.0, 2, "1"])
