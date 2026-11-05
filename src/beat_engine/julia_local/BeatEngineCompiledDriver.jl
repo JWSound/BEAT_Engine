@@ -3995,7 +3995,7 @@ function write_field_binary_result(request, request_path, values)
     array = Complex{scalar_type}.(values)
     path = joinpath(dirname(request_path), filename)
     open(path, "w") do io
-        write(io, array)
+        write(io, ndims(array) == 2 ? permutedims(array) : array)
     end
     return Dict(
         "file" => filename,
@@ -4049,8 +4049,9 @@ function retained_bem_field_evaluation_cache(
 ) where {T<:AbstractFloat}
     domain_key = strip(String(get(request, "domain_key", "")))
     isempty(domain_key) && error("Exterior field request is missing its domain cache key.")
-    quadrature_order = Int(get(request, "quadrature_order", 2))
-    cache_key = "$domain_key|$(T)|$backend|$symmetry|q$quadrature_order"
+    quantity = String(get(request, "field_quantity", "pressure"))
+    quadrature_order = Int(get(request, "quadrature_order", quantity == "pressure_gradient_v1" ? 4 : 2))
+    cache_key = "$domain_key|$(T)|$backend|$symmetry|q$quadrature_order|$quantity"
     cached = get(BEM_FIELD_EVALUATION_CACHES, cache_key, nothing)
     if cached !== nothing
         filter!(!=(cache_key), BEM_FIELD_EVALUATION_CACHE_ORDER)
@@ -4062,7 +4063,7 @@ function retained_bem_field_evaluation_cache(
         request,
         request_path,
         "boundary_points_m",
-        Float32,
+        get(request, "field_quantity", "pressure") == "pressure_gradient_v1" ? T : Float32,
     )
     length(vertex_shape) == 2 && vertex_shape[2] == 3 ||
         error("BEM boundary points must have shape (bem_node, 3).")
@@ -4122,6 +4123,12 @@ function evaluate_bem_field_request_impl(request, request_path)
     backend = Symbol(lowercase(String(get(request, "bem_backend", "cpu"))))
     backend in (:cpu, :cuda, :rocm, :metal) || error("Exterior field backend must be cpu, cuda, rocm, or metal.")
     symmetry = BeatEngineCore.normalized_symmetry_mode(get(request, "symmetry", "off"))
+    quantity = String(get(request, "field_quantity", "pressure"))
+    quantity in ("pressure", "pressure_gradient_v1") || error("Unsupported BEM field quantity: $quantity")
+    if quantity == "pressure_gradient_v1"
+        backend in (:cpu, :cuda) || error("BEM pressure gradients require CPU or CUDA.")
+        Int(get(request, "quadrature_order", 4)) == 4 || error("BEM gradients require fourth-order quadrature.")
+    end
     retained = retained_bem_field_evaluation_cache(request, request_path, FloatType, backend, symmetry)
     mesh = retained.mesh
     pressure, pressure_shape = read_field_binary_array(
@@ -4146,7 +4153,7 @@ function evaluate_bem_field_request_impl(request, request_path)
         request,
         request_path,
         "points_m",
-        Float32,
+        get(request, "field_quantity", "pressure") == "pressure_gradient_v1" ? FloatType : Float32,
     )
     length(point_shape) == 2 && point_shape[2] == 3 ||
         error("Exterior evaluation points must have shape (point, 3).")
@@ -4163,6 +4170,10 @@ function evaluate_bem_field_request_impl(request, request_path)
     sound_speed > zero(FloatType) || error("Exterior field sound speed must be positive.")
     field_cache = retained.field_cache
     wavenumber = FloatType(2pi) * frequency_hz / sound_speed
+    if quantity == "pressure_gradient_v1"
+        evaluator = backend == :cpu ? BeatEngineCore.evaluate_galerkin_field_gradient_cpu : BeatEngineCore.evaluate_galerkin_field_gradient_cuda
+        return evaluator(points, mesh, pressure, normal_derivative, wavenumber, field_cache; symmetry_mode=symmetry)
+    end
     if backend == :cuda
         return evaluate_galerkin_field_cuda(
             points,
@@ -4205,6 +4216,7 @@ include(joinpath(@__DIR__, "worker_backend_availability.jl"))
 
 function run_worker()
     ready = worker_ready(worker_backend_availability())
+    ready["field_quantities"] = Dict("cpu" => ["pressure", "pressure_gradient_v1"], "cuda" => ["pressure", "pressure_gradient_v1"])
     ready["compiled_worker"] = COMPILED_WORKER_LOAD[]
     ready["worker_cleanup_policies"] = ["aggressive", "cuda_reuse"]
     push!(ready["operations"], "reclaim")
@@ -4239,6 +4251,7 @@ function run_worker()
                     JSON.json(
                         Dict(
                             "type" => "field_result",
+                            "field_quantity" => get(request, "field_quantity", "pressure"),
                             "phasor_convention" => get(request, "phasor_convention", NEGATIVE_TIME_PHASOR),
                             "values_binary" => write_field_binary_result(
                                 request,
