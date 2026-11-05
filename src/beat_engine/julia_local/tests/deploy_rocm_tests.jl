@@ -8,6 +8,27 @@ BeatEngineCore._require_rocm!(rocsolver=true)
 const accelerator = BeatEngineCore.amdgpu_module()
 
 try
+    @testset "Deploy identity uploads preserve host complex conversion" begin
+        for T in (Float32, Float64)
+            # Include signed zero, extreme finite values and a rectangular block.
+            real_block = reshape(T[0.0, -0.0, 1, -1, floatmin(T), floatmax(T)], 2, 3)
+            for input in (real_block, Complex{T}.(real_block, one(T)),
+                          view(real_block, :, :), Float64.(real_block))
+                saved = copy(input)
+                uploaded = upload_deploy_rocm_identity(input, T)
+                try
+                    actual = Array(uploaded)
+                    @test eltype(actual) == Complex{T}
+                    @test size(actual) == size(input)
+                    @test isequal(actual, Complex{T}.(input))
+                    @test isequal(input, saved)
+                finally
+                    accelerator.synchronize()
+                    accelerator.unsafe_free!(uploaded)
+                end
+            end
+        end
+    end
     @testset "Deploy ROCm reusable factors and ROM feedback match full complex systems" begin
         rng = MersenneTwister(39125)
         for T in (Float32, Float64), convention in (NEGATIVE_TIME_PHASOR, POSITIVE_TIME_PHASOR)
