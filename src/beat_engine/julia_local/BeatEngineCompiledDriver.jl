@@ -4126,7 +4126,7 @@ function evaluate_bem_field_request_impl(request, request_path)
     quantity = String(get(request, "field_quantity", "pressure"))
     quantity in ("pressure", "pressure_gradient_v1") || error("Unsupported BEM field quantity: $quantity")
     if quantity == "pressure_gradient_v1"
-        backend in (:cpu, :cuda) || error("BEM pressure gradients require CPU or CUDA.")
+        backend in (:cpu, :cuda, :rocm) || error("BEM pressure gradients require CPU, CUDA, or ROCm.")
         Int(get(request, "quadrature_order", 4)) == 4 || error("BEM gradients require fourth-order quadrature.")
     end
     retained = retained_bem_field_evaluation_cache(request, request_path, FloatType, backend, symmetry)
@@ -4171,7 +4171,9 @@ function evaluate_bem_field_request_impl(request, request_path)
     field_cache = retained.field_cache
     wavenumber = FloatType(2pi) * frequency_hz / sound_speed
     if quantity == "pressure_gradient_v1"
-        evaluator = backend == :cpu ? BeatEngineCore.evaluate_galerkin_field_gradient_cpu : BeatEngineCore.evaluate_galerkin_field_gradient_cuda
+        evaluator = backend == :cpu ? BeatEngineCore.evaluate_galerkin_field_gradient_cpu :
+            backend == :rocm ? BeatEngineCore.evaluate_galerkin_field_gradient_rocm :
+            BeatEngineCore.evaluate_galerkin_field_gradient_cuda
         return evaluator(points, mesh, pressure, normal_derivative, wavenumber, field_cache; symmetry_mode=symmetry)
     end
     if backend == :cuda
@@ -4216,7 +4218,7 @@ include(joinpath(@__DIR__, "worker_backend_availability.jl"))
 
 function run_worker()
     ready = worker_ready(worker_backend_availability())
-    ready["field_quantities"] = Dict("cpu" => ["pressure", "pressure_gradient_v1"], "cuda" => ["pressure", "pressure_gradient_v1"])
+    ready["field_quantities"] = Dict(backend => ["pressure", "pressure_gradient_v1"] for backend in ("cpu", "cuda", "rocm"))
     ready["compiled_worker"] = COMPILED_WORKER_LOAD[]
     ready["worker_cleanup_policies"] = ["aggressive", "cuda_reuse"]
     push!(ready["operations"], "reclaim")

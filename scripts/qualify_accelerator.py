@@ -37,6 +37,8 @@ if backend == "rocm":
     for test in (
         "rocm_phasor_tests.jl",
         "rocm_worker_phasor_tests.jl",
+        "rocm_field_gradient_tests.jl",
+        "rocm_field_gradient_worker_tests.jl",
         "rocm_near_correction_tests.jl",
         "rocm_near_source_tests.jl",
         "rocm_wavelength_tests.jl",

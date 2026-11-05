@@ -4,6 +4,17 @@ if !isdefined(@__MODULE__, :BeatEngineCore)
 end
 using .BeatEngineCore
 
+function check_rocm_gradient(points, mesh, pressure, neumann, k, cpu_cache, expected; symmetry_mode=:off, rtol=1e-10, atol=0)
+    isdefined(@__MODULE__, :ROCM_GRADIENT_QUALIFICATION) || return
+    cache = build_rocm_field_evaluation_cache(cpu_cache)
+    try
+        actual = BeatEngineCore.evaluate_galerkin_field_gradient_rocm(points, mesh, pressure, neumann, k, cache; symmetry_mode)
+        @test isapprox(actual, expected; rtol, atol)
+    finally
+        release_rocm_field_evaluation_cache!(cache)
+    end
+end
+
 # A closed radiating surface checks the physical sign and full vector, rather
 # than comparing two evaluations of the same integral implementation.
 @testset "radiating monopole velocity and intensity" begin
@@ -28,6 +39,7 @@ using .BeatEngineCore
         q = [sum(grad(mesh.centroids[j]) .* mesh.normals[j]) for j in eachindex(faces)]
         cache = build_field_evaluation_cache(mesh,triangle_rule(Float64,4))
         result = BeatEngineCore.evaluate_galerkin_field_gradient_cpu(points,mesh,pressure,q,k,cache)
+        check_rocm_gradient(points,mesh,pressure,q,k,cache,result)
         for (i,x) in enumerate(points)
             @test result[i,1] ≈ p(x) rtol=0.01
             @test result[i,2:4] ≈ grad(x) rtol=0.01
@@ -56,6 +68,7 @@ end
         points = [SVector{3,T}(0.2,0.2,z) for z in (0.2,0.02,0.002)]
         p, q = zeros(Complex{T},3), ones(Complex{T},1)
         values = BeatEngineCore.evaluate_galerkin_field_gradient_cpu(points,mesh,p,q,zero(T),cache)
+        check_rocm_gradient(points,mesh,p,q,zero(T),cache,values; rtol=3e-4, atol=1e-6)
         for (i,x) in enumerate(points)
             a,b,c = (SVector{3,Float64}(v-x) for v in mesh.vertices)
             angle = abs(2 * atan(dot(a,cross(b,c)),norm(a)*norm(b)*norm(c)+dot(a,b)*norm(c)+dot(b,c)*norm(a)+dot(c,a)*norm(b)))
@@ -80,6 +93,7 @@ end
         with_phasor_convention(convention) do
             cache = build_field_evaluation_cache(mesh,triangle_rule(T,4);symmetry_mode=symmetry)
             values = BeatEngineCore.evaluate_galerkin_field_gradient_cpu([x],mesh,p,q,k,cache;symmetry_mode=symmetry)
+            check_rocm_gradient([x],mesh,p,q,k,cache,values;symmetry_mode=symmetry)
             @test values[1,1] ≈ evaluate_galerkin_field_cpu([x],mesh,p,q,k,cache)[1] rtol=1e-12
             for d in 1:3
                 delta = SVector{3,T}(ntuple(j -> j == d ? 1e-5 : 0.0,3))
