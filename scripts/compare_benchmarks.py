@@ -47,7 +47,7 @@ def accuracy(run, ref):
         actual = run["outputs"][key]
         if actual[1] != entry[1]:
             raise ValueError(f"{key}: output shape does not match the reference")
-        groups.setdefault(key.split("@")[0], []).append((complex_values(actual), complex_values(entry)))
+        groups.setdefault(key.rsplit("@", 1)[0], []).append((complex_values(actual), complex_values(entry)))
     result = {}
     for quantity, pairs in groups.items():
         num = den = worst = 0.0
