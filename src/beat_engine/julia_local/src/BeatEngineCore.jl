@@ -1263,13 +1263,12 @@ function assemble_regular_galerkin_operators(
         )
     end
 
-    # ROCm does not consume near-correction caches. Reject them before
-    # dispatch, including device-only caches, rather than silently ignoring them.
+    # ROCm builds difference rules from the host cache and the current regular
+    # rule; CUDA-specific device caches cannot be consumed by that path.
     if backend == :rocm && any(cache -> cache !== nothing, (
-        near_correction_cache, image_near_correction_cache,
         device_near_correction_cache, device_image_near_correction_cache,
     ))
-        error("Near-singular correction is not implemented for the $(backend) backend.")
+        error("ROCm near-singular correction requires host correction caches.")
     end
     if backend == :cuda && (
         near_correction_cache isa Union{Tuple,AbstractVector} ||
@@ -1321,6 +1320,8 @@ function assemble_regular_galerkin_operators(
             timing=timing,
             singular_cache=singular_cache,
             rocm_singular_cache=device_singular_cache,
+            near_correction_cache=near_correction_cache,
+            image_near_correction_cache=image_near_correction_cache,
             assembly_mode=rocm_assembly_mode,
             symmetry_mode=symmetry_mode,
         )

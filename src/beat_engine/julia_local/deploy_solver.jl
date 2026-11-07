@@ -1,4 +1,5 @@
 include(joinpath(@__DIR__, "deploy_cpu.jl"))
+include(joinpath(@__DIR__, "deploy_rocm.jl"))
 include(joinpath(@__DIR__, "deploy_rhs_policy.jl"))
 include(joinpath(@__DIR__, "deploy_rhs_compression.jl"))
 include(joinpath(@__DIR__, "deploy_rhs_projection.jl"))
@@ -17,6 +18,8 @@ function release_deploy_boundary_state!()
         cuda = BeatEngineCore.CUDA_MODULE
         state.pressure isa cuda.CuArray && cuda.unsafe_free!(state.pressure)
         state.q_neumann isa cuda.CuArray && cuda.unsafe_free!(state.q_neumann)
+    elseif state.backend == :rocm
+        Bool(get(state, :shared_geometry, false)) || release_rocm_field_evaluation_cache!(state.field_cache)
     elseif state.backend == :metal
         Bool(get(state, :shared_geometry, false)) || release_metal_field_evaluation_cache!(state.field_cache)
     end
@@ -46,6 +49,10 @@ function release_deploy_geometry_state!()
                 value isa cuda.CuArray && cuda.unsafe_free!(value)
             end
         end
+    elseif state.backend == :rocm
+        release_rocm_field_evaluation_cache!(state.field_cache)
+        release_rocm_regular_assembly_cache!(state.device_cache)
+        state.device_singular_cache === nothing || release_rocm_singular_correction_cache!(state.device_singular_cache)
     elseif state.backend == :metal
         release_metal_field_evaluation_cache!(state.field_cache)
         release_metal_regular_assembly_cache!(state.device_cache)
@@ -565,7 +572,7 @@ function solve_deploy_request_impl(
     schema_version = Int(get_value(request, "schema_version", 1))
     schema_version in (1, 2, 3) || error("Unsupported Deploy solve schema_version $(schema_version).")
     beat_backend = beat_backend_from_request(request)
-    beat_backend in (:cuda, :cpu, :metal) || error("Deploy supports BEAT CUDA, CPU or Metal.")
+    beat_backend in (:cuda, :cpu, :metal, :rocm) || error("Deploy supports BEAT CUDA, CPU, Metal or ROCm.")
     requested_assembly_mode = lowercase(String(get_value(request, "burton_miller_assembly", "direct_system")))
     requested_assembly_mode in ("direct_system", "operator_matrices") || error(
         "Deploy burton_miller_assembly must be 'direct_system' or 'operator_matrices'.",
@@ -773,6 +780,7 @@ function solve_deploy_request_impl(
     cached_q_neumann = nothing
     weighted_sources = nothing
     rom_factorization = nothing
+    rocm_system = nothing
     compressed_rhs = nothing
     projected_rhs = nothing
     compression_report = nothing
@@ -862,6 +870,14 @@ function solve_deploy_request_impl(
                     field_cache = build_cuda_field_evaluation_cache(cpu_field_cache)
                 end
                 cached_q_neumann = BeatEngineCore.CUDA_MODULE.CuArray(q_neumann)
+            elseif beat_backend == :rocm
+                if cached_geometry === nothing
+                    emit_event("status"; message="Preparing BEAT ROCm geometry caches")
+                    device_cache = build_rocm_regular_assembly_cache(mesh, p1_space, dp0_space, rule;
+                        singular_order=singular_order, symmetry_mode=:ground)
+                    device_singular_cache = build_rocm_singular_correction_cache(singular_cache)
+                    field_cache = build_rocm_field_evaluation_cache(cpu_field_cache)
+                end
             elseif beat_backend == :metal
                 if cached_geometry === nothing
                     emit_event("status"; message="Preparing BEAT Metal geometry caches")
@@ -967,8 +983,8 @@ function solve_deploy_request_impl(
                     singular_order=singular_order,
                     backend=beat_backend,
                     device_cache=device_cache,
-                    return_device=beat_backend in (:cuda, :metal),
-                    accelerator_quadrature=beat_backend in (:cuda, :metal),
+                    return_device=beat_backend in (:cuda, :metal, :rocm),
+                    accelerator_quadrature=beat_backend in (:cuda, :metal, :rocm),
                     singular_cache=singular_cache,
                     device_singular_cache=device_singular_cache,
                     device_image_singular_cache=device_image_singular_cache,
@@ -991,22 +1007,25 @@ function solve_deploy_request_impl(
                 "Solving fixed-Neumann exterior system",
         )
         solve_seconds = @elapsed begin
-            pressure = if rom_request && beat_backend in (:cpu, :metal)
+            pressure = if rom_request && beat_backend in (:cpu, :metal, :rocm)
                 cpu_system = nothing
+                build_system = beat_backend == :rocm ? build_deploy_rocm_system : BeatEngineCore.build_burton_miller_neumann_cpu_system
+                solve_system = beat_backend == :rocm ? solve_deploy_rocm_system : BeatEngineCore.solve_burton_miller_neumann_cpu_system
                 rom_factorization_seconds = @elapsed begin
-                    cpu_system = BeatEngineCore.build_burton_miller_neumann_cpu_system(
+                    cpu_system = build_system(
                         operators, identity_p1_p1, identity_p1_dp0, k,
                     )
+                    beat_backend == :rocm && (rocm_system = cpu_system)
                 end
                 preconditioned_rhs = nothing
                 rom_initial_preconditioner_seconds = @elapsed begin
-                    preconditioned_rhs = BeatEngineCore.solve_burton_miller_neumann_cpu_system(
+                    preconditioned_rhs = solve_system(
                         cpu_system, q_neumann, FloatType,
                     )
                 end
                 apply_schur = function(candidate)
                     feedback = deploy_speaker_rom_response(speaker_rom, candidate; include_drive=false)
-                    response = BeatEngineCore.solve_burton_miller_neumann_cpu_system(
+                    response = solve_system(
                         cpu_system, feedback.q, FloatType,
                     )
                     return candidate - response
@@ -1319,6 +1338,10 @@ function solve_deploy_request_impl(
                     rom_rhs_operator === nothing || cuda.unsafe_free!(rom_rhs_operator)
                     cuda.unsafe_free!(preconditioned_rhs)
                 end
+            elseif beat_backend == :rocm
+                rocm_system = build_deploy_rocm_system(operators, identity_p1_p1, identity_p1_dp0, k)
+                cached_q_neumann = copy(q_neumann)
+                solve_deploy_rocm_system(rocm_system, cached_q_neumann, FloatType)
             elseif direct_cuda_assembly
                 direct_system_consumed = true
                 solve_burton_miller_system_cuda!(direct_system; return_gpu=true)
@@ -1452,7 +1475,13 @@ function solve_deploy_request_impl(
                     "fidelity" => rom_request ? "level3_parity_petrov_galerkin" : "level2",
                 ),
             )
-            if beat_backend == :metal
+            if beat_backend == :rocm
+                result["diagnostics"]["linear_solver"] = "rocm_rocsolver_dense_lu"
+                result["diagnostics"]["dense_factorization_precision"] = "float64"
+                result["diagnostics"]["near_correction_backend"] = "rocm"
+                result["diagnostics"]["field_backend"] = "rocm"
+                rom_request && (result["diagnostics"]["rom_krylov_backend"] = "cpu")
+            elseif beat_backend == :metal
                 result["diagnostics"]["linear_solver"] = "metal_assembly_cpu_dense_lu"
                 result["diagnostics"]["near_correction_backend"] = "cpu"
                 result["diagnostics"]["field_backend"] = "metal"
@@ -1567,6 +1596,7 @@ function solve_deploy_request_impl(
             end
         end
         cuda_observation === nothing || release_cuda_observation_points!(cuda_observation)
+        release_deploy_rocm_system!(rocm_system)
         operators === nothing || release_operator_storage!(operators)
         (direct_system === nothing || direct_system_consumed) ||
             release_burton_miller_system_cuda!(direct_system)
@@ -1582,7 +1612,15 @@ function solve_deploy_request_impl(
         geometry_resources_retained = retain_geometry_cache && retained_state !== nothing &&
             retained_state.field_cache === field_cache
         if !geometry_resources_retained
-            if beat_backend == :metal
+            if beat_backend == :rocm
+                device_cache === nothing || release_rocm_regular_assembly_cache!(device_cache)
+                device_singular_cache === nothing || release_rocm_singular_correction_cache!(device_singular_cache)
+                boundary_state = DEPLOY_BOUNDARY_STATE[]
+                field_retained = boundary_state !== nothing && boundary_state.field_cache === field_cache
+                if !field_retained && field_cache !== cpu_field_cache
+                    release_rocm_field_evaluation_cache!(field_cache)
+                end
+            elseif beat_backend == :metal
                 device_cache === nothing || release_metal_regular_assembly_cache!(device_cache)
                 device_singular_cache === nothing || release_metal_singular_correction_cache!(device_singular_cache)
                 boundary_state = DEPLOY_BOUNDARY_STATE[]
