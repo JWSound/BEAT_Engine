@@ -50,6 +50,7 @@ if backend == "rocm":
         "rocm_speaker_rank_tests.jl",
         "rocm_speaker_rom_export_tests.jl",
         "deploy_rocm_tests.jl",
+        "rocm_thermoviscous_tests.jl",
     ):
         subprocess.run(
             [
