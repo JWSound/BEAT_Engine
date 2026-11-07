@@ -82,3 +82,10 @@ These results qualify the tested GPU/software configuration and workloads. They
 do not establish support for every AMD device or replace validation of a future
 packaged Deploy runtime. Release dependency pins are handled independently of
 this engine change.
+
+The subsequent [RX 7600 warmed array baseline](RX%207600%20Deploy%20Baseline.md)
+completed 24 interleaved fresh workers and 72 measured sweeps. Its independent
+output audit passed for every warm-up and measured sweep. Assembly and dense
+factorization dominate the four-cabinet ROCm path; GMRES and field evaluation
+are smaller costs. The report gives matched-repeat medians, ranges, stage
+timings, host memory, accuracy and the limits of these measurements.
