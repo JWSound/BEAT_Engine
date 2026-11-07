@@ -44,7 +44,7 @@ degree-one spherical wave. For radius `a`, real unit translation velocity along
 `h1(z) = -exp(i*z)*(z+i)/z^2`. The normal derivative at the surface follows
 independently from linearized Euler, `dp/dr = i*rho*omega*dot(u,x/r)`.
 Positive time conjugates the radial wave and reverses that derivative's sign.
-See [NASA-CR-98418, Appendix B, equations B-1–B-4](https://ntrs.nasa.gov/api/citations/19690015869/downloads/19690015869.pdf).
+See [NASA-CR-98418, Appendix B, equations B-1â€“B-4](https://ntrs.nasa.gov/api/citations/19690015869/downloads/19690015869.pdf).
 The tests implement explicit Hankel expressions without calling engine phasor
 helpers or Green functions, then compare the public compiled solve's complex
 outputs. The 8% bound is retained from the monopole check. The translating sphere
@@ -89,6 +89,10 @@ ROCm backend and checks the reported ROCm dense solve for every GPU request.
 Additional Float32/Float64 comparisons with CPU cover both phasors, ground
 reflection, boundary traces, radiation impedance, diaphragm velocity, current,
 and field outputs. The ordinary tests keep their CPU default.
+The [RX 7600 native Windows qualification](../../../../docs/ROCm%20RX%207600%20Qualification.md)
+records the tested ROCm stack, dedicated assembly/field/symmetry gates, coupled
+hardware execution, and remaining qualification gaps. The standalone
+`scripts/validate_rocm_coupled.jl` uses the packaged fixtures in this directory.
 
 The Metal gate runs with the `julia_metal` project on Apple Silicon. Its
 `metal production pipeline` testset solves `off`, `x` and `xy` on the meshes
