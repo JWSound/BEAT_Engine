@@ -2732,7 +2732,14 @@ function solve_request_impl(request; event_mode=false)
             parameters = component["parameters"]
             get(parameters, "motion_profile", "uniform_normal") == "uniform_normal" &&
                 !haskey(parameters, "motion_axis") && continue
-            error("Rigid-translation ideal sources currently require an exterior BEM solve.")
+            get(parameters, "motion_profile", "uniform_normal") == "rigid_translation" || error(
+                "Prescribed-source motion_axis requires motion_profile=rigid_translation.",
+            )
+            exterior_ids = Set(String(region["id"]) for region in unbounded_regions)
+            all(boundary_id -> String(object_by_id(boundaries, String(boundary_id), "boundary")["region_id"]) in exterior_ids,
+                component["boundary_ids"]) || error(
+                "Rigid-translation ideal sources require exterior-only boundary assignments.",
+            )
         end
     end
 
@@ -2949,6 +2956,14 @@ function solve_request_impl(request; event_mode=false)
                 "Prescribed-velocity component $(repr(String(component["id"]))) " *
                 "must own at least one moving FEM or BEM boundary.",
             )
+            axial_excitation = if get(parameters, "motion_profile", "uniform_normal") == "rigid_translation"
+                only(exterior_excitations(
+                    [port_id], (ports=ports, items=components), boundaries,
+                    bem_boundary_tag_by_id, unbounded_region, symmetry_mode, FloatType,
+                ))
+            else
+                nothing
+            end
             bem_source_index = 0
             if !isempty(bem_boundary_tags)
                 prescribed_bem_count += 1
@@ -2963,7 +2978,9 @@ function solve_request_impl(request; event_mode=false)
                     weight == zero(FloatType) && continue
                     push!(prescribed_bem_rows, face_index)
                     push!(prescribed_bem_cols, bem_source_index)
-                    push!(prescribed_bem_values, weight)
+                    motion = axial_excitation === nothing ? weight :
+                        weight * exterior_motion_factor(axial_excitation, bem_mesh.normals[face_index], FloatType)
+                    push!(prescribed_bem_values, motion)
                 end
             end
             push!(
