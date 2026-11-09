@@ -408,6 +408,30 @@ function _rocm_singular_dlp_hyp_gather_kernel!(
     return nothing
 end
 
+# No-free-reuse diagnostic (off by default). With BLAB_VALIDATE_REUSE_ARM_MEMORY=1
+# the block-gather scratch buffers below are kept resident per shape and reused
+# by later launches instead of being freed after each one, so reuse hands back
+# the same virtual addresses with the HIP mapping intact (the regime
+# GPUArrays.@cached reaches in its steady state). This is a third allocation
+# regime for the recycled-VA study: fresh addresses (BLAB_VALIDATE_KEEP_ARM_MEMORY=1),
+# free + realloc (default), and reuse without free (this knob). The default
+# path is unchanged. Intended for single-threaded validation runs; the per-shape
+# dictionary is guarded against concurrent misses only by the validator's
+# single-threaded use.
+const _ROCM_REUSED_GATHER_SCRATCH = Dict{Tuple{DataType,Int}, NTuple{4,Any}}()
+
+function _rocm_reused_gather_scratch!(value_type, pair_count::Int)
+    key = (value_type, pair_count)
+    return get(_ROCM_REUSED_GATHER_SCRATCH, key) do
+        (
+            AMDGPU.zeros(value_type, pair_count, 3),
+            AMDGPU.zeros(value_type, pair_count, 3),
+            AMDGPU.zeros(value_type, pair_count, 9),
+            AMDGPU.zeros(value_type, pair_count, 9),
+        )
+    end
+end
+
 function _launch_rocm_singular_block_gather_kernels!(
     operators,
     regular_cache::RocmRegularAssemblyCache,
@@ -426,10 +450,18 @@ function _launch_rocm_singular_block_gather_kernels!(
     csz = typeof(k)(transform.determinant * transform.signs[3])
     pair_count = singular_cache.pair_count
     pair_count == 0 && return nothing
-    slp_values = AMDGPU.zeros(eltype(operators.single_layer), pair_count, 3)
-    adjoint_values = AMDGPU.zeros(eltype(operators.adjoint_double_layer), pair_count, 3)
-    dlp_values = AMDGPU.zeros(eltype(operators.double_layer), pair_count, 9)
-    hypersingular_values = AMDGPU.zeros(eltype(operators.hypersingular), pair_count, 9)
+    reuse_scratch = get(ENV, "BLAB_VALIDATE_REUSE_ARM_MEMORY", "0") == "1"
+    if reuse_scratch
+        # All four operator matrices share eltype in this assembly path, so one
+        # value type keys the whole scratch set.
+        slp_values, adjoint_values, dlp_values, hypersingular_values =
+            _rocm_reused_gather_scratch!(eltype(operators.single_layer), pair_count)
+    else
+        slp_values = AMDGPU.zeros(eltype(operators.single_layer), pair_count, 3)
+        adjoint_values = AMDGPU.zeros(eltype(operators.adjoint_double_layer), pair_count, 3)
+        dlp_values = AMDGPU.zeros(eltype(operators.double_layer), pair_count, 9)
+        hypersingular_values = AMDGPU.zeros(eltype(operators.hypersingular), pair_count, 9)
+    end
     AMDGPU.@roc groupsize=groupsize gridsize=cld(pair_count, groupsize) _rocm_singular_slp_adjoint_blocks_kernel!(
         slp_values,
         adjoint_values,
@@ -504,9 +536,11 @@ function _launch_rocm_singular_block_gather_kernels!(
         regular_cache.p1_dof_count,
     )
     AMDGPU.synchronize()
-    AMDGPU.unsafe_free!(slp_values)
-    AMDGPU.unsafe_free!(adjoint_values)
-    AMDGPU.unsafe_free!(dlp_values)
-    AMDGPU.unsafe_free!(hypersingular_values)
+    if !reuse_scratch
+        AMDGPU.unsafe_free!(slp_values)
+        AMDGPU.unsafe_free!(adjoint_values)
+        AMDGPU.unsafe_free!(dlp_values)
+        AMDGPU.unsafe_free!(hypersingular_values)
+    end
     return nothing
 end

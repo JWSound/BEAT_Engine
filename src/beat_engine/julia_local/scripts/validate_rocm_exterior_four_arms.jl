@@ -18,7 +18,25 @@ end
 # 2 GiB instead of ~0.5 GiB because all four arms' memory stays live.
 const _KEPT_ARM_MEMORY = Any[]
 
-function _validate_rocm_exterior_arm(convention::AbstractString, arm_index::Int)
+# No-free-reuse diagnostic (off by default): when BLAB_VALIDATE_REUSE_ARM_MEMORY=1,
+# the device objects that the default run frees and reallocates once per arm are
+# built once (arm 1) and passed to every arm without ever being released, and
+# the engine's block-gather scratch is kept resident (BeatEngineRocmSingular.jl
+# reads the same knob). Later arms therefore overwrite the same virtual
+# addresses with no intervening free — the regime GPUArrays.@cached reaches in
+# its steady state, and the third arm of the recycled-VA allocation study:
+#   fresh VAs        BLAB_VALIDATE_KEEP_ARM_MEMORY=1   (control)
+#   free + realloc   default                           (reproduces)
+#   reuse, no free   BLAB_VALIDATE_REUSE_ARM_MEMORY=1  (this mode)
+# The per-arm operator matrices cannot be hoisted through the public assembly
+# API; they stay per-arm and are pinned (like keep-alive), so this mode differs
+# from a fully no-free run only in those buffers. Each arm prints an
+# ARM_MEMORY_REUSED line. Peak VRAM is comparable to keep-alive (~2 GiB).
+const _REUSED_ARM_MEMORY = Any[]
+
+_reuse_arm_memory() = get(ENV, "BLAB_VALIDATE_REUSE_ARM_MEMORY", "0") == "1"
+
+function _validate_rocm_exterior_arm(convention::AbstractString, arm_index::Int, shared=nothing)
     amdgpu = BeatEngineCore.AMDGPU_MODULE
     amdgpu === nothing && error("AMDGPU.jl did not load. Run this script with the julia_rocm project.")
     amdgpu.functional() || error("AMDGPU.functional() is false.")
@@ -35,7 +53,16 @@ function _validate_rocm_exterior_arm(convention::AbstractString, arm_index::Int)
     frequency_hz = 500.0f0
     sound_speed = 343.0f0
     k = Float32(2pi) * frequency_hz / sound_speed
-    singular_cache = build_singular_correction_cache(mesh, singular_order)
+    reuse = _reuse_arm_memory()
+    singular_cache = shared === nothing ? build_singular_correction_cache(mesh, singular_order) : shared.singular_cache
+    if shared === nothing
+        # In reuse mode the device singular cache is built here and passed to
+        # every arm so the assembly neither builds nor releases it per arm; in
+        # the other modes the assembly builds and releases its own, as before.
+        device_singular_cache = reuse ? build_rocm_singular_correction_cache(singular_cache) : nothing
+    else
+        device_singular_cache = shared.device_singular_cache
+    end
 
     println("ROCM_EXTERIOR_ARM_START arm=$(arm_index) convention=$(convention)")
     println("fixture=$(mesh_path)")
@@ -71,14 +98,18 @@ function _validate_rocm_exterior_arm(convention::AbstractString, arm_index::Int)
     println("cpu_assembly_s=$(cpu_assembly_s)")
     flush(stdout)
 
-    rocm_cache = build_rocm_regular_assembly_cache(
-        mesh,
-        p1,
-        dp0,
-        rule;
-        singular_order=singular_order,
-        symmetry_mode=:off,
-    )
+    if shared === nothing
+        rocm_cache = build_rocm_regular_assembly_cache(
+            mesh,
+            p1,
+            dp0,
+            rule;
+            singular_order=singular_order,
+            symmetry_mode=:off,
+        )
+    else
+        rocm_cache = shared.rocm_cache
+    end
     rocm_operators = nothing
     rocm_assembly_s = @elapsed begin
         rocm_operators = assemble_regular_galerkin_operators(
@@ -92,6 +123,7 @@ function _validate_rocm_exterior_arm(convention::AbstractString, arm_index::Int)
             backend=:rocm,
             device_cache=rocm_cache,
             singular_cache=singular_cache,
+            device_singular_cache=device_singular_cache,
             rocm_assembly_mode=:native,
             symmetry_mode=:off,
         )
@@ -126,12 +158,19 @@ function _validate_rocm_exterior_arm(convention::AbstractString, arm_index::Int)
             k,
         )
     end
-    identity_cache = build_rocm_burton_miller_identity_cache(identity_p1_p1, identity_p1_dp0, Float32)
+    identity_cache = shared === nothing ?
+        build_rocm_burton_miller_identity_cache(identity_p1_p1, identity_p1_dp0, Float32) :
+        shared.identity_cache
     rocm_pressure = nothing
     rocm_solve_s = @elapsed begin
         rocm_pressure = solve_burton_miller_neumann(rocm_operators, identity_cache, q_neumann, k)
     end
-    release_rocm_burton_miller_identity_cache!(identity_cache)
+    # Reuse mode never frees: the identity cache is built once (arm 1) and kept
+    # for the remaining arms. Keep-alive mode deliberately keeps this mid-arm
+    # release (identical churn in every arm of every baseline run).
+    if !reuse
+        release_rocm_burton_miller_identity_cache!(identity_cache)
+    end
 
     lhs, rhs_operator = burton_miller_neumann_matrices(
         cpu_operators,
@@ -145,9 +184,14 @@ function _validate_rocm_exterior_arm(convention::AbstractString, arm_index::Int)
     rocm_residual = relative_error(lhs * rocm_pressure, rhs)
 
     eval_points = fibonacci_sphere(16, Float32(2.0))
-    cpu_field_cache = build_field_evaluation_cache(mesh, rule)
+    if shared === nothing
+        cpu_field_cache = build_field_evaluation_cache(mesh, rule)
+        rocm_field_cache = build_rocm_field_evaluation_cache(cpu_field_cache)
+    else
+        cpu_field_cache = shared.cpu_field_cache
+        rocm_field_cache = shared.rocm_field_cache
+    end
     cpu_field = evaluate_galerkin_field_cpu(eval_points, mesh, cpu_pressure, q_neumann, k, cpu_field_cache)
-    rocm_field_cache = build_rocm_field_evaluation_cache(cpu_field_cache)
     rocm_field = evaluate_galerkin_field_rocm(eval_points, mesh, rocm_pressure, q_neumann, k, rocm_field_cache)
     field_error = relative_error(rocm_field, cpu_field)
 
@@ -164,7 +208,25 @@ function _validate_rocm_exterior_arm(convention::AbstractString, arm_index::Int)
     rocm_residual <= 5.0f-3 || error("ROCm pressure residual exceeds tolerance.")
     field_error <= 5.0f-3 || error("ROCm field differs from BEAT CPU beyond tolerance.")
 
-    if get(ENV, "BLAB_VALIDATE_KEEP_ARM_MEMORY", "0") == "1"
+    if reuse
+        # No-free-reuse diagnostic: pin the per-arm operator matrices (they
+        # cannot be hoisted through the public assembly API) and, on arm 1, the
+        # shared device caches built above. Nothing is released in this mode,
+        # so the later arms overwrite the same virtual addresses.
+        push!(_REUSED_ARM_MEMORY, rocm_operators)
+        if shared === nothing
+            shared = (
+                singular_cache=singular_cache,
+                device_singular_cache=device_singular_cache,
+                rocm_cache=rocm_cache,
+                identity_cache=identity_cache,
+                cpu_field_cache=cpu_field_cache,
+                rocm_field_cache=rocm_field_cache,
+            )
+            push!(_REUSED_ARM_MEMORY, shared)
+        end
+        println("ROCM_EXTERIOR_ARM_MEMORY_REUSED arm=$(arm_index)")
+    elseif get(ENV, "BLAB_VALIDATE_KEEP_ARM_MEMORY", "0") == "1"
         # Keep-alive diagnostic: pin this arm's device objects so its blocks stay
         # out of the allocator's free list. singular_cache is pinned as well —
         # its scratch buffers have no explicit release in this script and would
@@ -180,9 +242,10 @@ function _validate_rocm_exterior_arm(convention::AbstractString, arm_index::Int)
         release_rocm_regular_assembly_cache!(rocm_cache)
     end
     println("ROCM_EXTERIOR_VALIDATION_OK arm=$(arm_index) convention=$(convention)")
-    if get(ENV, "BLAB_VALIDATE_KEEP_ARM_MEMORY", "0") == "1"
+    if reuse || get(ENV, "BLAB_VALIDATE_KEEP_ARM_MEMORY", "0") == "1"
         flush(stdout)
     end
+    return shared
 end
 
 function validate_rocm_exterior_four_arms()
@@ -195,13 +258,21 @@ function validate_rocm_exterior_four_arms()
     length(conventions) == 4 || error(
         "BLAB_VALIDATE_PHASOR_SEQUENCE must list exactly 4 comma-separated conventions; got $(conventions).",
     )
+    if _reuse_arm_memory()
+        println("ROCM_EXTERIOR_4ARM_REUSE_ARM_MEMORY=1 (device caches built once and reused without free; block-gather scratch pinned; operator matrices stay per-arm)")
+        flush(stdout)
+    end
     if get(ENV, "BLAB_VALIDATE_KEEP_ARM_MEMORY", "0") == "1"
         println("ROCM_EXTERIOR_4ARM_KEEP_ARM_MEMORY=1 (end-of-arm releases skipped; each arm forced onto fresh device addresses)")
         flush(stdout)
     end
+    shared = nothing
     for (arm_index, convention) in enumerate(conventions)
         try
-            with_phasor_convention(() -> _validate_rocm_exterior_arm(convention, arm_index), convention)
+            shared = with_phasor_convention(
+                () -> _validate_rocm_exterior_arm(convention, arm_index, shared),
+                convention,
+            )
         catch err
             println("ROCM_EXTERIOR_ARM_FAIL arm=$(arm_index) convention=$(convention)")
             rethrow(err)
