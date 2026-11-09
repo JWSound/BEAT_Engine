@@ -83,8 +83,10 @@ const SPEAKER_ROM_QUANTITIES = Set([
 ])
 
 function speaker_interior_state_layout(system)
-    gamma_count = length(system.gamma_range)
-    interface_count = length(system.flux_range)
+    # ROM state includes the retained pressure and interface flux even when the
+    # production solve has eliminated them from its unknown vector.
+    gamma_count = length(system.retained_fem_vertices)
+    interface_count = size(system.interface_operators.fem_trace, 1)
     transducer_count = length(system.transducers)
     gamma_range = 1:gamma_count
     flux_range = (gamma_count + 1):(gamma_count + interface_count)
@@ -110,7 +112,7 @@ function speaker_interior_state_matrix(system)
     condensation = system.condensation
     hasproperty(condensation, :transducer_condensed) && condensation.transducer_condensed && error(
         "Speaker ROM construction needs transducer surfaces in the retained Schur block; " *
-        "unset BLAB_COUPLED_TRANSDUCER_CONDENSATION.",
+        "build with transducer_condensation=false or set BLAB_COUPLED_TRANSDUCER_CONDENSATION=off.",
     )
     schur = if hasproperty(condensation, :schur)
         condensation.schur
@@ -284,6 +286,8 @@ function _speaker_interior_factorization(system, k_matrix)
         cuda.synchronize()
         return (backend=:cuda, factorization=factorization, storage=device_matrix)
     end
+    # ROCm rank analysis uses the retained Schur block on the host, matching
+    # the existing speaker ROM path. Report this separately from the solve backend.
     return (backend=:cpu, factorization=lu!(k_matrix), storage=nothing)
 end
 
@@ -359,8 +363,8 @@ function speaker_rom_rank_experiment(system, raw_config)
     system.formulation == :fem_interface_condensed || error(
         "Speaker ROM rank experiment requires FEM interface condensation.",
     )
-    system.linear_backend in (:cpu, :cuda) || error(
-        "Speaker ROM rank experiment currently supports CPU or CUDA condensation.",
+    system.linear_backend in (:cpu, :cuda, :rocm) || error(
+        "Speaker ROM rank experiment currently supports CPU, CUDA, or ROCm condensation.",
     )
     train_count = Int(get(raw_config, "train_per_sector", 128))
     test_count = Int(get(raw_config, "test_per_sector", 32))
@@ -474,6 +478,7 @@ function speaker_rom_rank_experiment(system, raw_config)
     ]
     return Dict(
         "method" => "four-sector parity-projected output POD with held-out physical boundary fields",
+        "interior_factorization_backend" => String(factor.backend),
         "frequency_hz" => system.omega / (2pi),
         "precision" => string(T),
         "backend" => String(system.linear_backend),
@@ -689,8 +694,8 @@ function exterior_quadrature_selection(options, mesh::BoundaryMesh{T}, frequency
     mode in ("fixed", "wavelength") || error(
         "Unsupported regular quadrature mode: $mode. Expected fixed or wavelength.",
     )
-    backend == :cpu || mode == "fixed" || error(
-        "Wavelength-driven regular quadrature is currently available only on the CPU backend.",
+    backend in (:cpu, :rocm) || mode == "fixed" || error(
+        "Wavelength-driven regular quadrature is available on CPU and ROCm backends.",
     )
     if mode == "fixed"
         return (order=base_order, mode=mode, mesh_stat=nothing, area=nothing, length=nothing, kh=nothing)
@@ -1173,6 +1178,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                        configure_beat_cpu_blas_threads!(p1_space.global_dof_count) :
                        BLAS.get_num_threads()
     rule_cache = Dict{Int,Any}(base_order => base_rule)
+    rocm_quadrature_caches = Dict{Int,Any}()
     identity_cache = Dict{Int,Any}(base_order => (identity_p1_p1, identity_p1_dp0))
     cpu_field_cache_by_order = Dict{Int,Any}(base_order => cpu_field_cache)
     cpu_assembly_cache_by_order = Dict{Int,Any}()
@@ -1258,7 +1264,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
             selection = exterior_quadrature_selection(
                 options, mesh, frequency_hz, sound_speed, base_order, backend,
             )
-            rule = backend == :cpu ? get!(rule_cache, selection.order) do
+            rule = backend in (:cpu, :rocm) ? get!(rule_cache, selection.order) do
                 triangle_rule(FloatType, selection.order)
             end : base_rule
             selected_identity = backend == :cpu ? get!(identity_cache, selection.order) do
@@ -1292,6 +1298,18 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     symmetry_mode=symmetry_mode,
                 )
             end : nothing
+            selected_device_cache = device_cache
+            selected_device_identity_cache = device_identity_cache
+            if backend == :rocm && selection.order != base_order
+                selected_cache = get!(rocm_quadrature_caches, selection.order) do
+                    BeatEngineCore.build_rocm_quadrature_cache(mesh, p1_space, dp0_space, rule;
+                        singular_order, symmetry_mode)
+                end
+                selected_identity = selected_cache.identity
+                selected_field_cache = selected_cache.field_cache
+                selected_device_cache = selected_cache.device_cache
+                selected_device_identity_cache = selected_cache.device_identity_cache
+            end
             neumann_values = has_transducers ?
                 exterior_basis_neumann_values(mesh, excitations, density, omega, lumped.operators) :
                 [exterior_neumann(mesh, excitation, density, omega) for excitation in excitations]
@@ -1356,7 +1374,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     skip_singular=false,
                     singular_order=singular_order,
                     backend=backend,
-                    device_cache=device_cache,
+                    device_cache=selected_device_cache,
                     return_device=accelerator_backend,
                     accelerator_quadrature=accelerator_backend,
                     singular_cache=singular_cache,
@@ -1385,7 +1403,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     pressure = backend in (:cpu, :metal) ?
                                solve_burton_miller_neumann_cpu_system(cpu_system, neumann, FloatType) :
                                solve_burton_miller_neumann(
-                        operators, device_identity_cache, neumann, wavenumber,
+                        operators, selected_device_identity_cache, neumann, wavenumber,
                     )
                     push!(pressures, Complex{FloatType}.(pressure))
                 end
@@ -1602,6 +1620,9 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
         device_image_singular_cache === nothing ||
             release_cuda_image_singular_correction_cache!(device_image_singular_cache)
         if backend == :rocm
+            for cache in values(rocm_quadrature_caches)
+                BeatEngineCore.release_rocm_quadrature_cache!(cache)
+            end
             device_singular_cache === nothing ||
                 release_rocm_singular_correction_cache!(device_singular_cache)
             field_cache === cpu_field_cache || release_rocm_field_evaluation_cache!(field_cache)
@@ -2679,8 +2700,6 @@ end
 
 function solve_request(request; event_mode=false)
     convention = get(get(request, "solver_options", Dict()), "phasor_convention", NEGATIVE_TIME_PHASOR)
-    convention == POSITIVE_TIME_PHASOR && get(get(request, "solver_options", Dict()), "bem_backend", "cpu") == "rocm" &&
-        error("Positive-time ROCm solves require hardware qualification; use CPU, CUDA, or Metal.")
     return with_phasor_convention(convention) do
         solve_request_impl(request; event_mode=event_mode)
     end
@@ -3034,18 +3053,23 @@ function solve_request_impl(request; event_mode=false)
         ),
     )
     static_condensation = static_condensation_requested
+    rom_requested = any(String(output["quantity"]) in SPEAKER_ROM_QUANTITIES for output in outputs)
+    rocm_transducer_condensation = !rom_requested &&
+        isnothing(get(solver_options, "speaker_rom_rank_experiment", nothing)) &&
+        BeatEngineCoupled._rocm_transducer_condensation_enabled(bem_backend, static_condensation, transducers)
     transducer_fem_vertices = isempty(transducers) ?
                               Int[] :
                               unique(findnz(transducer_operators.fem_surface)[1])
-    retained_fem_vertices = sort(
-        unique(vcat(interface_map.fem_vertex_indices, transducer_fem_vertices)),
-    )
+    retained_fem_vertices = sort(unique(vcat(
+        interface_map.fem_vertex_indices,
+        rocm_transducer_condensation ? Int[] : transducer_fem_vertices,
+    )))
     # CPU condensation is deliberately isolated from the accelerator implementations. CUDA
     # continues to use cuDSS and ROCm continues to use the hybrid CPU-Schur/ROCm-dense path in
     # BeatEngineCoupled. Metal has no GPU LU, so it uses the CPU condensed solver with its
     # BEM operators assembled on the GPU.
     use_condensed_solver = static_condensation && bem_backend in (:cpu, :metal)
-    quadrature_selections = if use_condensed_solver
+    quadrature_selections = if use_condensed_solver || bem_backend == :rocm
         mode = lowercase(String(get(solver_options, "regular_quadrature_mode", "fixed")))
         mode in ("fixed", "wavelength") || error(
             "Unsupported regular quadrature mode: $mode. Expected fixed or wavelength.",
@@ -3075,6 +3099,7 @@ function solve_request_impl(request; event_mode=false)
         nothing
     end
     coupled_cache = nothing
+    rocm_quadrature_caches = Dict{Int,Any}()
     cache_setup_s = 0.0
     solved_count = 0
     cancelled = cancel_requested()
@@ -3116,9 +3141,6 @@ function solve_request_impl(request; event_mode=false)
         end
         cache_setup_s = (time_ns() - cache_setup_started) / 1.0e9
     end
-    rom_requested = any(
-        String(output["quantity"]) in SPEAKER_ROM_QUANTITIES for output in outputs
-    )
     radiation_requested = any(String(output["quantity"]) == "interface_radiated_pressure" for output in outputs)
     # Keep source IDs stable when an excitation subset leaves an exterior source
     # silent, or its motion projection happens to be zero.
@@ -3164,6 +3186,25 @@ function solve_request_impl(request; event_mode=false)
             frequency_hz = FloatType(frequency_value)
             println(stderr, "Coupled $(precision_name)/$(bem_backend): assembling $(frequency_hz) Hz")
             assembly_started = time_ns()
+            selected_quadrature_order = quadrature_selections === nothing ? quadrature_order :
+                                        quadrature_selections[frequency_index].order
+            selected_coupled_cache = coupled_cache
+            if bem_backend == :rocm && coupled_cache !== nothing && selected_quadrature_order != quadrature_order
+                selected_cache = get!(rocm_quadrature_caches, selected_quadrature_order) do
+                    BeatEngineCore.build_rocm_quadrature_cache(bem_mesh, coupled_cache.p1, coupled_cache.dp0,
+                        triangle_rule(FloatType, selected_quadrature_order); singular_order, symmetry_mode)
+                end
+                # FEM, interface, singular and sparse-block buffers are independent
+                # of the regular rule and remain owned by the original cache.
+                selected_coupled_cache = merge(coupled_cache, (
+                    rule=selected_cache.rule,
+                    device_cache=selected_cache.device_cache,
+                    identity_p1_p1=selected_cache.identity[1],
+                    identity_p1_dp0=selected_cache.identity[2],
+                    device_identity_cache=selected_cache.device_identity_cache,
+                    field_cache=selected_cache.field_cache,
+                ))
+            end
             coupled_system = if use_condensed_solver
                 build_condensed_coupled_system(
                     fem_mesh,
@@ -3200,14 +3241,15 @@ function solve_request_impl(request; event_mode=false)
                     frequency_hz,
                     sound_speed,
                     density;
-                    quadrature_order=quadrature_order,
+                    quadrature_order=selected_quadrature_order,
                     singular_order=singular_order,
-                    cache=coupled_cache,
+                    cache=selected_coupled_cache,
                     validation_diagnostics=validation_diagnostics,
                     retain_interface_radiation=radiation_requested,
                     bem_backend=bem_backend,
                     symmetry_mode=symmetry_mode,
                     static_condensation=static_condensation,
+                    transducer_condensation=rocm_transducer_condensation,
                     coupled_bem_assembly=coupled_bem_assembly,
                     coupled_bem_image_fusion=coupled_bem_image_fusion,
                     coupled_bem_max_registers=coupled_bem_max_registers,
@@ -3659,6 +3701,9 @@ function solve_request_impl(request; event_mode=false)
                 "coupled_bem_image_fusion" => hasproperty(coupled_system, :coupled_bem_image_fusion) && coupled_system.coupled_bem_image_fusion,
                 "coupled_bem_max_registers" => hasproperty(coupled_system, :coupled_bem_max_registers) ? coupled_system.coupled_bem_max_registers : 0,
                 "linear_backend" => String(coupled_system.linear_backend),
+                "rocm_transducer_condensation" => bem_backend == :rocm ? coupled_system.transducer_condensation : nothing,
+                "rocm_dense_factorization_precision" => coupled_system.linear_backend == :rocm ?
+                    (eltype(coupled_system.factorization) == ComplexF64 ? "float64" : "float32") : nothing,
                 "fem_symbolic_analysis_reused" => !isnothing(coupled_system.condensation) &&
                     hasproperty(coupled_system.condensation, :analysis_reused) &&
                     coupled_system.condensation.analysis_reused,
@@ -3695,6 +3740,9 @@ function solve_request_impl(request; event_mode=false)
                                                            coupled_system.optimization_fallback_reasons : String[],
                 "fem_matrix_precision" => hasproperty(coupled_system, :fem_scalar_type) ?
                                           lowercase(string(coupled_system.fem_scalar_type)) : nothing,
+                "regular_quadrature_mode" => quadrature_selections === nothing ? "fixed" :
+                                             quadrature_selections[frequency_index].mode,
+                "regular_quadrature_order" => selected_quadrature_order,
                 "bounded_region_count" => length(bounded_regions),
                 "interface_count" => length(interfaces),
                 "transducer_count" => length(transducers),
@@ -3869,6 +3917,9 @@ function solve_request_impl(request; event_mode=false)
             release_coupled_system!(coupled_system)
         end
         metal_field_points === nothing || BeatEngineCore.release_metal_field_output_points!(metal_field_points)
+        for cache in values(rocm_quadrature_caches)
+            BeatEngineCore.release_rocm_quadrature_cache!(cache)
+        end
         if coupled_cache !== nothing
             use_condensed_solver ? release_condensed_coupled_cache!(coupled_cache) :
             release_coupled_cache!(coupled_cache)
@@ -4081,8 +4132,6 @@ function retained_bem_field_evaluation_cache(
 end
 
 function evaluate_bem_field_request(request, request_path)
-    get(request, "phasor_convention", NEGATIVE_TIME_PHASOR) == POSITIVE_TIME_PHASOR && get(request, "bem_backend", "cpu") == "rocm" &&
-        error("Positive-time ROCm fields require hardware qualification; use CPU or CUDA.")
     return with_phasor_convention(get(request, "phasor_convention", NEGATIVE_TIME_PHASOR)) do
         evaluate_bem_field_request_impl(request, request_path)
     end
@@ -4098,7 +4147,7 @@ function evaluate_bem_field_request_impl(request, request_path)
     quantity = String(get(request, "field_quantity", "pressure"))
     quantity in ("pressure", "pressure_gradient_v1") || error("Unsupported BEM field quantity: $quantity")
     if quantity == "pressure_gradient_v1"
-        backend in (:cpu, :cuda) || error("BEM pressure gradients require CPU or CUDA.")
+        backend in (:cpu, :cuda, :rocm) || error("BEM pressure gradients require CPU, CUDA, or ROCm.")
         Int(get(request, "quadrature_order", 4)) == 4 || error("BEM gradients require fourth-order quadrature.")
     end
     retained = retained_bem_field_evaluation_cache(request, request_path, FloatType, backend, symmetry)
@@ -4143,7 +4192,9 @@ function evaluate_bem_field_request_impl(request, request_path)
     field_cache = retained.field_cache
     wavenumber = FloatType(2pi) * frequency_hz / sound_speed
     if quantity == "pressure_gradient_v1"
-        evaluator = backend == :cpu ? BeatEngineCore.evaluate_galerkin_field_gradient_cpu : BeatEngineCore.evaluate_galerkin_field_gradient_cuda
+        evaluator = backend == :cpu ? BeatEngineCore.evaluate_galerkin_field_gradient_cpu :
+            backend == :rocm ? BeatEngineCore.evaluate_galerkin_field_gradient_rocm :
+            BeatEngineCore.evaluate_galerkin_field_gradient_cuda
         return evaluator(points, mesh, pressure, normal_derivative, wavenumber, field_cache; symmetry_mode=symmetry)
     end
     # The retained sources hold the base rule. A frequency with large panels
@@ -4204,7 +4255,7 @@ include(joinpath(@__DIR__, "worker_backend_availability.jl"))
 
 function run_worker()
     ready = worker_ready(worker_backend_availability())
-    ready["field_quantities"] = Dict("cpu" => ["pressure", "pressure_gradient_v1"], "cuda" => ["pressure", "pressure_gradient_v1"])
+    ready["field_quantities"] = Dict(backend => ["pressure", "pressure_gradient_v1"] for backend in ("cpu", "cuda", "rocm"))
     ready["compiled_worker"] = COMPILED_WORKER_LOAD[]
     ready["worker_cleanup_policies"] = ["aggressive", "cuda_reuse"]
     push!(ready["operations"], "reclaim")

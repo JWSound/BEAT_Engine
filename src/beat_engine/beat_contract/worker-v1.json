@@ -6,7 +6,7 @@
   },
   "engine": {
     "name": "BEAT Engine",
-    "version": "0.7.0"
+    "version": "0.8.0"
   },
   "contracts": {
     "system_request": [
@@ -40,7 +40,7 @@
     "interior_fem",
     "coupled_fem_bem_lem"
   ],
-  "deploy_solver_backends": ["cpu", "cuda", "metal"],
+  "deploy_solver_backends": ["cpu", "cuda", "metal", "rocm"],
   "exterior_source_profiles": [
     "uniform_normal",
     "rigid_translation"
