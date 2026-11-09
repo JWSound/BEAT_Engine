@@ -85,15 +85,19 @@ def test_selects_current_formats_and_accepts_future_advertised_versions(ready, p
     assert negotiate_submission(ready, field, "bem_field") == {"protocol_version": 1, "field_array_schema_version": 1}
 
 
-def test_gradient_field_requires_explicit_backend_capability(ready):
+@pytest.mark.parametrize("backend", ["cpu", "cuda", "rocm"])
+def test_gradient_field_requires_explicit_backend_capability(ready, backend):
+    ready["backends"][backend] = {"available": True}
     field = {
         "binary_array_schema_version": 1,
-        "bem_backend": "cpu",
+        "bem_backend": backend,
         "precision": "float64",
         "field_quantity": "pressure_gradient_v1",
     }
     with pytest.raises(WorkerCompatibilityError, match="field quantity"):
         negotiate_submission(ready, field, "bem_field")
+    ready["field_quantities"] = {backend: ["pressure", "pressure_gradient_v1"]}
+    assert negotiate_submission(ready, field, "bem_field")["field_array_schema_version"] == 1
 
 
 @pytest.mark.parametrize("capabilities", [None, [], "pressure_gradient_v1", {"cpu": "pressure_gradient_v1"}])
