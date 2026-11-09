@@ -1007,7 +1007,13 @@ function solve_request_impl(request)
     cpu_assembly_cache_by_order = Dict{Int,Any}()
     # Near corrections replace the regular rule pair by pair, so a large-panel
     # correction on top of them would count those pairs twice.
-    large_panel_rules = beat_backend in (:cpu, :metal) && !near_enabled ? LargePanelRules(mesh, singular_order) : nothing
+    # Every path reports large panels; only CPU and Metal without near
+    # corrections integrate them.
+    large_panel_mesh_rules = LargePanelRules(mesh, singular_order)
+    large_panel_unapplied = !(beat_backend in (:cpu, :metal)) ? LARGE_PANEL_UNSUPPORTED_BACKEND :
+                            near_enabled ? LARGE_PANEL_NEAR_CORRECTION : ""
+    large_panel_rules = isempty(large_panel_unapplied) ? large_panel_mesh_rules : nothing
+    large_panel_warned = false
     if beat_backend == :cuda
         emit_event("status"; message="Initializing BEAT Engine using CUDA...")
         device_cache = build_cuda_regular_assembly_cache(mesh, rule)
@@ -1206,6 +1212,12 @@ function solve_request_impl(request)
         selected_rocm_identity_cache = rocm_solve_identity_cache
         selected_cpu_assembly_cache = nothing
         large_panels = large_panel_plan(large_panel_rules, k)
+        large_panel_status = large_panel_report(large_panel_mesh_rules, k, large_panels, large_panel_unapplied)
+        large_panel_message = large_panel_warning(large_panel_status, freq)
+        if large_panel_message !== nothing && !large_panel_warned
+            emit_event("status"; message=large_panel_message, level="warning")
+            large_panel_warned = true
+        end
         if beat_backend == :rocm && quadrature_selection.order != base_regular_order
             selected_cache = get!(rocm_quadrature_caches, quadrature_selection.order) do
                 BeatEngineCore.build_rocm_quadrature_cache(mesh, p1_space, dp0_space, selected_rule;
@@ -1515,8 +1527,7 @@ function solve_request_impl(request)
                     "p1_dof_count" => p1_space.global_dof_count,
                     "regular_quadrature_mode" => regular_quadrature_mode,
                     "regular_quadrature_order" => quadrature_selection.order,
-                    "large_panel_count" => large_panel_summary(large_panels).panels,
-                    "large_panel_max_order" => large_panel_summary(large_panels).max_order,
+                    large_panel_diagnostics(large_panel_status)...,
                     "cpu_regular_kernel" => beat_backend == :cpu ? String(cpu_regular_kernel) : nothing,
                     "cpu_singular_kernel" => assembly_payload.kind === :fused && beat_backend == :cpu ?
                         String(assembly_payload.system.singular_kernel) : nothing,

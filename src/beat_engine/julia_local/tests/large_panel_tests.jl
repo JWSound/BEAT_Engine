@@ -455,12 +455,17 @@ end
                 "distance" => 6.0, "quadrature_order" => 4, "singular_order" => 4,
                 "regular_quadrature_mode" => "fixed", "sound_speed" => 343.0),
         )))
+        # The last solve's warning events, read after each solve below.
+        warnings = Any[]
+        record_warnings!(events) = append!(empty!(warnings),
+            [event for event in events if event["type"] == "status" && get(event, "level", "") == "warning"])
         solve_compiled() = begin
             outcome, events = _large_panel_capture(json) do
                 driver.solve_request(compiled; event_mode=true)
             end
             @test !outcome.cancelled && outcome.solved_count == 1
             @test last(events)["type"] == "result"
+            record_warnings!(events)
             only(event["result"] for event in events if event["type"] == "result")
         end
         solve_source() = begin
@@ -468,20 +473,31 @@ end
                 LargePanelSourceDriver.solve_request(source)
             end
             @test last(events)["type"] == "completed"
+            record_warnings!(events)
             only(event["result"] for event in events if event["type"] == "result")
         end
+        max_kh = k * maximum(LargePanelRules(mesh).max_edges)
         withenv("BLAB_BEAT_FUSED_BM" => "1", "BLAB_BEAT_DENSE_SOLVE" => "lu") do
             for (solve, values) in (
                 (solve_compiled, result -> result["quantities"]),
                 (solve_source, result -> [result[key] for key in ("horizontal_pressure", "vertical_pressure", "impedance")]),
             )
                 planned = withenv(solve, "BLAB_BEAT_LARGE_PANEL_KH" => "6")
-                @test planned["diagnostics"]["large_panel_count"] > 0
+                @test planned["diagnostics"]["large_panel_count"] == count(>(0), plan.panel_orders)
+                @test planned["diagnostics"]["large_panel_max_order"] == maximum(plan.panel_orders)
+                @test planned["diagnostics"]["large_panel_correction"] == "applied"
+                @test planned["diagnostics"]["large_panel_max_kh"] ≈ max_kh rtol = 1.0e-5
+                @test isempty(warnings)
                 disabled = withenv(solve, "BLAB_BEAT_LARGE_PANEL_KH" => "0")
                 @test disabled["diagnostics"]["large_panel_count"] == 0
+                @test disabled["diagnostics"]["large_panel_correction"] == "disabled"
+                @test disabled["diagnostics"]["large_panel_max_kh"] ≈ max_kh rtol = 1.0e-5
+                @test isempty(warnings)
                 # Same frequency and physics, with every panel below the limit.
-                below = withenv(solve, "BLAB_BEAT_LARGE_PANEL_KH" => string(2k * maximum(LargePanelRules(mesh).max_edges)))
+                below = withenv(solve, "BLAB_BEAT_LARGE_PANEL_KH" => string(2max_kh))
                 @test below["diagnostics"]["large_panel_count"] == 0
+                @test below["diagnostics"]["large_panel_correction"] == "not_needed"
+                @test isempty(warnings)
                 @test values(disabled) == values(below)
                 @test values(planned) != values(disabled)
             end
@@ -489,7 +505,79 @@ end
             source["config"]["near_correction_order"] = 4
             near = withenv(solve_source, "BLAB_BEAT_LARGE_PANEL_KH" => "6")
             @test near["diagnostics"]["near_correction_enabled"]
-            @test near["diagnostics"]["large_panel_count"] == 0
+            @test near["diagnostics"]["large_panel_count"] == count(>(0), plan.panel_orders)
+            @test near["diagnostics"]["large_panel_max_order"] == 0
+            @test near["diagnostics"]["large_panel_correction"] == "near_correction"
+            @test length(warnings) == 1
+            @test occursin("near corrections", only(warnings)["message"])
         end
     end
+end
+
+@testset "Large-panel report and warning on every path" begin
+    mesh, h = _large_panel_pair_mesh(Float64)
+    rules = LargePanelRules(mesh, 4)
+    limit = _LP.beat_large_panel_kh_limit()
+    k = 16.0 / h
+    plan = large_panel_plan(rules, k)
+    applied = large_panel_report(rules, k, plan, LARGE_PANEL_UNSUPPORTED_BACKEND)
+    @test applied.correction == "applied"
+    @test applied.panels == count(>(0), plan.panel_orders) > 0
+    @test applied.max_order == maximum(plan.panel_orders)
+    @test applied.max_kh ≈ k * maximum(rules.max_edges)
+    @test large_panel_warning(applied, 1000.0) === nothing
+    # The selection the drivers make for CUDA, ROCm, coupled and Deploy solves:
+    # no plan, the same panels counted, and a warning naming why.
+    for (reason, phrase) in ((LARGE_PANEL_UNSUPPORTED_BACKEND, "backend or solve path"),
+                             (LARGE_PANEL_NEAR_CORRECTION, "near corrections"))
+        skipped = large_panel_report(rules, k, nothing, reason)
+        @test skipped.correction == reason
+        @test skipped.panels == applied.panels
+        @test skipped.max_order == 0
+        @test skipped.max_kh == applied.max_kh
+        message = large_panel_warning(skipped, 1000.0)
+        @test occursin(phrase, message) && occursin("1000.0 Hz", message)
+        @test large_panel_diagnostics(skipped)["large_panel_correction"] == reason
+    end
+    below = large_panel_report(rules, 0.5 * limit / h, nothing, LARGE_PANEL_UNSUPPORTED_BACKEND)
+    @test below.correction == "not_needed" && below.panels == 0
+    @test large_panel_warning(below, 1000.0) === nothing
+    withenv("BLAB_BEAT_LARGE_PANEL_KH" => "0") do
+        disabled = large_panel_report(rules, k, nothing, LARGE_PANEL_UNSUPPORTED_BACKEND)
+        @test disabled.correction == "disabled" && disabled.panels == 0
+        @test large_panel_warning(disabled, 1000.0) === nothing
+    end
+    @test_throws ArgumentError _LP._large_panel_require_singular_order(plan, 6)
+    @test _LP._large_panel_require_singular_order(plan, 4) === nothing
+    @test _LP._large_panel_require_singular_order(nothing, 6) === nothing
+
+    # The compiled driver warns once per request, as an event or on stderr.
+    driver = _LargePanelCompiledDriver
+    skipped = large_panel_report(rules, k, nothing, LARGE_PANEL_UNSUPPORTED_BACKEND)
+    warned, events = _large_panel_capture(driver.JSON) do
+        first = driver.emit_large_panel_warning(skipped, 1000.0, false, true)
+        second = driver.emit_large_panel_warning(skipped, 2000.0, first, true)
+        quiet = driver.emit_large_panel_warning(applied, 1000.0, false, true)
+        (first, second, quiet)
+    end
+    @test warned == (true, true, false)
+    @test length(events) == 1
+    @test only(events)["type"] == "status" && only(events)["level"] == "warning"
+end
+
+@testset "Assembly refuses a plan built for another singular order" begin
+    mesh = _large_panel_sphere(Float64; level=0)
+    p1, dp0 = build_p1_space(mesh), build_dp0_space(mesh)
+    rule = triangle_rule(Float64, 4)
+    k = _large_panel_mixed_k(mesh)
+    plan = large_panel_plan(LargePanelRules(mesh, 4), k)
+    @test_throws ArgumentError assemble_regular_galerkin_operators_cpu(
+        mesh, p1, dp0, k, rule; skip_singular=false, singular_order=6, large_panels=plan,
+    )
+    q = ComplexF64[1.0 + 0.0im for _ in 1:dp0.global_dof_count, _ in 1:1]
+    @test_throws ArgumentError assemble_burton_miller_neumann_system_cpu(
+        mesh, p1, dp0, q, k, rule; singular_order=6, large_panels=plan,
+        identity_p1_p1=assemble_l2_identity_matrix(mesh, p1, dp0, rule, :p1, :p1),
+        identity_p1_dp0=assemble_l2_identity_matrix(mesh, p1, dp0, rule, :p1, :dp0),
+    )
 end

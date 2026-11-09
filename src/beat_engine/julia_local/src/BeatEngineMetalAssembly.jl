@@ -32,6 +32,7 @@ function _assemble_regular_galerkin_operators_metal_native(
     large_panels=nothing,
 ) where {T<:AbstractFloat}
     large_panels === nothing || !skip_singular || error("Large-panel integration corrects the singular pass; it cannot skip it.")
+    _large_panel_require_singular_order(large_panels, singular_order)
     large_panels === nothing || (near_correction_cache === nothing && image_near_correction_cache === nothing) ||
         error("Large-panel integration and near corrections would both replace the regular rule on the same pairs.")
     normalized_mode = normalized_symmetry_mode(symmetry_mode)

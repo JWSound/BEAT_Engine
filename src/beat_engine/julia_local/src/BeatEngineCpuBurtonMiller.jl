@@ -295,6 +295,7 @@ function assemble_burton_miller_neumann_system_cpu(
     large_panels=nothing,
 ) where {T<:AbstractFloat}
     large_panels === nothing || !skip_singular || error("Large-panel integration corrects the singular pass; it cannot skip it.")
+    _large_panel_require_singular_order(large_panels, singular_order)
     regular_kernel = _beat_cpu_validated_regular_kernel(regular_kernel)
     singular_kernel = _beat_cpu_validated_regular_kernel(singular_kernel)
     k = outgoing_wavenumber(k)

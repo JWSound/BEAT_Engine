@@ -24,6 +24,14 @@ include(joinpath(@__DIR__, "large_panel_test_helpers.jl"))
                 mesh, p1, dp0, q, k, rule; identity_p1_p1, identity_p1_dp0, singular_order=4, singular_cache,
                 symmetry_mode=symmetry, large_panels=plan,
             )
+            # The tolerance below must be far smaller than the correction
+            # itself, or a Metal path that dropped it would still pass.
+            unplanned = assemble_burton_miller_neumann_system_cpu(
+                mesh, p1, dp0, q, k, rule; identity_p1_p1, identity_p1_dp0, singular_order=4, singular_cache,
+                symmetry_mode=symmetry,
+            )
+            @test norm(reference.matrix - unplanned.matrix) > 20 * 5.0f-4 * norm(reference.matrix)
+            @test norm(reference.rhs - unplanned.rhs) > 20 * 5.0f-4 * norm(reference.rhs)
             cache = build_metal_regular_assembly_cache(mesh, p1, dp0, rule; singular_order=4, symmetry_mode=symmetry)
             for device_drives in (false, true)
                 drives = device_drives ? MtlArray(q) : q
@@ -53,8 +61,14 @@ include(joinpath(@__DIR__, "large_panel_test_helpers.jl"))
                     mesh, p1, dp0, k, rule; skip_singular=false, singular_order=4, singular_cache,
                     symmetry_mode=symmetry, large_panels=plan,
                 )
+                unplanned_operators = assemble_regular_galerkin_operators_cpu(
+                    mesh, p1, dp0, k, rule; skip_singular=false, singular_order=4, singular_cache,
+                    symmetry_mode=symmetry,
+                )
                 for name in (:single_layer, :double_layer, :adjoint_double_layer, :hypersingular)
                     @test norm(getfield(operators, name) - getfield(expected, name)) <= 5.0f-4 * norm(getfield(expected, name))
+                    @test norm(getfield(expected, name) - getfield(unplanned_operators, name)) >
+                          20 * 5.0f-4 * norm(getfield(expected, name))
                 end
             finally
                 operators === nothing || release_operator_storage!(operators)

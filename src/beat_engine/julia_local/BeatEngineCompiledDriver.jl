@@ -1032,6 +1032,24 @@ function exterior_output_fields!(fields, output_id, points_by_output, mesh, pres
     return fields[output_id]
 end
 
+"""
+Emit `large_panel_warning` for this frequency unless the request already has,
+as a status event in event mode and on stderr otherwise, where stdout carries
+only results. Returns whether the request has warned.
+"""
+function emit_large_panel_warning(report, frequency_hz, warned::Bool, event_mode::Bool)
+    warned && return true
+    message = large_panel_warning(report, frequency_hz)
+    message === nothing && return false
+    if event_mode
+        println(JSON.json(Dict("type" => "status", "level" => "warning", "message" => message)))
+        flush(stdout)
+    else
+        println(stderr, "Warning: ", message)
+    end
+    return true
+end
+
 function solve_exterior_request(request, system, unbounded_region; event_mode=false)
     meshes = system["meshes"]
     boundaries = system["boundaries"]
@@ -1182,7 +1200,10 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     identity_cache = Dict{Int,Any}(base_order => (identity_p1_p1, identity_p1_dp0))
     cpu_field_cache_by_order = Dict{Int,Any}(base_order => cpu_field_cache)
     cpu_assembly_cache_by_order = Dict{Int,Any}()
-    large_panel_rules = backend in (:cpu, :metal) ? LargePanelRules(mesh, singular_order) : nothing
+    # Every backend reports large panels; only CPU and Metal integrate them.
+    large_panel_mesh_rules = LargePanelRules(mesh, singular_order)
+    large_panel_rules = backend in (:cpu, :metal) ? large_panel_mesh_rules : nothing
+    large_panel_warned = false
     cancel_path = get(request, "cancel_path", nothing)
     cancel_requested() = cancel_path !== nothing && isfile(String(cancel_path))
     solved_count = 0
@@ -1278,6 +1299,10 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 )
             end : (identity_p1_p1, identity_p1_dp0)
             large_panels = large_panel_plan(large_panel_rules, wavenumber)
+            large_panel_status = large_panel_report(
+                large_panel_mesh_rules, wavenumber, large_panels, LARGE_PANEL_UNSUPPORTED_BACKEND,
+            )
+            large_panel_warned = emit_large_panel_warning(large_panel_status, frequency_hz, large_panel_warned, event_mode)
             selected_field_cache = if large_panels !== nothing
                 planned_field_cache = build_field_evaluation_cache(mesh, rule; symmetry_mode=symmetry_mode, large_panels=large_panels)
                 backend == :metal ? (current_panel_field_cache = build_metal_field_evaluation_cache(planned_field_cache)) : planned_field_cache
@@ -1546,8 +1571,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 "interface_count" => 0,
                 "regular_quadrature_mode" => selection.mode,
                 "regular_quadrature_order" => selection.order,
-                "large_panel_count" => large_panel_summary(large_panels).panels,
-                "large_panel_max_order" => large_panel_summary(large_panels).max_order,
+                large_panel_diagnostics(large_panel_status)...,
                 "blas_threads" => cpu_blas_threads,
                 "timings" => Dict(
                     "assembly_s" => assembly_s,
@@ -3174,6 +3198,9 @@ function solve_request_impl(request; event_mode=false)
     )
     metal_field_points = nothing
     pipeline_candidate = use_condensed_solver && coupled_cache !== nothing && length(pipeline_frequencies) > 1
+    # Coupled solves keep the fixed rules; report and warn about large panels.
+    large_panel_mesh_rules = LargePanelRules(bem_mesh, singular_order)
+    large_panel_warned = false
     try
         if metal_field_batch !== nothing
             metal_field_points = BeatEngineCore.prepare_metal_field_output_points(metal_field_batch.point_sets)
@@ -3185,6 +3212,10 @@ function solve_request_impl(request; event_mode=false)
             end
             frequency_hz = FloatType(frequency_value)
             println(stderr, "Coupled $(precision_name)/$(bem_backend): assembling $(frequency_hz) Hz")
+            large_panel_status = large_panel_report(
+                large_panel_mesh_rules, FloatType(2pi) * frequency_hz / sound_speed, nothing, LARGE_PANEL_UNSUPPORTED_BACKEND,
+            )
+            large_panel_warned = emit_large_panel_warning(large_panel_status, frequency_hz, large_panel_warned, event_mode)
             assembly_started = time_ns()
             selected_quadrature_order = quadrature_selections === nothing ? quadrature_order :
                                         quadrature_selections[frequency_index].order
@@ -3691,6 +3722,7 @@ function solve_request_impl(request; event_mode=false)
                 rank_experiment_config,
             )
             diagnostics = Dict{String,Any}(
+                large_panel_diagnostics(large_panel_status)...,
                 "precision" => precision_name,
                 "bem_backend" => String(bem_backend),
                 "interface_radiation_boundary_reconstruction_relative_error" => radiation_requested ?

@@ -69,6 +69,22 @@ field evaluation of pressure. These stay on the fixed rules:
   pairs twice.
 - Pressure gradients from retained fields.
 
+## Diagnostics
+
+Every exterior, coupled and Deploy result reports, per frequency:
+
+| Field | Meaning |
+|---|---|
+| `large_panel_correction` | `applied`; `not_needed` (no panel above the limit); `disabled` (limit set to `0`); `unsupported_backend` (CUDA, ROCm, the BEM half of a coupled solve); `near_correction` (near corrections are on, which includes every Deploy solve) |
+| `large_panel_count` | panels above the limit, corrected or not |
+| `large_panel_max_order` | the largest rule order used, `0` when the correction did not run |
+| `large_panel_max_kh` | the mesh's largest `k * h` at this frequency |
+
+When panels exceed the limit and the correction does not run, the request emits
+one warning, at the first such frequency: a `status` event with
+`level: "warning"`, or a line on stderr for a compiled request outside event
+mode.
+
 ## Close panels
 
 This rule is sized for phase, not for distance. Two panels that nearly touch

@@ -639,6 +639,7 @@ function assemble_burton_miller_neumann_system_metal(
 ) where {T<:AbstractFloat}
     _require_metal!()
     large_panels === nothing || !skip_singular || error("Large-panel integration corrects the singular pass; it cannot skip it.")
+    _large_panel_require_singular_order(large_panels, singular_order)
     # The kernels combine -D + (i/k) H and -S - (i/k) K' with this k, so the
     # signed outgoing wavenumber carries the convention into the coupling too.
     k = outgoing_wavenumber(k)

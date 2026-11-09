@@ -39,7 +39,7 @@ end
 
 beat_large_panel_kh_limit() = _large_panel_env("BLAB_BEAT_LARGE_PANEL_KH", 6.0)
 
-# Gauss needs about two points per radian of phase range. One more keeps every
+# Gauss needs about one point per two radians of phase range. One more keeps every
 # block within 4e-4 of partitioned panels up to k*h = 40; see docs/Large Panels.md.
 large_panel_regular_order(kh::Float64) = min(BEAT_LARGE_PANEL_MAX_ORDER, ceil(Int, kh / 2) + 1)
 # One more order holds touching pairs to the same 1e-3; cap the Duffy rule's growth.
@@ -118,6 +118,76 @@ function large_panel_summary(plan)
         max_kh=plan.k * maximum(plan.rules.max_edges),
         max_order=maximum(plan.panel_orders),
     )
+end
+
+# Why a solve path left the correction out, as `large_panel_report` reports it.
+const LARGE_PANEL_UNSUPPORTED_BACKEND = "unsupported_backend"
+const LARGE_PANEL_NEAR_CORRECTION = "near_correction"
+
+"""
+    large_panel_report(rules, k, plan, unapplied)
+
+One frequency's large-panel diagnostics, whether or not the correction ran.
+`rules` is built for every solve path. `plan` is what the assembly used, or
+`nothing`; `unapplied` names why a path without the correction leaves it out
+(`LARGE_PANEL_UNSUPPORTED_BACKEND` or `LARGE_PANEL_NEAR_CORRECTION`), and is
+ignored where the correction runs.
+
+`correction` is `applied`, `not_needed` (no panel above the limit), `disabled`
+(limit set to 0), or `unapplied`. `panels` counts panels above the limit,
+corrected or not; `max_order` is the largest rule order used, 0 when none was.
+"""
+function large_panel_report(rules::LargePanelRules, k::Real, plan, unapplied::String)
+    wavenumber = abs(Float64(k))
+    limit = beat_large_panel_kh_limit()
+    max_kh = wavenumber * maximum(rules.max_edges; init=0.0)
+    panels = limit > 0 ? count(edge -> wavenumber * edge > limit, rules.max_edges) : 0
+    correction = plan !== nothing ? "applied" :
+                 limit <= 0 ? "disabled" :
+                 panels == 0 ? "not_needed" : unapplied
+    return (
+        panels=panels,
+        max_kh=max_kh,
+        max_order=plan === nothing ? 0 : maximum(plan.panel_orders),
+        correction=correction,
+        limit=limit,
+    )
+end
+
+"""The result diagnostics for one `large_panel_report`."""
+large_panel_diagnostics(report) = Dict{String,Any}(
+    "large_panel_count" => report.panels,
+    "large_panel_max_order" => report.max_order,
+    "large_panel_max_kh" => report.max_kh,
+    "large_panel_correction" => report.correction,
+)
+
+"""
+A warning when panels above the limit ran on the fixed rules, else `nothing`.
+Drivers emit it once per request, at the first such frequency.
+"""
+function large_panel_warning(report, frequency_hz::Real)
+    report.correction in (LARGE_PANEL_UNSUPPORTED_BACKEND, LARGE_PANEL_NEAR_CORRECTION) || return nothing
+    reason = report.correction == LARGE_PANEL_NEAR_CORRECTION ?
+        "near corrections are enabled and replace the same pairs" :
+        "this backend or solve path does not have it; CPU and Metal exterior solves do"
+    return string(
+        "Large-panel integration not applied: ", reason, ". At ", round(Float64(frequency_hz); digits=1), " Hz, ",
+        report.panels, " panels exceed k*h = ", report.limit, " (largest ", round(report.max_kh; digits=2),
+        "), so results at this and higher frequencies may be inaccurate. See docs/Large Panels.md.",
+    )
+end
+
+# The correction subtracts the base pass's Duffy rule by the order the plan was
+# built with, and floors each panel's Duffy order there: both must be the
+# assembly's own `singular_order`.
+_large_panel_require_singular_order(::Nothing, singular_order::Int) = nothing
+function _large_panel_require_singular_order(plan::LargePanelPlan, singular_order::Int)
+    plan.rules.singular_order == singular_order || throw(ArgumentError(
+        "LargePanelRules was built for singular_order $(plan.rules.singular_order), but the assembly uses " *
+        "$(singular_order); build it with LargePanelRules(mesh, $(singular_order)).",
+    ))
+    return nothing
 end
 
 _large_panel_rule(::Nothing, base_rule, element_index) = base_rule
