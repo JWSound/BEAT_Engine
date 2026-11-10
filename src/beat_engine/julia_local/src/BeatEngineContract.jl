@@ -9,6 +9,9 @@ using .BeatEngineProvenance
 export validate_system_request, worker_ready, validate_worker_submission
 
 # The same engine-owned schema is loaded by the standalone Python validator.
+# JSON inputs must invalidate compiled bundles just like included Julia sources.
+include_dependency(joinpath(@__DIR__, "..", "..", "beat_contract", "system-v1.schema.json"))
+include_dependency(joinpath(@__DIR__, "..", "..", "beat_contract", "worker-v1.json"))
 const SCHEMA = JSON.parsefile(joinpath(@__DIR__, "..", "..", "beat_contract", "system-v1.schema.json"))
 const WORKER = JSON.parsefile(joinpath(@__DIR__, "..", "..", "beat_contract", "worker-v1.json"))
 
