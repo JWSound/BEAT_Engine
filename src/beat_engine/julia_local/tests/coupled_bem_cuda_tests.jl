@@ -16,7 +16,8 @@ using .BeatEngineCore
         ipq = assemble_l2_identity_matrix(mesh,p1,dp0,rule,:p1,:dp0;symmetry_mode=symmetry)
         identity = build_cuda_burton_miller_identity_cache(ipp,ipq,T)
         prepared = (;p1,dp0,rule,symmetry_mode=symmetry,singular_cache=sc,device_cache=dc,
-            device_singular_cache=dsc,device_image_singular_cache=dic,device_identity_cache=identity)
+            device_singular_cache=dsc,device_image_singular_cache=dic,device_identity_cache=identity,
+            identity_p1_p1=sparse(ipp),identity_p1_dp0=sparse(ipq))
         for convention in (NEGATIVE_TIME_PHASOR,POSITIVE_TIME_PHASOR), k in T[.07,7,70]
             with_phasor_convention(convention) do
                 operators = assemble_regular_galerkin_operators(mesh,p1,dp0,k,rule;
@@ -39,9 +40,31 @@ using .BeatEngineCore
                     @test isapprox(Array(blocks.bem_interface_block),c*q;rtol=2f-4,atol=2f-5)
                     @test isapprox(Array(blocks.bem_motion_block),c*motion;rtol=2f-4,atol=2f-5)
                     @test isapprox(Array(blocks.bem_prescribed_rhs),-c*prescribed;rtol=2f-4,atol=2f-5)
-                    for array in (blocks.bem_lhs,blocks.bem_interface_block,blocks.bem_motion_block,blocks.bem_prescribed_rhs,dq.colptr,dq.rowval,dq.nzval)
+                    for array in (blocks.bem_lhs,blocks.bem_interface_block,blocks.bem_motion_block,blocks.bem_prescribed_rhs)
                         CUDA.unsafe_free!(array)
                     end
+                    # Compact C (flux-carrying columns only): same A, the retained columns of C, and
+                    # the same blocks; a flux outside the retained columns is refused.
+                    for active in ([1,2,3], [1,2,3,4], Int[])
+                        full = BeatEngineCore.assemble_coupled_burton_miller_cuda(mesh,prepared,k;fused=fused,max_registers=cap)
+                        compact = BeatEngineCore.assemble_coupled_burton_miller_cuda(mesh,prepared,k;fused=fused,max_registers=cap,active_columns=active)
+                        @test compact.active_columns == active && compact.dp0_count == 4
+                        # Atomic accumulation order differs between launches: compare to rounding.
+                        @test isapprox(Array(compact.a), Array(full.a); rtol=1f-6, atol=1f-7)
+                        @test isapprox(Array(compact.c)[:, 1:length(active)], Array(full.c)[:, active]; rtol=1f-6, atol=1f-7)
+                        if length(active) >= 3
+                            compact_blocks = BeatEngineCore.build_cuda_combined_bem_blocks(compact,dq,motion .* (1:4 .<= 3),prescribed .* (1:4 .<= 3))
+                            @test isapprox(Array(compact_blocks.bem_interface_block),c*q;rtol=2f-4,atol=2f-5)
+                            @test isapprox(Array(compact_blocks.bem_motion_block),c*(motion .* (1:4 .<= 3));rtol=2f-4,atol=2f-5)
+                            for array in (compact_blocks.bem_lhs,compact_blocks.bem_interface_block,compact_blocks.bem_motion_block,compact_blocks.bem_prescribed_rhs)
+                                CUDA.unsafe_free!(array)
+                            end
+                        else
+                            @test_throws ErrorException BeatEngineCore.build_cuda_combined_bem_blocks(compact,dq,motion,prescribed)
+                        end
+                        CUDA.unsafe_free!(full.a); CUDA.unsafe_free!(full.c)
+                    end
+                    foreach(CUDA.unsafe_free!, (dq.colptr,dq.rowval,dq.nzval))
                 end
             end
         end

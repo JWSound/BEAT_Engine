@@ -1,6 +1,6 @@
 # Split-precision storage and refinement for the dense condensed coupled system.
 #
-# Included inside `BeatEngineCoupledCondensed`. Under `precision=float32` the refined dense path
+# Included inside `BeatEngineCoupled` (shared by the condensed solver and the CUDA coupled path). Under `precision=float32` the refined dense path
 # (`RefinedDenseLU`) used to hold the whole system twice: once in `ComplexF64` (the refinement
 # residual) and once in `ComplexF32` (the LU factor), 24 bytes per entry. Most of the system is the
 # BEM block `bem_lhs`, which arrives in `ComplexF32` and so carries no information that a
@@ -55,6 +55,7 @@ end
 """`BLAB_COUPLED_DENSE_GMRES_IR=1|0` (default 1): continue a stalled refinement as GMRES-IR."""
 _dense_gmres_ir_enabled() = lowercase(strip(get(ENV, "BLAB_COUPLED_DENSE_GMRES_IR", "1"))) in ("1", "on", "true", "auto")
 
+const SPLIT_REFINEMENT_MAX_ITERATIONS = 10       # as DENSE_REFINEMENT_MAX_ITERATIONS
 const DENSE_GMRES_IR_RESTART = 30
 const DENSE_GMRES_IR_MAX_CYCLES = 10
 const DENSE_SPLIT_PANEL_BYTES = 256 * 1024^2     # ComplexF64 panel used by the residual product
@@ -279,6 +280,10 @@ mutable struct SplitRefinedLU
     fallback_reason::Union{Nothing,String}
     backward_error::Float64
     spill_path::Union{Nothing,String}
+    # A factor held elsewhere (the CUDA LU on the device): `device_solve(x::Matrix{ComplexF32})`
+    # returns the ComplexF64 host solution, `release_device()` frees it. `factor` is then nothing.
+    device_solve::Union{Nothing,Function}
+    release_device::Union{Nothing,Function}
 end
 
 function _split_spill(hi::Matrix{ComplexF32}, directory::AbstractString)
@@ -303,7 +308,8 @@ function SplitRefinedLU(matrix::SplitDenseMatrix)
     n = size(matrix, 1)
     spill_directory = _dense_spill_target(n)
     store, spill_path = isnothing(spill_directory) ? (matrix.hi, nothing) : _split_spill(matrix.hi, spill_directory)
-    refined = SplitRefinedLU(matrix, store, _split_opnorm_inf(store, matrix), nothing, nothing, 0, 0, nothing, NaN, spill_path)
+    refined = SplitRefinedLU(matrix, store, _split_opnorm_inf(store, matrix), nothing, nothing, 0, 0, nothing, NaN, spill_path,
+                             nothing, nothing)
     if matrix.overflow
         _split_fall_back!(refined, "an entry is outside the Float32 range")
         return refined
@@ -321,12 +327,39 @@ function SplitRefinedLU(matrix::SplitDenseMatrix)
     return refined
 end
 
+"""
+    SplitRefinedLU(matrix, device_solve, release_device)
+
+Refinement on the host around a factorization held on a device (CUDA): `matrix.hi` is the
+host copy of the matrix that was factored there (spilled to a mapped file under
+`BLAB_COUPLED_DENSE_SPILL`, so the host may hold none of it). GMRES-IR needs the factors on the
+host and is skipped; a stall falls back to a host `ComplexF64` LU.
+"""
+function SplitRefinedLU(matrix::SplitDenseMatrix, device_solve::Function, release_device::Function)
+    all(isfinite, matrix.hi) || throw(ArgumentError("dense coupled matrix has non-finite entries"))
+    spill_directory = _dense_spill_target(size(matrix, 1))
+    store, spill_path = isnothing(spill_directory) ? (matrix.hi, nothing) : _split_spill(matrix.hi, spill_directory)
+    isnothing(spill_path) || (matrix.hi = Matrix{ComplexF32}(undef, 0, 0))
+    return SplitRefinedLU(matrix, store, _split_opnorm_inf(store, matrix), nothing, nothing, 0, 0, nothing, NaN,
+                          spill_path, device_solve, release_device)
+end
+
+"""Free a device-held factor (no-op for host factors)."""
+function release_split_factor!(factorization::SplitRefinedLU)
+    release = factorization.release_device
+    factorization.release_device = nothing
+    factorization.device_solve = nothing
+    release === nothing || release()
+    return nothing
+end
+
 Base.size(factorization::SplitRefinedLU, dims...) = size(factorization.store, dims...)
 
 function _split_fall_back!(factorization::SplitRefinedLU, reason::AbstractString)
     factorization.fallback_reason = "Float32 LU with refinement fell back to a Float64 LU: " * reason
     @warn factorization.fallback_reason * " (materializes the Float64 system: 16 n² bytes)"
     factorization.factor = nothing
+    release_split_factor!(factorization)
     GC.gc()
     factorization.fallback = lu!(_split_materialize(factorization.store, factorization.matrix))
     return factorization
@@ -344,8 +377,14 @@ function _split_backward_error_ratios(factorization::SplitRefinedLU, residual, s
             max(norm(view(solution, :, column), Inf) * threshold, floatmin(Float64)) for column in axes(solution, 2)]
 end
 
-_split_precondition(factorization::SplitRefinedLU, x::AbstractVecOrMat) =
-    ComplexF64.(factorization.factor \ ComplexF32.(x))
+function _split_precondition(factorization::SplitRefinedLU, x::AbstractVecOrMat)
+    device_solve = factorization.device_solve
+    if device_solve !== nothing
+        solution = device_solve(ComplexF32.(x isa AbstractVector ? reshape(x, :, 1) : x))
+        return x isa AbstractVector ? vec(solution) : solution
+    end
+    return ComplexF64.(factorization.factor \ ComplexF32.(x))
+end
 
 """
     _split_precondition_double(factorization, x) -> ComplexF64 matrix
@@ -392,7 +431,7 @@ function _split_solve_columns(factorization::SplitRefinedLU, target::Matrix{Comp
         solution = _split_precondition(factorization, target)
         previous = Inf
         reason = nothing
-        for iteration in 0:DENSE_REFINEMENT_MAX_ITERATIONS
+        for iteration in 0:SPLIT_REFINEMENT_MAX_ITERATIONS
             ratios = _split_backward_error_ratios(factorization, _split_residual!(residual, factorization, target, solution), solution)
             ratio = maximum(ratios; init=0.0)
             if !isfinite(ratio)
@@ -403,7 +442,7 @@ function _split_solve_columns(factorization::SplitRefinedLU, target::Matrix{Comp
                 factorization.backward_error = ratio
                 return solution
             end
-            iteration == DENSE_REFINEMENT_MAX_ITERATIONS && break
+            iteration == SPLIT_REFINEMENT_MAX_ITERATIONS && break
             if ratio > previous / 2
                 reason = "refinement stalled at $(ratio)x the Float64 backward error after $iteration steps"
                 break
@@ -413,8 +452,8 @@ function _split_solve_columns(factorization::SplitRefinedLU, target::Matrix{Comp
             factorization.iterations = max(factorization.iterations, iteration + 1)
         end
         isnothing(reason) &&
-            (reason = "refinement did not reach the Float64 backward error in $(DENSE_REFINEMENT_MAX_ITERATIONS) steps")
-        if _dense_gmres_ir_enabled()
+            (reason = "refinement did not reach the Float64 backward error in $(SPLIT_REFINEMENT_MAX_ITERATIONS) steps")
+        if _dense_gmres_ir_enabled() && factorization.device_solve === nothing
             accepted, gmres_reason = _split_gmres_ir!(factorization, target, solution, residual)
             accepted && return solution
             reason *= "; GMRES-IR: " * gmres_reason

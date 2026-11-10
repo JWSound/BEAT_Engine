@@ -120,3 +120,30 @@ end
     @test factorization \ rhs ≈ dense \ rhs rtol = 1e-10
     @test_throws ArgumentError SD.SplitRefinedLU(split_build(merge(f, (; bem=fill(NaN32 + 0im, f.m, f.m)))))
 end
+
+@testset "SplitRefinedLU around a device-held factor (CUDA path, simulated on the host)" begin
+    rng = MersenneTwister(15)
+    n = 180
+    matrix = randn(rng, ComplexF32, n, n) ./ Float32(sqrt(n)) + 2.0f0I
+    rhs = randn(rng, ComplexF64, n, 3)
+    reference = lu(ComplexF64.(matrix)) \ rhs
+    for spill in ("off", "on")
+        withenv("BLAB_COUPLED_DENSE_SPILL" => spill) do
+            host = SD.SplitDenseMatrix(n, Int[], Int[])
+            copyto!(host.hi, matrix)
+            device_factor = lu(copy(matrix))                       # stands in for the CUDA LU
+            solves = Ref(0)
+            released = Ref(false)
+            factorization = SD.SplitRefinedLU(host,
+                x -> (solves[] += 1; ComplexF64.(device_factor \ x)), () -> (released[] = true; nothing))
+            @test isnothing(factorization.factor) && (factorization.spill_path !== nothing) == (spill == "on")
+            solution = factorization \ rhs
+            @test norm(solution - reference) / norm(reference) < 1e-12
+            @test factorization.backward_error <= 1 && solves[] >= 2  # initial solve + refinement
+            @test vec(factorization \ rhs[:, 2]) ≈ solution[:, 2] rtol = 1e-13
+            SD.release_split_factor!(factorization)
+            @test released[] && factorization.device_solve === nothing
+            SD.release_split_factor!(factorization)                  # idempotent
+        end
+    end
+end

@@ -711,6 +711,7 @@ function assemble_boundary_mass_matrix(
 end
 
 include("BeatEngineThermoviscous.jl")
+include("BeatEngineSplitDense.jl")
 
 function assemble_prescribed_velocity_load(
     mesh::VolumeMesh{T},
@@ -1317,7 +1318,7 @@ function prepare_coupled_cache(
         # The combined CUDA assembly adds the identities from the sparse host matrices; only the
         # four-operator paths keep dense device copies (N_B² + N_B·F entries).
         device_identity_cache = if bem_backend == :cuda
-            coupled_bem_assembly == :combined ? nothing : build_cuda_burton_miller_identity_cache(
+            coupled_bem_assembly != :operators ? nothing : build_cuda_burton_miller_identity_cache(
                 Matrix(identity_p1_p1),
                 Matrix(identity_p1_dp0),
                 T,
@@ -2756,6 +2757,10 @@ function build_coupled_system(
             coupled = promoted
         end
         rocm_dense_lu!(coupled)
+    elseif linear_backend == :cuda && T == Float32 && _cuda_dense_refinement_enabled()
+        # Float32 LU on the device as before, now refined on the host to the Float64 backward
+        # error against the assembled matrix (whose host copy may be spilled to a mapped file).
+        _cuda_refined_dense_lu!(coupled)
     else
         lu!(coupled)
     end
@@ -2822,9 +2827,57 @@ function build_coupled_system(
     )
 end
 
+"""
+`BLAB_COUPLED_DENSE_REFINEMENT` on CUDA (this fork: `auto`, i.e. on, by default): factor the dense
+coupled system in ComplexF32 on the device and refine on the host (`SplitRefinedLU`).
+"""
+_cuda_dense_refinement_enabled() =
+    lowercase(strip(get(ENV, "BLAB_COUPLED_DENSE_REFINEMENT", "auto"))) in ("auto", "1", "on", "true")
+
+function _cuda_refined_dense_lu!(coupled)
+    cuda = BeatEngineCore.cuda_module()
+    n = size(coupled, 1)
+    host = SplitDenseMatrix(n, Int[], Int[])
+    copyto!(host.hi, coupled)                       # ComplexF32 host copy before the in-place LU
+    device_factor = lu!(coupled)
+    cuda.synchronize()
+    device_solve = x -> begin
+        d_x = cuda.CuArray(x)
+        d_y = nothing
+        try
+            d_y = device_factor \ d_x
+            cuda.synchronize()
+            ComplexF64.(Array(d_y))
+        finally
+            cuda.unsafe_free!(d_x)
+            d_y === nothing || d_y === d_x || cuda.unsafe_free!(d_y)
+        end
+    end
+    release_device = () -> begin
+        cuda.unsafe_free!(device_factor.factors)
+        cuda.unsafe_free!(device_factor.ipiv)
+        nothing
+    end
+    try
+        return SplitRefinedLU(host, device_solve, release_device)
+    catch
+        release_device()
+        rethrow()
+    end
+end
+
+"""Dense solve with a device right-hand side; a host-refined factorization solves on the host."""
+function _coupled_device_solve(factorization, d_rhs, accelerator)
+    factorization isa SplitRefinedLU || return factorization \ d_rhs
+    host_solution = factorization \ Array(d_rhs)
+    return accelerator.CuArray(eltype(d_rhs).(host_solution))
+end
+
 function release_coupled_system!(system)
     _release_interface_radiation_replay!(system.interface_radiation_replay)
-    if system.linear_backend in (:cuda, :rocm)
+    if system.factorization isa SplitRefinedLU
+        release_split_factor!(system.factorization)
+    elseif system.linear_backend in (:cuda, :rocm)
         accelerator = system.linear_backend == :cuda ?
                       BeatEngineCore.cuda_module() : BeatEngineCore.amdgpu_module()
         accelerator.unsafe_free!(system.factorization.factors)
@@ -3148,7 +3201,7 @@ function solve_coupled_excitations(system, excitations)
                 d_electrical_rhs = cuda.CuArray(electrical_rhs)
                 view(d_rhs, system.electrical_range, :) .= d_electrical_rhs
             end
-            d_solution = system.factorization \ d_rhs
+            d_solution = _coupled_device_solve(system.factorization, d_rhs, cuda)
             view(d_forward, schur_rows, :) .= view(d_solution, system.gamma_range, :)
             cudss.cudss(
                 "solve_bwd_schur",
@@ -3207,7 +3260,7 @@ function solve_coupled_excitations(system, excitations)
         try
             d_solution = system.linear_backend == :rocm ?
                          solve_rocm_dense_factorization(system.factorization, d_rhs) :
-                         system.factorization \ d_rhs
+                         _coupled_device_solve(system.factorization, d_rhs, accelerator)
             accelerator.synchronize()
             Complex{T}.(Array(d_solution))
         finally

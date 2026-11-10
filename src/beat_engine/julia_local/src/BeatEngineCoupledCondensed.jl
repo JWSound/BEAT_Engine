@@ -298,7 +298,11 @@ function Base.:\(factorization::RefinedDenseLU, rhs::AbstractVecOrMat)
     return solution
 end
 
-include(joinpath(@__DIR__, "BeatEngineSplitDense.jl"))
+# Split-precision dense storage and refinement (BeatEngineSplitDense.jl) live in BeatEngineCoupled,
+# shared with the CUDA coupled path.
+using ..BeatEngineCoupled: SplitDenseMatrix, SplitRefinedLU, release_split_factor!, _dense_split_enabled,
+    _dense_spill_target, _dense_gmres_ir_enabled, _split_mul!, _split_opnorm_inf, _split_materialize,
+    _split_precondition_double
 
 """
     dense_solver_diagnostics(system) -> Dict{String,Any}
