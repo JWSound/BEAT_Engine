@@ -11,7 +11,7 @@ function _metal_coupled_flux_gather_kernel!(
     vertex_offsets,
     incident_elements,
     incident_local_indices,
-    element_dp0_dofs,
+    element_columns,
     element_count::Int32,
     chunk_start::Int32,
     chunk_count::Int32,
@@ -23,6 +23,10 @@ function _metal_coupled_flux_gather_kernel!(
     row = (index - Int32(1)) % p1_count + Int32(1)
     trial_local = (index - Int32(1)) ÷ p1_count + Int32(1)
     @inbounds trial_index = Int32(elements[chunk_start + trial_local - Int32(1)])
+    # The retained C column of this trial face: its DP0 dof, or its position among the active
+    # faces when C is compacted (0: the face carries no flux, nothing to write).
+    @inbounds dp0_column = Int32(element_columns[trial_index])
+    dp0_column == Int32(0) && return nothing
     column_base = element_count * (trial_local - Int32(1))
     value_re = zero(eltype(blocks))
     value_im = zero(eltype(blocks))
@@ -37,7 +41,6 @@ function _metal_coupled_flux_gather_kernel!(
         incident_position += Int32(1)
     end
     coefficient = Complex(value_re, value_im)
-    @inbounds dp0_column = Int32(element_dp0_dofs[trial_index])
     @inbounds rhs_operator[row + (dp0_column - Int32(1)) * p1_count] += coefficient
     return nothing
 end
@@ -56,7 +59,8 @@ function _launch_metal_coupled_pair_kernels!(
     trial_sign_z,
     trial_curl_sign_x,
     trial_curl_sign_y,
-    trial_curl_sign_z,
+    trial_curl_sign_z;
+    element_columns=cache.element_dp0_dofs,
 )
     element_count = length(cache.element_indices)
     element_count == 0 && return nothing
@@ -96,7 +100,7 @@ function _launch_metal_coupled_pair_kernels!(
             cache.vertex_offsets,
             cache.incident_elements,
             cache.incident_local_indices,
-            cache.element_dp0_dofs,
+            element_columns,
             Int32(element_count),
             Int32(chunk_start),
             Int32(chunk_count),
@@ -137,7 +141,8 @@ function _launch_metal_coupled_singular_kernels!(
     regular_cache::MetalRegularAssemblyCache,
     singular_cache::MetalSingularCorrectionCache,
     k,
-    transform::SymmetryTransform=SymmetryTransform(:identity, SVector{3,Int}(1, 1, 1), 1),
+    transform::SymmetryTransform=SymmetryTransform(:identity, SVector{3,Int}(1, 1, 1), 1);
+    compact=nothing,
 )
     pair_count = singular_cache.pair_count
     pair_count == 0 && return nothing
@@ -173,9 +178,17 @@ function _launch_metal_coupled_singular_kernels!(
                 Val(point_count), Val(part_count),
             )
         end
+        rhs_map = if compact === nothing
+            gather_tables.p1_dp0
+        else
+            compact.part_count == part_count || error(
+                "Compact coupled C maps were built for $(compact.part_count) singular parts; now $(part_count).",
+            )
+            compact.singular[objectid(singular_cache)]
+        end
         for (destination, values, block_map) in (
             (lhs, lhs_values, gather_tables.p1_p1),
-            (rhs_operator, rhs_values, gather_tables.p1_dp0),
+            (rhs_operator, rhs_values, rhs_map),
         )
             _metal_launch(
                 _metal_singular_entry_gather_kernel!,
@@ -212,20 +225,96 @@ function metal_coupled_combined_support_reason(prepared, ::Type{T}) where {T}
     return nothing
 end
 
-function build_metal_coupled_identity_cache(prepared, ::Type{T}) where {T}
+"""
+    build_metal_coupled_identity_cache(prepared, T; active_columns=nothing)
+
+The identity scatter maps of the combined assembly. With `active_columns` (sorted DP0 dofs that
+carry interface, motion or prescribed flux) C is compacted to those columns: the pair gather skips
+every other trial face, the singular write-back maps and the `p1_dp0` identity are restricted to
+them, and C costs `N × length(active_columns)` instead of `N × F`.
+"""
+function build_metal_coupled_identity_cache(prepared, ::Type{T}; active_columns=nothing) where {T}
     pp = build_metal_sparse_scatter_cache(sparse(Complex{T}.(prepared.identity_p1_p1)))
+    pq = nothing
+    compact = nothing
     try
-        pq = build_metal_sparse_scatter_cache(sparse(Complex{T}.(prepared.identity_p1_dp0)))
-        return (p1_p1=pp, p1_dp0=pq)
+        identity_pq = prepared.identity_p1_dp0
+        if active_columns !== nothing
+            compact = _metal_coupled_compact_columns(prepared, active_columns)
+            identity_pq = identity_pq[:, compact.active]
+        end
+        pq = build_metal_sparse_scatter_cache(sparse(Complex{T}.(identity_pq)))
+        return (p1_p1=pp, p1_dp0=pq, compact=compact)
     catch
         release_metal_sparse_scatter_cache!(pp)
+        pq === nothing || release_metal_sparse_scatter_cache!(pq)
+        compact === nothing || _release_metal_coupled_compact!(compact)
         rethrow()
     end
+end
+
+function _metal_coupled_compact_columns(prepared, active_columns)
+    cache = prepared.device_cache
+    dp0_count = prepared.dp0.global_dof_count
+    p1_count = prepared.p1.global_dof_count
+    active = sort!(unique!(collect(Int, active_columns)))
+    all(column -> 1 <= column <= dp0_count, active) || error("Active C columns outside 1:$(dp0_count).")
+    column_map = zeros(Int32, dp0_count)
+    column_map[active] .= Int32.(1:length(active))
+    element_columns = Int32[dof >= 1 ? column_map[dof] : Int32(0) for dof in Array(cache.element_dp0_dofs)]
+    part_count = _metal_singular_part_count()
+    singular = Dict{UInt,MetalSingularGatherMap}()
+    device_element_columns = MtlArray(element_columns)
+    try
+        for singular_cache in (prepared.device_singular_cache, cache.image_singular_caches...)
+            singular_cache.pair_count == 0 && continue
+            haskey(singular, objectid(singular_cache)) && continue
+            tables = lock(() -> _metal_singular_gather_tables(cache, singular_cache, part_count), _metal_packed_cache_lock)
+            singular[objectid(singular_cache)] = _metal_compact_gather_map(tables.p1_dp0, column_map, p1_count)
+        end
+    catch
+        Metal.unsafe_free!(device_element_columns)
+        foreach(_metal_release_singular_gather_map!, values(singular))
+        rethrow()
+    end
+    return (active=active, column_map=column_map, element_columns=device_element_columns,
+            singular=singular, part_count=part_count, dp0_count=dp0_count)
+end
+
+# Restrict a P1 x DP0 singular write-back map to the active columns, renumbering the destination
+# cells for the compacted N x |active| matrix. Contributions keep their value indices.
+function _metal_compact_gather_map(map::MetalSingularGatherMap, column_map::Vector{Int32}, p1_count::Int)
+    entries = Array(map.entry_indices)
+    offsets = Array(map.contrib_offsets)
+    contributions = Array(map.contrib_values)
+    kept_entries = Int32[]
+    kept_offsets = Int32[1]
+    kept_values = eltype(contributions)[]
+    for entry in 1:map.entry_count
+        linear = Int(entries[entry]) - 1
+        row = linear % p1_count + 1
+        column = Int(column_map[linear ÷ p1_count + 1])
+        column == 0 && continue
+        push!(kept_entries, Int32(row + (column - 1) * p1_count))
+        append!(kept_values, view(contributions, Int(offsets[entry]):(Int(offsets[entry + 1]) - 1)))
+        push!(kept_offsets, Int32(length(kept_values) + 1))
+    end
+    isempty(kept_values) && push!(kept_values, zero(eltype(contributions)))   # no empty device buffers
+    return MetalSingularGatherMap(MtlArray(isempty(kept_entries) ? Int32[0] : kept_entries),
+                                  MtlArray(kept_offsets), MtlArray(kept_values), nothing, length(kept_entries))
+end
+
+function _release_metal_coupled_compact!(compact)
+    Metal.unsafe_free!(compact.element_columns)
+    foreach(_metal_release_singular_gather_map!, values(compact.singular))
+    return nothing
 end
 
 function release_metal_coupled_identity_cache!(cache)
     release_metal_sparse_scatter_cache!(cache.p1_p1)
     release_metal_sparse_scatter_cache!(cache.p1_dp0)
+    compact = get(cache, :compact, nothing)
+    compact === nothing || _release_metal_coupled_compact!(compact)
     return nothing
 end
 
@@ -258,11 +347,14 @@ function assemble_coupled_burton_miller_metal(
             tables = _metal_fused_gather_tables(cache)
             blocks = MtlArray{Float32}(undef, _METAL_FUSED_COMPONENTS * length(cache.element_indices) * tables.chunk_size)
         end
+        compact = get(identity_cache, :compact, nothing)
+        element_columns = compact === nothing ? cache.element_dp0_dofs : compact.element_columns
+        column_count = compact === nothing ? prepared.dp0.global_dof_count : length(compact.active)
         a = Metal.zeros(Complex{T}, prepared.p1.global_dof_count, prepared.p1.global_dof_count; storage=storage)
-        c = Metal.zeros(Complex{T}, prepared.p1.global_dof_count, prepared.dp0.global_dof_count; storage=storage)
+        c = Metal.zeros(Complex{T}, prepared.p1.global_dof_count, max(column_count, 1); storage=storage)
         _launch_metal_coupled_pair_kernels!(
             a, c, blocks, cache, signed_k, cache.vertex_offsets, cache.incident_elements, Int32(0),
-            one(T), one(T), one(T), one(T), one(T), one(T),
+            one(T), one(T), one(T), one(T), one(T), one(T); element_columns=element_columns,
         )
         for (transform, image_cache) in zip(cache.image_transforms, cache.image_singular_caches)
             _launch_metal_coupled_pair_kernels!(
@@ -270,14 +362,15 @@ function assemble_coupled_burton_miller_metal(
                 T(transform.signs[1]), T(transform.signs[2]), T(transform.signs[3]),
                 T(transform.determinant * transform.signs[1]),
                 T(transform.determinant * transform.signs[2]),
-                T(transform.determinant * transform.signs[3]),
+                T(transform.determinant * transform.signs[3]);
+                element_columns=element_columns,
             )
         end
         # Singular compact blocks carry A and -C too; reuse the P1/DP0 map,
         # with one owner per cell instead of the exterior known-flux row map.
-        _launch_metal_coupled_singular_kernels!(a, c, cache, prepared.device_singular_cache, signed_k)
+        _launch_metal_coupled_singular_kernels!(a, c, cache, prepared.device_singular_cache, signed_k; compact=compact)
         for (transform, image_cache) in zip(cache.image_transforms, cache.image_singular_caches)
-            _launch_metal_coupled_singular_kernels!(a, c, cache, image_cache, signed_k, transform)
+            _launch_metal_coupled_singular_kernels!(a, c, cache, image_cache, signed_k, transform; compact=compact)
         end
         # Only the integral part is row weighted. The cached mass matrices
         # already include the orbit weights. Convert the retained -C to C here.
@@ -298,7 +391,9 @@ function assemble_coupled_burton_miller_metal(
             alpha=T(0.5) * burton_miller_coupling(k), add=true)
         Metal.synchronize()
         succeeded = true
-        return (a=a, c=c, on_gpu=true, gpu_backend=:metal, assembly_mode=:metal_coupled_combined)
+        return (a=a, c=c, on_gpu=true, gpu_backend=:metal, assembly_mode=:metal_coupled_combined,
+                active_columns=compact === nothing ? nothing : compact.active,
+                dp0_count=prepared.dp0.global_dof_count)
     finally
         Metal.synchronize()
         owns_identity && release_metal_coupled_identity_cache!(identity_cache)
@@ -316,7 +411,9 @@ function metal_host_coupled_burton_miller(combined)
     Metal.synchronize()
     a = Metal.is_shared(combined.a) ? unsafe_wrap(Array, combined.a) : Array(combined.a)
     c = Metal.is_shared(combined.c) ? unsafe_wrap(Array, combined.c) : Array(combined.c)
-    return (a=a, c=c, on_gpu=false, metal_backing=(a=combined.a, c=combined.c))
+    return (a=a, c=c, on_gpu=false, metal_backing=(a=combined.a, c=combined.c),
+            active_columns=get(combined, :active_columns, nothing),
+            dp0_count=get(combined, :dp0_count, size(c, 2)))
 end
 
 function release_metal_coupled_burton_miller!(combined)

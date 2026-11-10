@@ -298,6 +298,8 @@ function Base.:\(factorization::RefinedDenseLU, rhs::AbstractVecOrMat)
     return solution
 end
 
+include(joinpath(@__DIR__, "BeatEngineSplitDense.jl"))
+
 """
     dense_solver_diagnostics(system) -> Dict{String,Any}
 
@@ -308,6 +310,21 @@ The dense coupled factorization that ran: `dense_solver` (`lu_float32`, `lu_floa
 """
 function dense_solver_diagnostics(system)
     factorization = hasproperty(system, :factorization) ? system.factorization : nothing
+    if factorization isa SplitRefinedLU
+        return Dict{String,Any}(
+            "dense_solver" => isnothing(factorization.fallback) ?
+                              (factorization.gmres_iterations > 0 ? "lu_float32_split_gmres_ir" : "lu_float32_split_refined") :
+                              "lu_float64_fallback",
+            "dense_refinement_iterations" => factorization.iterations,
+            "dense_refinement_fallback_reason" => factorization.fallback_reason,
+            "dense_refinement_backward_error" => isnan(factorization.backward_error) ? nothing : factorization.backward_error,
+            "dense_gmres_ir_iterations" => factorization.gmres_iterations,
+            "dense_split_border_columns" => length(factorization.matrix.border_columns),
+            "dense_split_border_rows" => length(factorization.matrix.border_rows),
+            "dense_split_stray_entries" => length(factorization.matrix.stray),
+            "dense_spill" => !isnothing(factorization.spill_path),
+        )
+    end
     if factorization isa RefinedDenseLU
         return Dict{String,Any}(
             "dense_solver" => isnothing(factorization.fallback) ? "lu_float32_refined" : "lu_float64_fallback",
@@ -1737,6 +1754,72 @@ function _stage_overlap_enabled(bem_backend::Symbol)
 end
 
 """
+`BLAB_METAL_COUPLED_COMPACT_FLUX=auto|0` (default `auto`): the combined Metal assembly keeps only
+the C columns of DP0 faces that carry interface, transducer-motion or prescribed flux (every other
+column multiplies zero). `0` restores the full `N × F` C.
+"""
+_metal_compact_flux_enabled() = lowercase(strip(get(ENV, "BLAB_METAL_COUPLED_COMPACT_FLUX", "auto"))) in ("auto", "1", "on", "true")
+
+"""Sorted DP0 rows with a nonzero entry in any of the given flux maps (`nothing` maps are skipped)."""
+function _active_flux_rows(dp0_count::Int, maps...)
+    mask = falses(dp0_count)
+    for map in maps
+        map === nothing && continue
+        size(map, 1) == dp0_count || error("Flux map has $(size(map, 1)) rows; expected $(dp0_count) DP0 dofs.")
+        if map isa SparseMatrixCSC
+            rows, values = rowvals(map), nonzeros(map)
+            for position in eachindex(rows)
+                iszero(values[position]) || (mask[rows[position]] = true)
+            end
+        else
+            for column in axes(map, 2), row in axes(map, 1)
+                iszero(map[row, column]) || (mask[row] = true)
+            end
+        end
+    end
+    return findall(mask)
+end
+
+"""
+    CompactFluxOperator(matrix, active, dp0_count)
+
+A P1 × DP0 flux operator stored only on its `active` DP0 columns. Products check that the flux
+they multiply has no nonzero row outside `active` (it would have been silently dropped).
+"""
+struct CompactFluxOperator{M<:AbstractMatrix}
+    matrix::M
+    active::Vector{Int}
+    dp0_count::Int
+    mask::BitVector
+end
+
+function CompactFluxOperator(matrix::AbstractMatrix, active::Vector{Int}, dp0_count::Int)
+    mask = falses(dp0_count)
+    mask[active] .= true
+    return CompactFluxOperator(matrix, active, dp0_count, mask)
+end
+
+Base.size(operator::CompactFluxOperator) = (size(operator.matrix, 1), operator.dp0_count)
+Base.size(operator::CompactFluxOperator, dim::Integer) = size(operator)[dim]
+
+function Base.:*(operator::CompactFluxOperator, flux::AbstractVecOrMat)
+    size(flux, 1) == operator.dp0_count ||
+        throw(DimensionMismatch("flux has $(size(flux, 1)) rows; the operator has $(operator.dp0_count) DP0 columns"))
+    outside = setdiff(_active_flux_rows(operator.dp0_count, flux isa AbstractVector ? reshape(flux, :, 1) : flux),
+                      operator.active)
+    isempty(outside) || error(
+        "Compact Metal C was assembled for $(length(operator.active)) flux-carrying faces, but this flux " *
+        "is nonzero on $(length(outside)) other faces (set BLAB_METAL_COUPLED_COMPACT_FLUX=0).",
+    )
+    columns = flux isa AbstractVector ? 1 : size(flux, 2)
+    result_type = promote_type(eltype(operator.matrix), eltype(flux))
+    isempty(operator.active) && return flux isa AbstractVector ? zeros(result_type, size(operator.matrix, 1)) :
+                                                                 zeros(result_type, size(operator.matrix, 1), columns)
+    restricted = flux isa AbstractVector ? flux[operator.active] : flux[operator.active, :]
+    return view(operator.matrix, :, 1:length(operator.active)) * restricted
+end
+
+"""
     _condensed_bem_assembly_plan(condensed_cache, prepared, T, quadrature_order) -> (plan, identity)
 
 `BLAB_METAL_COUPLED_BEM_ASSEMBLY` for one condensed frequency: `plan.mode` is `:combined` (Metal
@@ -1744,7 +1827,8 @@ assembles A and C directly; `identity` is the cached identity scatter for this q
 `:operators` (the four operators; `identity` is `nothing`), with `plan.fallback_reason` when `auto`
 could not use the combined path. The build and the sweep pipeline's producer resolve it alike.
 """
-function _condensed_bem_assembly_plan(condensed_cache, prepared, ::Type{T}, quadrature_order::Int) where {T}
+function _condensed_bem_assembly_plan(condensed_cache, prepared, ::Type{T}, quadrature_order::Int;
+                                      active_columns=:cached) where {T}
     plan = if prepared.bem_backend == :metal
         requested = get(ENV, "BLAB_METAL_COUPLED_BEM_ASSEMBLY", "auto")
         # Operators bypass support probes, preserving the diagnostic/reference path.
@@ -1763,10 +1847,24 @@ function _condensed_bem_assembly_plan(condensed_cache, prepared, ::Type{T}, quad
     end
     plan.mode == :combined || return plan, nothing
     # A sweep that assembles the BEM stage on a producer task reaches the store from two tasks.
+    # `active_columns`: the flux-carrying DP0 columns to compact C to (a build passes them),
+    # `nothing` for the full C, or `:cached` (the sweep producer) to reuse whatever the store holds.
     identity = lock(condensed_cache.metal_combined_identity_lock) do
-        get!(condensed_cache.metal_combined_identity_store, quadrature_order) do
-            BeatEngineCore.build_metal_coupled_identity_cache(prepared, T)
+        store = condensed_cache.metal_combined_identity_store
+        existing = get(store, quadrature_order, nothing)
+        if existing !== nothing && active_columns !== :cached
+            compact = get(existing, :compact, nothing)
+            held = compact === nothing ? nothing : compact.active
+            if held != active_columns
+                BeatEngineCore.release_metal_coupled_identity_cache!(existing)
+                delete!(store, quadrature_order)
+                existing = nothing
+            end
         end
+        existing !== nothing && return existing
+        store[quadrature_order] = BeatEngineCore.build_metal_coupled_identity_cache(
+            prepared, T; active_columns=active_columns === :cached ? nothing : active_columns,
+        )
     end
     return plan, identity
 end
@@ -1827,19 +1925,54 @@ end
 The Burton-Miller combination of one frequency's four operators and the interface coupling block
 `-C Q`, as fresh host arrays. Frees the operators' Metal buffers: nothing reads them afterwards.
 """
-function _combine_condensed_bem_operators!(operators, prepared, wavenumber)
+# The host flux operator of a combined assembly: the full C, or C on its active columns.
+function _combined_flux_operator(host, matrix)
+    active = get(host, :active_columns, nothing)
+    active === nothing && return matrix
+    return CompactFluxOperator(matrix, active, host.dp0_count)
+end
+
+function _combine_condensed_bem_operators!(operators, prepared, wavenumber; keep_device::Bool=false)
     if hasproperty(operators, :combined)
         # A = 0.5Mpp - D + alpha H and C = S + alpha (adjD + 0.5Mpq); the operator path's
         # right-hand-side operator is -C. Owned host copies, then the device storage is freed.
+        if keep_device
+            # No host copies: A and -C (negated in place) stay on the shared device storage the
+            # host tuple wraps. The caller consumes them and then calls the returned release.
+            released = false
+            host = nothing
+            try
+                host = BeatEngineCore.metal_host_coupled_burton_miller(operators.combined)
+                bem_flux = prepared.interface_operators.bem_flux
+                negated = host.c
+                negated .*= -one(eltype(negated))
+                rhs_operator = _combined_flux_operator(host, negated)
+                interface_block = -(rhs_operator * Complex{typeof(wavenumber)}.(bem_flux))
+                release = () -> begin
+                    released && return nothing
+                    released = true
+                    BeatEngineCore.release_metal_coupled_burton_miller!(host)
+                    return nothing
+                end
+                return host.a, rhs_operator, interface_block, release
+            catch
+                isnothing(host) ? BeatEngineCore.release_metal_coupled_burton_miller!(operators.combined) :
+                                  BeatEngineCore.release_metal_coupled_burton_miller!(host)
+                rethrow()
+            end
+        end
         try
             host = BeatEngineCore.metal_host_coupled_burton_miller(operators.combined)
             bem_flux = prepared.interface_operators.bem_flux
-            size(host.c, 2) == size(bem_flux, 1) || error("Metal combined flux map must have one row per DP0 dof.")
-            return copy(host.a), -host.c, host.c * Complex{typeof(wavenumber)}.(bem_flux)
+            positive = _combined_flux_operator(host, host.c)
+            size(positive, 2) == size(bem_flux, 1) || error("Metal combined flux map must have one row per DP0 dof.")
+            negative = _combined_flux_operator(host, -host.c)
+            return copy(host.a), negative, positive * Complex{typeof(wavenumber)}.(bem_flux)
         finally
             BeatEngineCore.release_metal_coupled_burton_miller!(operators.combined)
         end
     end
+    keep_device && return (_combine_condensed_bem_operators!(operators, prepared, wavenumber)..., () -> nothing)
     bem_lhs, bem_rhs_operator = burton_miller_neumann_matrices(
         operators,
         prepared.identity_p1_p1,
@@ -2018,7 +2151,17 @@ function build_condensed_coupled_system(
     prepared.retained_fem_vertices == retained_fem_vertices ||
         error("Coupled cache retained FEM vertices do not match the current moving surfaces.")
 
-    assembly_plan, combined_identity = _condensed_bem_assembly_plan(condensed_cache, prepared, T, selected_quadrature_order)
+    # Flux-carrying DP0 faces: only these C columns are ever multiplied by a nonzero flux.
+    active_flux_columns = if prepared.bem_backend == :metal && _metal_compact_flux_enabled()
+        motion_map = isempty(transducers) ? nothing : resolved_transducer_operators.bem_normal_velocity
+        _active_flux_rows(prepared.dp0.global_dof_count, prepared.interface_operators.bem_flux, motion_map,
+                          prescribed_bem_normal_velocity)
+    else
+        nothing
+    end
+    assembly_plan, combined_identity = _condensed_bem_assembly_plan(
+        condensed_cache, prepared, T, selected_quadrature_order; active_columns=active_flux_columns,
+    )
     assembly_plan.fallback_reason === nothing || push!(optimization_fallbacks,
         "combined Metal BEM assembly not used: " * assembly_plan.fallback_reason)
 
@@ -2167,6 +2310,11 @@ function build_condensed_coupled_system(
     # before propagating, so the caller's cleanup never releases a solver the task is still using.
     local prefetched, operators, bem_operator_s, bem_lhs, bem_rhs_operator, bem_interface_block,
           bem_combine_s, bem_motion_block, bem_prescribed_rhs, interface_radiation_replay, bem_matrix_s
+    # Split dense storage copies `bem_lhs` straight from the device-backed host view and frees it
+    # right after (no host copy of A and no negated copy of C; see `_combine_condensed_bem_operators!`).
+    keep_device = T === Float32 && _dense_double_assembly(bem_backend) && _dense_refinement_enabled(bem_backend) &&
+                  _dense_split_enabled()
+    bem_release = () -> nothing
     try
         bem_operator_started = time_ns()
         prefetched = nothing
@@ -2187,10 +2335,11 @@ function build_condensed_coupled_system(
         bem_operator_s = (time_ns() - bem_operator_started) / 1.0e9
 
         bem_matrix_started = time_ns()
-        bem_lhs, bem_rhs_operator, bem_interface_block = if isnothing(prefetched)
-            _combine_condensed_bem_operators!(operators, prepared, wavenumber)
+        bem_lhs, bem_rhs_operator, bem_interface_block, bem_release = if isnothing(prefetched)
+            keep_device ? _combine_condensed_bem_operators!(operators, prepared, wavenumber; keep_device=true) :
+                          (_combine_condensed_bem_operators!(operators, prepared, wavenumber)..., () -> nothing)
         else
-            (prefetched.bem_lhs, prefetched.bem_rhs_operator, prefetched.bem_interface_block)
+            (prefetched.bem_lhs, prefetched.bem_rhs_operator, prefetched.bem_interface_block, () -> nothing)
         end
         # The part of `bem_matrix_s` the sweep pipeline moves onto its producer.
         bem_combine_s = isnothing(prefetched) ? (time_ns() - bem_matrix_started) / 1.0e9 : 0.0
@@ -2206,6 +2355,7 @@ function build_condensed_coupled_system(
         ) : nothing
         bem_matrix_s = (time_ns() - bem_matrix_started) / 1.0e9
     catch
+        bem_release()
         if !isnothing(condensation_task)
             try
                 wait(condensation_task)
@@ -2276,7 +2426,18 @@ function build_condensed_coupled_system(
     ]
     force_factor = T[transducer.bl_n_per_a for transducer in transducers]
 
-    coupled = zeros(Complex{dense_type}, system_count, system_count)
+    # Split storage (BeatEngineSplitDense.jl): ComplexF32 everywhere plus exact ComplexF64
+    # corrections on the rows/columns that FEM-side double-precision blocks touch. The BEM block
+    # outside the Γ-mapped columns holds only `bem_lhs` (Complex{T} == ComplexF32) and needs none.
+    split_dense = dense_type === Float64 && T === Float32 && _dense_refinement_enabled(bem_backend) &&
+                  _dense_split_enabled()
+    coupled = if split_dense
+        non_bem = setdiff(1:system_count, bem_range)
+        gamma_bem_columns = isnothing(elimination_map) ? Int[] : collect(bem_range)[elimination_map.bem_of_gamma]
+        SplitDenseMatrix(system_count, non_bem, vcat(non_bem, gamma_bem_columns))
+    else
+        zeros(Complex{dense_type}, system_count, system_count)
+    end
     interface_elimination_s = 0.0
     elimination = nothing
     # The Schur complement takes the slot the full FEM block occupies in the monolithic
@@ -2442,8 +2603,23 @@ function build_condensed_coupled_system(
     block_assembly_s = (time_ns() - block_assembly_started) / 1.0e9
 
     coupled_factorization_started = time_ns()
-    factorization = dense_type === Float64 && T !== Float64 && _dense_refinement_enabled(bem_backend) ?
-                    RefinedDenseLU(coupled) : lu!(coupled)
+    if coupled isa SplitDenseMatrix
+        # A, -C and any prefetched copies are consumed: free them before the factor is allocated.
+        bem_lhs = nothing
+        bem_rhs_operator = nothing
+        prefetched = nothing
+        operators = nothing
+        bem_release()
+        GC.gc()
+    end
+    factorization = if coupled isa SplitDenseMatrix
+        SplitRefinedLU(coupled)
+    elseif dense_type === Float64 && T !== Float64 && _dense_refinement_enabled(bem_backend)
+        RefinedDenseLU(coupled)
+    else
+        lu!(coupled)
+    end
+    coupled = nothing
     coupled_factorization_s = (time_ns() - coupled_factorization_started) / 1.0e9
 
     return (

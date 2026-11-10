@@ -69,9 +69,36 @@ function check_matrices(mesh, prepared, k, singular_order)
         empty_blocks = BeatEngineCoupledCondensed.project_metal_coupled_host_blocks(host,
             spzeros(Float32, f, 0), zeros(ComplexF32, f, 0), zeros(ComplexF32, f, 0))
         size(empty_blocks.bem_prescribed_rhs, 2) == 0 || error("empty projection failed")
+        check_compact_columns(mesh, prepared, k, host, q)
     finally
         release_operator_storage!(host_operators === nothing ? operators : host_operators)
         combined === nothing || BeatEngineCore.release_metal_coupled_burton_miller!(combined)
+    end
+end
+
+# Compact C (BLAB_METAL_COUPLED_COMPACT_FLUX): the assembly restricted to the flux-carrying
+# columns must reproduce those columns of the full C, A unchanged, for the interface faces alone,
+# a scattered subset with the first and last faces, and the empty set.
+function check_compact_columns(mesh, prepared, k, full_host, q)
+    f = size(full_host.c, 2)
+    interface = BeatEngineCoupledCondensed._active_flux_rows(f, q)
+    for active in (interface, sort(unique(vcat(1, f, collect(1:3:f), interface))), Int[])
+        identity = BeatEngineCore.build_metal_coupled_identity_cache(prepared, Float32; active_columns=active)
+        compact = nothing
+        try
+            compact = BeatEngineCore.assemble_coupled_burton_miller_metal(mesh, prepared, k; identity_cache=identity)
+            host = BeatEngineCore.metal_host_coupled_burton_miller(compact)
+            host.active_columns == active || error("compact C: active columns not reported")
+            check("A (compact C run, $(length(active))/$f columns)", full_host.a, host.a; rtol=0, atol=0)
+            check("C[:, active] ($(length(active))/$f columns)", full_host.c[:, active],
+                  host.c[:, 1:length(active)]; rtol=0, atol=0)
+            operator = BeatEngineCoupledCondensed._combined_flux_operator(host, host.c)
+            isempty(active) || check("compact C * Q", full_host.c * ComplexF32.(q[:, :]),
+                                     operator * ComplexF32.(q); rtol=1e-6)
+        finally
+            compact === nothing || BeatEngineCore.release_metal_coupled_burton_miller!(compact)
+            BeatEngineCore.release_metal_coupled_identity_cache!(identity)
+        end
     end
 end
 

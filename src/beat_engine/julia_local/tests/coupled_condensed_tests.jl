@@ -855,7 +855,7 @@ if get(ENV, "BLAB_RUN_COUPLED_REFERENCE", "0") == "1"
             end
             try
                 @test composed_refined.dense_scalar_type == Float64
-                @test composed_refined.factorization isa BeatEngineCoupledCondensed.RefinedDenseLU
+                @test composed_refined.factorization isa Union{BeatEngineCoupledCondensed.RefinedDenseLU,BeatEngineCoupledCondensed.SplitRefinedLU}
                 @test eltype(composed_refined.condensation.schur) == ComplexF64
                 # The mechanical block (mechanical impedance minus the condensed air spring) is formed
                 # in Float64 and must reach the Float64 dense matrix unrounded.
@@ -868,7 +868,7 @@ if get(ENV, "BLAB_RUN_COUPLED_REFERENCE", "0") == "1"
                 for field in elimination_fields
                     @test relative_error(getproperty(dense64_solution, field), getproperty(refined_solution, field)) < 1e-6
                 end
-                @test BeatEngineCoupledCondensed.dense_solver_diagnostics(composed_refined)["dense_solver"] == "lu_float32_refined"
+                @test BeatEngineCoupledCondensed.dense_solver_diagnostics(composed_refined)["dense_solver"] in ("lu_float32_refined", "lu_float32_split_refined")
                 @test composed_refined.factorization.iterations >= 1
             finally
                 release_condensed_coupled_system!(composed_refined)
@@ -929,7 +929,7 @@ if get(ENV, "BLAB_RUN_COUPLED_REFERENCE", "0") == "1"
                 for field in elimination_fields
                     @test relative_error(getproperty(reference_solution, field), getproperty(metal_like_solution, field)) < 1e-9
                 end
-                @test metal_like32.factorization isa BeatEngineCoupledCondensed.RefinedDenseLU
+                @test metal_like32.factorization isa Union{BeatEngineCoupledCondensed.RefinedDenseLU,BeatEngineCoupledCondensed.SplitRefinedLU}
                 @test metal_like32.fem_scalar_type == Float64
                 @test BeatEngineCoupledCondensed.interface_mass_diagnostics(metal_like32)["interface_mass_solver"] == "cholmod"
             finally
@@ -986,16 +986,16 @@ if get(ENV, "BLAB_RUN_COUPLED_REFERENCE", "0") == "1"
             try
                 @test baseline32.factorization isa LinearAlgebra.LU{ComplexF32}
                 @test baseline32.dense_scalar_type == Float32 && baseline32.fem_scalar_type == Float32
-                @test default32.factorization isa BeatEngineCoupledCondensed.RefinedDenseLU
+                @test default32.factorization isa Union{BeatEngineCoupledCondensed.RefinedDenseLU,BeatEngineCoupledCondensed.SplitRefinedLU}
                 @test default32.dense_scalar_type == Float64 && default32.fem_scalar_type == Float32
-                @test refined32.factorization isa BeatEngineCoupledCondensed.RefinedDenseLU
+                @test refined32.factorization isa Union{BeatEngineCoupledCondensed.RefinedDenseLU,BeatEngineCoupledCondensed.SplitRefinedLU}
                 @test refined32.dense_scalar_type == Float64 && refined32.fem_scalar_type == Float64
                 # The Schur block is formed in Float64 and must not be demoted on the way to the dense matrix.
                 @test eltype(refined32.condensation.schur) == ComplexF64
                 @test any(value -> ComplexF64(ComplexF32(value)) != value,
                           refined32.factorization.matrix[refined32.gamma_range, refined32.gamma_range])
                 @test plain64lu.factorization isa LinearAlgebra.LU{ComplexF64}
-                @test BeatEngineCoupledCondensed.dense_solver_diagnostics(refined32)["dense_solver"] == "lu_float32_refined"
+                @test BeatEngineCoupledCondensed.dense_solver_diagnostics(refined32)["dense_solver"] in ("lu_float32_refined", "lu_float32_split_refined")
                 refined_solution = only(solve_condensed_coupled_excitations(refined32, voltage32))
                 plain_solution = only(solve_condensed_coupled_excitations(plain64lu, voltage32))
                 @test eltype(refined_solution.bem_pressure) == ComplexF32
@@ -1044,7 +1044,7 @@ if get(ENV, "BLAB_RUN_COUPLED_REFERENCE", "0") == "1"
                             @test isempty(mass["interface_mass_fallback_reasons"])
                             @test baseline.factorization isa LinearAlgebra.LU{ComplexF64}
                             if T === Float32
-                                @test defaults.factorization isa CC.RefinedDenseLU
+                                @test defaults.factorization isa Union{CC.RefinedDenseLU,CC.SplitRefinedLU}
                             else
                                 @test defaults.factorization isa LinearAlgebra.LU{ComplexF64}
                             end
@@ -1055,7 +1055,7 @@ if get(ENV, "BLAB_RUN_COUPLED_REFERENCE", "0") == "1"
                                 @test relative_error(getproperty(reference, field), getproperty(candidate, field)) < tolerance
                             end
                             if T === Float32
-                                @test CC.dense_solver_diagnostics(defaults)["dense_solver"] == "lu_float32_refined"
+                                @test CC.dense_solver_diagnostics(defaults)["dense_solver"] in ("lu_float32_refined", "lu_float32_split_refined")
                                 @test defaults.factorization.iterations >= 1
                             end
                             lean = only(solve_condensed_coupled_excitations(defaults, excitations; reconstruct_interior=false))
@@ -1630,7 +1630,7 @@ end
     @test isnothing(refined.fallback) && isnothing(refined.fallback_reason)
     @test relative(reference[:, 2], refined \ rhs[:, 2]) < 1e-10
     diagnostics = BeatEngineCoupledCondensed.dense_solver_diagnostics((factorization=refined,))
-    @test diagnostics["dense_solver"] == "lu_float32_refined"
+    @test diagnostics["dense_solver"] in ("lu_float32_refined", "lu_float32_split_refined")
     @test diagnostics["dense_refinement_iterations"] == refined.iterations
     @test isnothing(diagnostics["dense_refinement_fallback_reason"])
     @test BeatEngineCoupledCondensed.dense_solver_diagnostics((factorization=lu(matrix),))["dense_solver"] == "lu_float64"
