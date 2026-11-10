@@ -66,6 +66,7 @@ export BoundaryMesh,
     SymmetryTransform,
     TriangleRule,
     assemble_l2_identity_matrix,
+    assemble_l2_identity_sparse,
     build_cuda_regular_assembly_cache,
     build_cuda_field_evaluation_cache,
     release_cuda_field_evaluation_cache!,
@@ -1182,6 +1183,44 @@ end
 function count_adjacent_pairs(mesh::BoundaryMesh, element_indices)
     adjacent = adjacent_trial_indices_by_test(mesh, element_indices)
     return sum(length, values(adjacent))
+end
+
+"""
+    assemble_l2_identity_sparse(mesh, p1_space, dp0_space, rule, test_basis, trial_basis; symmetry_mode=:off)
+
+`assemble_l2_identity_matrix` as a `SparseMatrixCSC` (same entries, same orbit weights). The
+dense version costs `N_test × N_trial` scalars; the P1 × DP0 identity of a fine BEM mesh is
+tens of GB dense and a few MB sparse. The coupled caches hold this form.
+"""
+function assemble_l2_identity_sparse(
+    mesh::BoundaryMesh{T},
+    p1_space::P1Space,
+    dp0_space::DP0Space,
+    rule::TriangleRule{T},
+    test_basis::Symbol,
+    trial_basis::Symbol,
+    ;
+    symmetry_mode::Symbol=:off,
+) where {T<:AbstractFloat}
+    test_dof_count = test_basis == :p1 ? p1_space.global_dof_count : dp0_space.global_dof_count
+    trial_dof_count = trial_basis == :p1 ? p1_space.global_dof_count : dp0_space.global_dof_count
+    rows, columns, values = Int[], Int[], T[]
+    for element_index in eachindex(mesh.faces)
+        test_dofs = test_basis == :p1 ? p1_space.local_to_global[element_index] : (dp0_space.local_to_global[element_index],)
+        trial_dofs = trial_basis == :p1 ? p1_space.local_to_global[element_index] : (dp0_space.local_to_global[element_index],)
+        block = l2_identity_element_matrix(mesh.areas[element_index], test_basis, trial_basis, rule)
+        for local_row in eachindex(test_dofs), local_col in eachindex(trial_dofs)
+            push!(rows, test_dofs[local_row])
+            push!(columns, trial_dofs[local_col])
+            push!(values, block[local_row, local_col])
+        end
+    end
+    matrix = sparse(rows, columns, values, test_dof_count, trial_dof_count)   # duplicates summed
+    if test_basis == :p1
+        weights = p1_symmetry_orbit_weights(mesh, symmetry_mode)
+        matrix = Diagonal(T.(weights)) * matrix
+    end
+    return matrix
 end
 
 function assemble_l2_identity_matrix(

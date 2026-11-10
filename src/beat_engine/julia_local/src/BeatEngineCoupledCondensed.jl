@@ -1552,10 +1552,11 @@ function _condensed_quadrature_bundle(
     # where the exact block is area/6 on the diagonal and area/12 off it. That would silently
     # degrade the Burton-Miller 0.5*I term rather than fail.
     identity_rule = order >= 2 ? rule : triangle_rule(T, 2)
-    identity_p1_p1 = assemble_l2_identity_matrix(
+    # Sparse: the dense P1 x DP0 identity alone is N_B x F scalars per quadrature bundle.
+    identity_p1_p1 = assemble_l2_identity_sparse(
         bem_mesh, p1, dp0, identity_rule, :p1, :p1; symmetry_mode=symmetry_mode,
     )
-    identity_p1_dp0 = assemble_l2_identity_matrix(
+    identity_p1_dp0 = assemble_l2_identity_sparse(
         bem_mesh, p1, dp0, identity_rule, :p1, :dp0; symmetry_mode=symmetry_mode,
     )
     bem_identity_cache_s = (time_ns() - identity_started) / 1.0e9

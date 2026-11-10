@@ -1117,6 +1117,26 @@ function assemble_transducer_operators(
 end
 
 # Diagnostics retain the individual operators needed for replay/residual checks.
+"""Sorted DP0 faces with a nonzero entry in any of the flux maps (columns of C that are ever used)."""
+function _coupled_active_flux_faces(dp0_count::Int, maps...)
+    mask = falses(dp0_count)
+    for map in maps
+        (map === nothing || size(map, 2) == 0) && continue
+        size(map, 1) == dp0_count || error("Flux map has $(size(map, 1)) rows; expected $(dp0_count) DP0 dofs.")
+        if map isa SparseMatrixCSC
+            rows, values = rowvals(map), nonzeros(map)
+            for position in eachindex(rows)
+                iszero(values[position]) || (mask[rows[position]] = true)
+            end
+        else
+            for column in axes(map, 2), row in axes(map, 1)
+                iszero(map[row, column]) || (mask[row] = true)
+            end
+        end
+    end
+    return findall(mask)
+end
+
 function resolve_coupled_bem_assembly(mode::Symbol, backend::Symbol, diagnostics::Bool)
     mode in (:auto, :combined, :operators) || error(
         "coupled_bem_assembly must be auto, combined, or operators.")
@@ -1265,7 +1285,8 @@ function prepare_coupled_cache(
     bem_device_image_cache_s = (time_ns() - device_image_started) / 1.0e9
 
     identity_started = time_ns()
-    identity_p1_p1 = assemble_l2_identity_matrix(
+    # Sparse host identities; dense copies are made only where a path needs them.
+    identity_p1_p1 = assemble_l2_identity_sparse(
         bem_mesh,
         p1,
         dp0,
@@ -1274,7 +1295,7 @@ function prepare_coupled_cache(
         :p1;
         symmetry_mode=normalized_symmetry,
     )
-    identity_p1_dp0 = assemble_l2_identity_matrix(
+    identity_p1_dp0 = assemble_l2_identity_sparse(
         bem_mesh,
         p1,
         dp0,
@@ -1293,16 +1314,18 @@ function prepare_coupled_cache(
     if bem_backend in (:cuda, :rocm)
         accelerator = bem_backend == :cuda ?
                       BeatEngineCore.cuda_module() : BeatEngineCore.amdgpu_module()
+        # The combined CUDA assembly adds the identities from the sparse host matrices; only the
+        # four-operator paths keep dense device copies (N_B² + N_B·F entries).
         device_identity_cache = if bem_backend == :cuda
-            build_cuda_burton_miller_identity_cache(
-                identity_p1_p1,
-                identity_p1_dp0,
+            coupled_bem_assembly == :combined ? nothing : build_cuda_burton_miller_identity_cache(
+                Matrix(identity_p1_p1),
+                Matrix(identity_p1_dp0),
                 T,
             )
         else
             build_rocm_burton_miller_identity_cache(
-                identity_p1_p1,
-                identity_p1_dp0,
+                Matrix(identity_p1_p1),
+                Matrix(identity_p1_dp0),
                 T,
             )
         end
@@ -1504,7 +1527,7 @@ function release_coupled_cache!(cache)
             :basis_values,
         ),
     )
-    release_cuda_burton_miller_identity_cache!(cache.device_identity_cache)
+    cache.device_identity_cache === nothing || release_cuda_burton_miller_identity_cache!(cache.device_identity_cache)
     cache.device_bem_flux === nothing || BeatEngineCore.cuda_module().unsafe_free!(cache.device_bem_flux)
     BeatEngineCore.release_cuda_bem_flux_cache!(cache.device_bem_flux_sparse)
     for (name, sparse_cache) in pairs(cache.device_sparse_blocks)
@@ -1544,8 +1567,8 @@ function _accelerator_coupled_bem_blocks(
             d_identity_p1_dp0 = identity_p1_dp0
             d_bem_flux = bem_flux
         else
-            d_identity_p1_p1 = device_array(Complex{T}.(identity_p1_p1))
-            d_identity_p1_dp0 = device_array(Complex{T}.(identity_p1_dp0))
+            d_identity_p1_p1 = device_array(Complex{T}.(Matrix(identity_p1_p1)))
+            d_identity_p1_dp0 = device_array(Complex{T}.(Matrix(identity_p1_dp0)))
             d_bem_flux = device_array(Complex{T}.(Matrix(bem_flux)))
         end
         d_lhs = (
@@ -2349,8 +2372,16 @@ function build_coupled_system(
     fuse_images = assembly_mode == :combined && coupled_bem_image_fusion &&
         length(BeatEngineCore.symmetry_image_transforms(prepared.symmetry_mode)) > 1
     image_max_registers = fuse_images ? coupled_bem_max_registers : 0
+    # Compact C: only the DP0 faces that carry interface, motion or prescribed flux
+    # (`BLAB_CUDA_COUPLED_COMPACT_FLUX=auto|0`).
+    compact_flux = assembly_mode == :combined &&
+                   lowercase(strip(get(ENV, "BLAB_CUDA_COUPLED_COMPACT_FLUX", "auto"))) in ("auto", "1", "on", "true")
+    active_flux_columns = compact_flux ? _coupled_active_flux_faces(
+        prepared.dp0.global_dof_count, interface_operators.bem_flux, bem_motion_flux, bem_prescribed_neumann,
+    ) : nothing
     operators = assembly_mode == :combined ? BeatEngineCore.assemble_coupled_burton_miller_cuda(
         bem_mesh, prepared, wavenumber; fused=fuse_images, max_registers=image_max_registers,
+        active_columns=active_flux_columns,
     ) : assemble_regular_galerkin_operators(
         bem_mesh,
         prepared.p1,
@@ -2390,6 +2421,7 @@ function build_coupled_system(
         device_bem_motion_flux = nothing
         device_bem_prescribed_neumann = nothing
         temporary_bem_flux = nothing
+        temporary_identity = nothing
         try
             if prepared.device_bem_flux === nothing
                 temporary_bem_flux = device_array(Complex{T}.(Matrix(interface_operators.bem_flux)))
@@ -2406,10 +2438,19 @@ function build_coupled_system(
             end
             build_bem_blocks = bem_backend == :cuda ?
                                _cuda_coupled_bem_blocks : _rocm_coupled_bem_blocks
+            # A cache prepared for the combined CUDA assembly holds no dense device identities;
+            # a four-operator build on it (validation diagnostics) makes temporary ones.
+            if prepared.device_identity_cache === nothing
+                temporary_identity = (
+                    identity_p1_p1=device_array(Complex{T}.(Matrix(prepared.identity_p1_p1))),
+                    identity_p1_dp0=device_array(Complex{T}.(Matrix(prepared.identity_p1_dp0))),
+                )
+            end
+            identity_cache = something(prepared.device_identity_cache, temporary_identity)
             build_bem_blocks(
                 operators,
-                prepared.device_identity_cache.identity_p1_p1,
-                prepared.device_identity_cache.identity_p1_dp0,
+                identity_cache.identity_p1_p1,
+                identity_cache.identity_p1_dp0,
                 temporary_bem_flux === nothing ? prepared.device_bem_flux : temporary_bem_flux,
                 wavenumber;
                 validation_diagnostics=validation_diagnostics,
@@ -2420,6 +2461,10 @@ function build_coupled_system(
             )
         finally
             release_operator_storage!(operators)
+            if temporary_identity !== nothing
+                accelerator.unsafe_free!(temporary_identity.identity_p1_p1)
+                accelerator.unsafe_free!(temporary_identity.identity_p1_dp0)
+            end
             temporary_bem_flux === nothing || accelerator.unsafe_free!(temporary_bem_flux)
             isnothing(device_bem_motion_flux) ||
                 accelerator.unsafe_free!(device_bem_motion_flux)

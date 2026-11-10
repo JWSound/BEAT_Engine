@@ -102,6 +102,35 @@ function _add_scaled_matvec!(rhs::Vector{Complex{T}}, matrix::AbstractMatrix,
     return rhs
 end
 
+# Sparse identities (the coupled caches): the dense formulas above would broadcast into a
+# SparseMatrixCSC. These give the same entries bit for bit: off the identity's pattern the
+# identity term is an exact zero, on it the original expression is re-evaluated.
+function burton_miller_neumann_lhs(operators, identity_p1_p1::SparseMatrixCSC, k::T) where {T<:AbstractFloat}
+    coupling = burton_miller_coupling(k)
+    lhs = .-operators.double_layer .+ coupling .* operators.hypersingular
+    rows, columns, values = findnz(identity_p1_p1)
+    @inbounds for position in eachindex(values)
+        i, j = rows[position], columns[position]
+        lhs[i, j] = Complex{T}(0.5) * values[position] - operators.double_layer[i, j] +
+                    coupling * operators.hypersingular[i, j]
+    end
+    return lhs
+end
+
+function burton_miller_neumann_matrices(operators, identity_p1_p1::SparseMatrixCSC, identity_p1_dp0::SparseMatrixCSC,
+                                        k::T) where {T<:AbstractFloat}
+    coupling = burton_miller_coupling(k)
+    lhs = burton_miller_neumann_lhs(operators, identity_p1_p1, k)
+    rhs_operator = -operators.single_layer .- coupling .* operators.adjoint_double_layer
+    rows, columns, values = findnz(identity_p1_dp0)
+    @inbounds for position in eachindex(values)
+        i, j = rows[position], columns[position]
+        rhs_operator[i, j] = -operators.single_layer[i, j] -
+                             coupling * (operators.adjoint_double_layer[i, j] + Complex{T}(0.5) * values[position])
+    end
+    return lhs, rhs_operator
+end
+
 function burton_miller_neumann_matrices(operators, identity_p1_p1, identity_p1_dp0, k::T) where {T<:AbstractFloat}
     coupling = burton_miller_coupling(k)
     lhs = burton_miller_neumann_lhs(operators, identity_p1_p1, k)

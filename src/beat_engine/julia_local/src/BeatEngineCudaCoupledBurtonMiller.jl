@@ -12,6 +12,7 @@ function _cuda_combined_kernel!(
     k,
     p1_dof_count,
     dp0_dof_count,
+    column_map,
     face_count,
     rule_count,
     total_pairs,
@@ -206,12 +207,16 @@ function _cuda_combined_kernel!(
                 end
             end
 
-            _cuda_atomic_add!(c_re, t1 + (trial_index - 1) * p1_dof_count, c1_re)
-            _cuda_atomic_add!(c_im, t1 + (trial_index - 1) * p1_dof_count, c1_im)
-            _cuda_atomic_add!(c_re, t2 + (trial_index - 1) * p1_dof_count, c2_re)
-            _cuda_atomic_add!(c_im, t2 + (trial_index - 1) * p1_dof_count, c2_im)
-            _cuda_atomic_add!(c_re, t3 + (trial_index - 1) * p1_dof_count, c3_re)
-            _cuda_atomic_add!(c_im, t3 + (trial_index - 1) * p1_dof_count, c3_im)
+            # C column of the trial face: its DP0 dof, or its compact position (0: not retained).
+            c_column = column_map[trial_index]
+            if c_column > 0
+                _cuda_atomic_add!(c_re, t1 + (c_column - 1) * p1_dof_count, c1_re)
+                _cuda_atomic_add!(c_im, t1 + (c_column - 1) * p1_dof_count, c1_im)
+                _cuda_atomic_add!(c_re, t2 + (c_column - 1) * p1_dof_count, c2_re)
+                _cuda_atomic_add!(c_im, t2 + (c_column - 1) * p1_dof_count, c2_im)
+                _cuda_atomic_add!(c_re, t3 + (c_column - 1) * p1_dof_count, c3_re)
+                _cuda_atomic_add!(c_im, t3 + (c_column - 1) * p1_dof_count, c3_im)
+            end
             _cuda_atomic_add!(a_re, t1 + (r1 - 1) * p1_dof_count, a11_re)
             _cuda_atomic_add!(a_im, t1 + (r1 - 1) * p1_dof_count, a11_im)
             _cuda_atomic_add!(a_re, t1 + (r2 - 1) * p1_dof_count, a12_re)
@@ -253,6 +258,7 @@ function _cuda_combined_fused_kernel!(
     k,
     p1_dof_count,
     dp0_dof_count,
+    column_map,
     face_count,
     rule_count,
     total_pairs,
@@ -450,12 +456,16 @@ function _cuda_combined_fused_kernel!(
             end
 
             end # sequential image transforms, one scatter
-            _cuda_atomic_add!(c_re, t1 + (trial_index - 1) * p1_dof_count, c1_re)
-            _cuda_atomic_add!(c_im, t1 + (trial_index - 1) * p1_dof_count, c1_im)
-            _cuda_atomic_add!(c_re, t2 + (trial_index - 1) * p1_dof_count, c2_re)
-            _cuda_atomic_add!(c_im, t2 + (trial_index - 1) * p1_dof_count, c2_im)
-            _cuda_atomic_add!(c_re, t3 + (trial_index - 1) * p1_dof_count, c3_re)
-            _cuda_atomic_add!(c_im, t3 + (trial_index - 1) * p1_dof_count, c3_im)
+            # C column of the trial face: its DP0 dof, or its compact position (0: not retained).
+            c_column = column_map[trial_index]
+            if c_column > 0
+                _cuda_atomic_add!(c_re, t1 + (c_column - 1) * p1_dof_count, c1_re)
+                _cuda_atomic_add!(c_im, t1 + (c_column - 1) * p1_dof_count, c1_im)
+                _cuda_atomic_add!(c_re, t2 + (c_column - 1) * p1_dof_count, c2_re)
+                _cuda_atomic_add!(c_im, t2 + (c_column - 1) * p1_dof_count, c2_im)
+                _cuda_atomic_add!(c_re, t3 + (c_column - 1) * p1_dof_count, c3_re)
+                _cuda_atomic_add!(c_im, t3 + (c_column - 1) * p1_dof_count, c3_im)
+            end
             _cuda_atomic_add!(a_re, t1 + (r1 - 1) * p1_dof_count, a11_re)
             _cuda_atomic_add!(a_im, t1 + (r1 - 1) * p1_dof_count, a11_im)
             _cuda_atomic_add!(a_re, t1 + (r2 - 1) * p1_dof_count, a12_re)
@@ -484,11 +494,11 @@ function _cuda_combined_fused_kernel!(
 end
 
 # Coupled Burton-Miller A=-D+alpha*H, C=S+alpha*adjD before weighted identities.
-function _launch_combined!(ar, ai, cr, ci, cache, k, transforms; skip_adjacent, fused=false, max_registers=0)
+function _launch_combined!(ar, ai, cr, ci, cache, k, transforms; skip_adjacent, column_map, fused=false, max_registers=0)
     count = length(cache.element_indices)^2
     args = (ar, ai, cr, ci, cache.face_vertices, cache.normals, cache.areas,
         cache.faces, cache.curls, cache.test_indices, cache.trial_indices,
-        cache.rule_points, cache.rule_weights, k, size(ar, 1), size(cr, 2),
+        cache.rule_points, cache.rule_weights, k, size(ar, 1), size(cr, 2), column_map,
         cache.face_count, cache.rule_count, count, skip_adjacent)
     signs = Tuple((T = typeof(k); (T.(t.signs)..., T.(t.determinant .* t.signs)...)) for t in transforms)
     if fused && max_registers > 0
@@ -524,6 +534,72 @@ function _cuda_combined_correction_kernel!(ar, ai, cr, ci, rows, cols, dpcols, s
     return nothing
 end
 
+"""Combined-assembly correction target whose C columns go through `map` (DP0 dof -> retained column, 0 = skip)."""
+struct CudaCombinedColumns{M}
+    map::M
+end
+
+function _cuda_combined_mapped_correction_kernel!(ar, ai, cr, ci, rows, cols, dpcols, column_map, s, adj, d, h, ik, n, count)
+    pair = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    stride = blockDim().x * gridDim().x
+    while pair <= count
+        c_column = column_map[dpcols[pair]]
+        for i in 1:3
+            row = rows[pair + (i-1)*count]
+            pos = pair + (i-1)*count
+            if c_column > 0
+                index = row + (c_column-1)*n
+                _cuda_atomic_add!(cr, index, real(s[pos]) - ik*imag(adj[pos]))
+                _cuda_atomic_add!(ci, index, imag(s[pos]) + ik*real(adj[pos]))
+            end
+            for j in 1:3
+                col = cols[pair + (j-1)*count]
+                pos = pair + ((j-1)*3+i-1)*count
+                _cuda_bm_add_lhs!(ar, ai, row+(col-1)*n, real(d[pos]), imag(d[pos]), real(h[pos]), imag(h[pos]), ik)
+            end
+        end
+        pair += stride
+    end
+    return nothing
+end
+
+function _scatter_cuda_bm_blocks!(ar, ai, cr, ci, columns::CudaCombinedColumns, blocks, cache, k; rhs_only=false)
+    count = cache.pair_count
+    count == 0 && return 0
+    CUDA.@cuda threads=128 blocks=min(cld(count,128),65535) _cuda_combined_mapped_correction_kernel!(
+        ar, ai, cr, ci, cache.p1_rows, cache.p1_cols, cache.dp0_cols, columns.map,
+        blocks.slp, blocks.adjoint, blocks.dlp, blocks.hypersingular, inv(k), size(ar,1), count)
+    CUDA.synchronize()
+    return count
+end
+
+# Sparse identity add (COO, unique entries: no atomics): dest[row, col] += alpha * value.
+function _cuda_coo_add_kernel!(dest, rows, cols, values, alpha, n, count)
+    index = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    stride = blockDim().x * gridDim().x
+    while index <= count
+        dest[rows[index] + (cols[index] - 1) * n] += alpha * values[index]
+        index += stride
+    end
+    return nothing
+end
+
+function _cuda_add_sparse_identity!(dest, identity::SparseMatrixCSC, alpha)
+    rows, cols, values = findnz(identity)
+    isempty(values) && return dest
+    d_rows = CUDA.CuArray(Int32.(rows))
+    d_cols = CUDA.CuArray(Int32.(cols))
+    d_values = CUDA.CuArray(eltype(dest).(values))
+    try
+        CUDA.@cuda threads=256 blocks=min(cld(length(values),256),65535) _cuda_coo_add_kernel!(
+            dest, d_rows, d_cols, d_values, alpha, size(dest, 1), length(values))
+        CUDA.synchronize()
+    finally
+        foreach(CUDA.unsafe_free!, (d_rows, d_cols, d_values))
+    end
+    return dest
+end
+
 function _scatter_cuda_bm_blocks!(ar, ai, cr, ci, ::Val{:combined}, blocks, cache, k; rhs_only=false)
     count = cache.pair_count
     count == 0 && return 0
@@ -534,40 +610,63 @@ function _scatter_cuda_bm_blocks!(ar, ai, cr, ci, ::Val{:combined}, blocks, cach
     return count
 end
 
-function assemble_coupled_burton_miller_cuda(mesh::BoundaryMesh{T}, prepared, k; fused=true, max_registers=0) where T
+"""
+    assemble_coupled_burton_miller_cuda(mesh, prepared, k; fused=true, max_registers=0, active_columns=nothing)
+
+Combined A (P1 x P1) and C (P1 x DP0). With `active_columns` (sorted DP0 dofs carrying interface,
+motion or prescribed flux) C keeps only those columns: `N x |active|` instead of `N x F` on the
+device. The identities are added from the host sparse matrices (no dense device copies).
+"""
+function assemble_coupled_burton_miller_cuda(mesh::BoundaryMesh{T}, prepared, k; fused=true, max_registers=0,
+                                             active_columns=nothing) where T
     k = outgoing_wavenumber(k)
     n = prepared.p1.global_dof_count
-    m = prepared.dp0.global_dof_count
+    f = prepared.dp0.global_dof_count
+    active = active_columns === nothing ? nothing : sort!(unique!(collect(Int, active_columns)))
+    host_map = zeros(Int32, f)
+    if active === nothing
+        host_map .= Int32.(1:f)
+    else
+        all(column -> 1 <= column <= f, active) || error("Active C columns outside 1:$(f).")
+        host_map[active] .= Int32.(1:length(active))
+    end
+    m = active === nothing ? f : length(active)
+    column_map = CUDA.CuArray(host_map)
     astorage = CUDA.zeros(T, 2, n, n)
     cstorage = nothing
     ok = false
     try
-        cstorage = CUDA.zeros(T, 2, n, m)
+        cstorage = CUDA.zeros(T, 2, n, max(m, 1))
         ar, ai = view(astorage,1,:,:), view(astorage,2,:,:)
         cr, ci = view(cstorage,1,:,:), view(cstorage,2,:,:)
         _launch_combined!(ar,ai,cr,ci,prepared.device_cache,k,
-            symmetry_transforms(:off; include_identity=true); skip_adjacent=true)
+            symmetry_transforms(:off; include_identity=true); skip_adjacent=true, column_map=column_map)
         images = symmetry_image_transforms(prepared.symmetry_mode)
-        isempty(images) || _launch_combined!(ar,ai,cr,ci,prepared.device_cache,k,images; skip_adjacent=false,fused=fused,max_registers=max_registers)
-        add_cuda_bm_singular_corrections!(ar,ai,cr,ci,Val(:combined),mesh,k,
+        isempty(images) || _launch_combined!(ar,ai,cr,ci,prepared.device_cache,k,images;
+            skip_adjacent=false,fused=fused,max_registers=max_registers,column_map=column_map)
+        targets = CudaCombinedColumns(column_map)
+        add_cuda_bm_singular_corrections!(ar,ai,cr,ci,targets,mesh,k,
             prepared.singular_cache,prepared.device_singular_cache,prepared.device_cache)
-        add_cuda_bm_image_corrections!(ar,ai,cr,ci,Val(:combined),mesh,k,prepared.rule,
+        add_cuda_bm_image_corrections!(ar,ai,cr,ci,targets,mesh,k,prepared.rule,
             prepared.device_image_singular_cache,prepared.device_cache)
         a = reshape(reinterpret(Complex{T}, astorage),n,n)
-        c = reshape(reinterpret(Complex{T}, cstorage),n,m)
+        c = reshape(reinterpret(Complex{T}, cstorage),n,max(m, 1))
         weights = CUDA.CuArray(p1_symmetry_orbit_weights(mesh, prepared.symmetry_mode))
         try
             a .*= weights
             c .*= weights
-            a .+= T(0.5) .* prepared.device_identity_cache.identity_p1_p1
-            c .+= Complex{T}(0,T(0.5)/k) .* prepared.device_identity_cache.identity_p1_dp0
+            # The cached mass matrices already include the orbit weights.
+            _cuda_add_sparse_identity!(a, prepared.identity_p1_p1, Complex{T}(T(0.5)))
+            identity_pq = active === nothing ? prepared.identity_p1_dp0 : prepared.identity_p1_dp0[:, active]
+            _cuda_add_sparse_identity!(c, identity_pq, Complex{T}(0,T(0.5)/k))
             CUDA.synchronize()
         finally
             CUDA.unsafe_free!(weights)
         end
         ok = true
-        return (a=a,c=c)
+        return (a=a, c=c, active_columns=active, dp0_count=f)
     finally
+        CUDA.unsafe_free!(column_map)
         if !ok
             CUDA.unsafe_free!(astorage)
             cstorage === nothing || CUDA.unsafe_free!(cstorage)
@@ -592,25 +691,74 @@ function _cuda_combined_projection_kernel!(out, c, colptr, rowval, values, n, to
     return nothing
 end
 
+function _cuda_combined_mapped_projection_kernel!(out, c, colptr, rowval, values, column_map, n, total)
+    index = (blockIdx().x-1)*blockDim().x + threadIdx().x
+    stride = blockDim().x*gridDim().x
+    while index <= total
+        row = (index-1)%n+1
+        col = (index-1) ÷ n+1
+        value = zero(eltype(out))
+        for pos in colptr[col]:(colptr[col+1]-1)
+            c_column = column_map[rowval[pos]]
+            c_column > 0 && (value += c[row+(c_column-1)*n]*values[pos])
+        end
+        out[index] = value
+        index += stride
+    end
+    return nothing
+end
+
+# Rows of a DP0 flux map on the retained C columns; refuses flux outside them.
+function _compact_flux_rows(flux, active, dp0_count)
+    active === nothing && return flux
+    size(flux, 1) == dp0_count || error("Flux map has $(size(flux, 1)) rows; expected $(dp0_count).")
+    mask = falses(dp0_count)
+    mask[active] .= true
+    rows = flux isa SparseMatrixCSC ? rowvals(flux)[.!iszero.(nonzeros(flux))] :
+           [i for i in axes(flux, 1) if any(!iszero, view(flux, i, :))]
+    all(row -> mask[row], rows) || error(
+        "Compact CUDA C was assembled for $(length(active)) flux-carrying faces, but a flux is nonzero " *
+        "outside them (set BLAB_CUDA_COUPLED_COMPACT_FLUX=0).")
+    return flux[active, :]
+end
+
 function build_cuda_combined_bem_blocks(operators, q, motion, prescribed)
     a,c = operators.a, operators.c
+    active = get(operators, :active_columns, nothing)
+    dp0_count = get(operators, :dp0_count, size(c, 2))
     interface = motion_block = prescribed_rhs = nothing
     success = false
     try
         if q isa NamedTuple
             interface = CUDA.zeros(eltype(c),size(c,1),q.ncols)
-            isempty(interface) || CUDA.@cuda threads=256 blocks=min(cld(length(interface),256),65535) _cuda_combined_projection_kernel!(
-                interface,c,q.colptr,q.rowval,q.nzval,size(c,1),length(interface))
+            if active === nothing
+                isempty(interface) || CUDA.@cuda threads=256 blocks=min(cld(length(interface),256),65535) _cuda_combined_projection_kernel!(
+                    interface,c,q.colptr,q.rowval,q.nzval,size(c,1),length(interface))
+            else
+                host_map = zeros(Int32, dp0_count)
+                host_map[active] .= Int32.(1:length(active))
+                column_map = CUDA.CuArray(host_map)
+                try
+                    isempty(interface) || CUDA.@cuda threads=256 blocks=min(cld(length(interface),256),65535) _cuda_combined_mapped_projection_kernel!(
+                        interface,c,q.colptr,q.rowval,q.nzval,column_map,size(c,1),length(interface))
+                    CUDA.synchronize()
+                finally
+                    CUDA.unsafe_free!(column_map)
+                end
+            end
         else
             error("Combined CUDA BEM blocks require the cached sparse interface map.")
         end
+        retained = active === nothing ? size(c, 2) : length(active)
         if size(motion,2)>0
-            d = CUDA.CuArray(Matrix(motion))
-            try; motion_block = c*d; finally; CUDA.unsafe_free!(d); end
+            rows = _compact_flux_rows(motion, active, dp0_count)
+            d = CUDA.CuArray(Matrix(rows))
+            try; motion_block = view(c, :, 1:retained)*d; finally; CUDA.unsafe_free!(d); end
         end
         if size(prescribed,2)>0
-            d = CUDA.CuArray(Matrix(prescribed))
-            try; prescribed_rhs = -(c*d); finally; CUDA.unsafe_free!(d); end
+            rows = _compact_flux_rows(prescribed, active, dp0_count)
+            d = CUDA.CuArray(Matrix(rows))
+            try; prescribed_rhs = -(view(c, :, 1:retained)*d); finally; CUDA.unsafe_free!(d); end
         end
         CUDA.synchronize()
         success = true
