@@ -2186,6 +2186,40 @@ function _rocm_transducer_condensation_enabled(
     error("BLAB_COUPLED_TRANSDUCER_CONDENSATION must be off, on, or auto.")
 end
 
+"""Own replay storage independently of the temporary coupled-assembly blocks."""
+function _build_interface_radiation_replay(bem_lhs, interface_block, backend::Symbol)
+    if backend != :cuda
+        return (backend=:cpu, factorization=lu(Array(bem_lhs)), interface_block=Array(interface_block))
+    end
+    cuda = BeatEngineCore.cuda_module()
+    factors = copy(bem_lhs)
+    factorization = block = nothing
+    success = false
+    try
+        factorization = lu!(factors)
+        block = copy(interface_block)
+        cuda.synchronize()
+        success = true
+        return (backend=:cuda, factorization=factorization, interface_block=block)
+    finally
+        if !success
+            cuda.unsafe_free!(factors)
+            isnothing(factorization) || cuda.unsafe_free!(factorization.ipiv)
+            isnothing(block) || cuda.unsafe_free!(block)
+        end
+    end
+end
+
+function _release_interface_radiation_replay!(replay)
+    if !isnothing(replay) && get(replay, :backend, :cpu) == :cuda
+        cuda = BeatEngineCore.cuda_module()
+        cuda.unsafe_free!(replay.factorization.factors)
+        cuda.unsafe_free!(replay.factorization.ipiv)
+        cuda.unsafe_free!(replay.interface_block)
+    end
+    return nothing
+end
+
 function build_coupled_system(
     fem_mesh::VolumeMesh{T},
     bem_mesh::BoundaryMesh{T},
@@ -2421,11 +2455,9 @@ function build_coupled_system(
                          zeros(Complex{T}, length(bem_mesh.vertices), 0) :
                          Complex{T}.(Array(bem_blocks.bem_prescribed_rhs))
     # Replay the frozen operating flux without changing the coupled state.
-    # Preserve host matrices before accelerator assembly storage is released.
-    interface_radiation_replay = retain_interface_radiation ? (
-        factorization=lu(Array(bem_lhs)),
-        interface_block=Array(bem_blocks.bem_interface_block),
-    ) : nothing
+    # Keep CUDA factors/operators resident; assembly frees its own copies below.
+    interface_radiation_replay = retain_interface_radiation ?
+        _build_interface_radiation_replay(bem_lhs, bem_blocks.bem_interface_block, linear_backend) : nothing
     bem_matrix_s = (time_ns() - bem_matrix_started) / 1.0e9
 
     condensation_started = time_ns()
@@ -2746,6 +2778,7 @@ function build_coupled_system(
 end
 
 function release_coupled_system!(system)
+    _release_interface_radiation_replay!(system.interface_radiation_replay)
     if system.linear_backend in (:cuda, :rocm)
         accelerator = system.linear_backend == :cuda ?
                       BeatEngineCore.cuda_module() : BeatEngineCore.amdgpu_module()

@@ -3691,6 +3691,8 @@ function solve_request_impl(request; event_mode=false)
                 "bem_backend" => String(bem_backend),
                 "interface_radiation_boundary_reconstruction_relative_error" => radiation_requested ?
                     [t.reconstruction_error for t in radiation_traces] : nothing,
+                "interface_radiation_backend" => radiation_requested ?
+                    String(get(coupled_system.interface_radiation_replay, :backend, :cpu)) : nothing,
                 "coupled_bem_assembly" => hasproperty(coupled_system, :coupled_bem_assembly) ? String(coupled_system.coupled_bem_assembly) : "operators",
                 "coupled_bem_assembly_fallback_reason" => get(coupled_system, :coupled_bem_assembly_fallback_reason, nothing),
                 "coupled_host_zgemm" => BeatEngineCoupledCondensed.host_zgemm_path(),
