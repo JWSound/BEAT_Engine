@@ -7,7 +7,7 @@ F ≈ 2 N_B BEM faces, n ≈ N_B + 2·transducers the dense order under flux eli
 |---|---|---|
 | Combined BEM assembly (A, C) | A (8 N_B²) + C (8 N_B·F) on shared storage | A + C on the flux-carrying columns only (8 N_B·F_active) |
 | Host combine | + host copy of A (8 N_B²) + negated C copy (8 N_B·F) | no copies: A and −C stay on the device-backed host views until consumed |
-| Dense system + factor | ComplexF64 matrix (16 n²) + ComplexF32 factor (8 n²); F64 LU fallback +16 n² | ComplexF32 store + border corrections (8 n² + 16 n·w) + factor (8 n²); with spill the store is a memory-mapped file (8 n² resident) |
+| Dense system + factor | ComplexF64 matrix (16 n²) + ComplexF32 factor (8 n²); F64 LU fallback +16 n² | ComplexF32 store + border corrections (8 n² + 16 n·w) + factor (8 n²); with spill the store is an unlinked scratch file streamed by panels (8 n² resident) |
 | Refinement fallback | ComplexF64 LU of the whole system | GMRES-IR (Float32 LU preconditioner applied in Float64) first |
 
 `w` is the border width: the non-BEM unknowns plus the BEM columns that the interface
@@ -23,8 +23,8 @@ elimination writes Float64 data into (|Γ|).
   `ComplexF32` store equals `ComplexF32.(M)` and the reconstruction equals `M` bit for bit
   (`tests/split_dense_tests.jl`). The factor is the one `RefinedDenseLU` computed; only the summation
   order of the residual product differs. The refinement acceptance test is unchanged.
-* **Spill** (`BLAB_COUPLED_DENSE_SPILL`): same arithmetic, the residual store is read from a mapped file
-  (unlinked at once, so no file outlives the factorization).
+* **Spill** (`BLAB_COUPLED_DENSE_SPILL`): same arithmetic, the residual store is streamed from a scratch file
+  (unlinked at once, so no file outlives the factorization; no Mmap dependency).
 * **GMRES-IR** (`BLAB_COUPLED_DENSE_GMRES_IR`): accepted only at the same Float64 backward-error test.
 
 `dense_solver_diagnostics` reports `lu_float32_split_refined`, `lu_float32_split_gmres_ir` or
@@ -45,7 +45,7 @@ bit; ROCm and the CUDA four-operator path materialize dense copies only where th
 |---|---|---|
 | Job-long device identities | dense P1×P1 + P1×DP0 (8 N_B² + 8 N_B·F) | none (sparse COO added during assembly) |
 | Combined assembly | A (8 N_B²) + C (8 N_B·F) | A + C on flux-carrying columns (`BLAB_CUDA_COUPLED_COMPACT_FLUX`) |
-| Dense LU | ComplexF32 `lu!` on the device, no refinement | same LU, refined on the host to the Float64 backward error (`SplitRefinedLU` with a device factor; host copy of the matrix, spillable) |
+| Dense LU | ComplexF32 `lu!` on the device, no refinement | same LU, refined on the host to the Float64 backward error (`SplitRefinedLU` with a device factor; host copy of the matrix, spillable to a scratch file) |
 
 `BLAB_COUPLED_DENSE_REFINEMENT=0` restores the unrefined CUDA solve. A refinement that stalls on
 CUDA falls back to a host `ComplexF64` LU (GMRES-IR needs host factors and is not used there).

@@ -16,14 +16,12 @@
 #
 #   memory  RefinedDenseLU 24 n²  ->  SplitRefinedLU 16 n² (`hi` kept for the residual)
 #                                  ->   8 n² with `BLAB_COUPLED_DENSE_SPILL`, which keeps the
-#                                       residual copy of `hi` in a memory-mapped file and factors
-#                                       `hi` in place (the residual streams it from disk).
+#                                       residual copy of `hi` in an unlinked scratch file and
+#                                       factors `hi` in place (the residual streams it from disk).
 #
 # A refinement that stalls continues as GMRES-IR (right-preconditioned GMRES in `ComplexF64`
 # with the `ComplexF32` LU as preconditioner) instead of a `ComplexF64` LU, which would need
 # 16 n² more. The `ComplexF64` LU stays as the last resort and says why it ran.
-
-using Mmap
 
 """
 `BLAB_COUPLED_DENSE_SPLIT=auto|1|0`: hold the refined dense coupled system as `ComplexF32` plus
@@ -34,7 +32,7 @@ _dense_split_enabled() = lowercase(strip(get(ENV, "BLAB_COUPLED_DENSE_SPLIT", "a
 
 """
 `BLAB_COUPLED_DENSE_SPILL=off|auto|on|<directory>`: keep the refinement copy of the `ComplexF32`
-system in a memory-mapped file instead of RAM (8 n² instead of 16 n² resident). `auto` (default)
+system in a scratch file instead of RAM (8 n² instead of 16 n² resident). `auto` (default)
 spills when 16 n² would exceed `BLAB_COUPLED_DENSE_SPILL_FRACTION` (default 0.5) of physical
 memory; `on` always spills; a directory spills there (default: `tempdir()`).
 """
@@ -59,6 +57,60 @@ const SPLIT_REFINEMENT_MAX_ITERATIONS = 10       # as DENSE_REFINEMENT_MAX_ITERA
 const DENSE_GMRES_IR_RESTART = 30
 const DENSE_GMRES_IR_MAX_CYCLES = 10
 const DENSE_SPLIT_PANEL_BYTES = 256 * 1024^2     # ComplexF64 panel used by the residual product
+
+"""
+    SpilledMatrix(matrix)
+
+A read-only `ComplexF32` matrix kept in an unlinked scratch file (column-major, streamed by
+column panels). The open handle keeps the data alive; closing it (finalizer) frees the space.
+No Mmap: the engine bundles do not declare that standard library.
+"""
+mutable struct SpilledMatrix <: AbstractMatrix{ComplexF32}
+    io::IOStream
+    rows::Int
+    columns::Int
+    path::String
+    function SpilledMatrix(matrix::Matrix{ComplexF32}, directory::AbstractString)
+        path, io = mktemp(directory; cleanup=true)
+        write(io, matrix)
+        flush(io)
+        rm(path; force=true)                 # unlinked: the space returns when `io` is closed
+        spilled = new(io, size(matrix, 1), size(matrix, 2), path)
+        finalizer(spilled -> close(spilled.io), spilled)
+        return spilled
+    end
+end
+
+Base.size(matrix::SpilledMatrix) = (matrix.rows, matrix.columns)
+
+function Base.getindex(matrix::SpilledMatrix, i::Int, j::Int)
+    @boundscheck checkbounds(matrix, i, j)
+    seek(matrix.io, ((j - 1) * matrix.rows + (i - 1)) * sizeof(ComplexF32))
+    return read(matrix.io, ComplexF32)
+end
+
+"""Copy columns `columns` of `store` into `panel` (a ComplexF32 buffer of matching size)."""
+_load_panel!(panel::AbstractMatrix{ComplexF32}, store::AbstractMatrix{ComplexF32}, columns) =
+    copyto!(panel, view(store, :, columns))
+
+function _load_panel!(panel::AbstractMatrix{ComplexF32}, store::SpilledMatrix, columns::UnitRange{Int})
+    size(panel) == (store.rows, length(columns)) || throw(DimensionMismatch("panel size"))
+    seek(store.io, (first(columns) - 1) * store.rows * sizeof(ComplexF32))
+    if panel isa Matrix{ComplexF32}
+        read!(store.io, panel)
+    else
+        buffer = Matrix{ComplexF32}(undef, size(panel))
+        read!(store.io, buffer)
+        copyto!(panel, buffer)
+    end
+    return panel
+end
+
+_load_all(store::AbstractMatrix{ComplexF32}) = store
+function _load_all(store::SpilledMatrix)
+    matrix = Matrix{ComplexF32}(undef, size(store))
+    return _load_panel!(matrix, store, 1:store.columns)
+end
 
 """
     SplitDenseMatrix(n, border_rows, border_columns)
@@ -177,7 +229,7 @@ end
 
 """Materialize the exact `ComplexF64` matrix (the last-resort fallback; 16 n²)."""
 function _split_materialize(store::AbstractMatrix{ComplexF32}, matrix::SplitDenseMatrix)
-    dense = ComplexF64.(store)
+    dense = ComplexF64.(_load_all(store))
     _split_add_corrections!(dense, matrix)
     return dense
 end
@@ -207,12 +259,15 @@ function _split_mul!(result::AbstractMatrix{ComplexF64}, store::AbstractMatrix{C
     n = size(store, 1)
     width = max(1, min(size(store, 2), DENSE_SPLIT_PANEL_BYTES ÷ (16 * n)))
     panel = Matrix{ComplexF64}(undef, n, width)
+    panel32 = Matrix{ComplexF32}(undef, n, width)
     iszero(beta) ? fill!(result, zero(ComplexF64)) : (isone(beta) || (result .*= beta))
     for first_column in 1:width:size(store, 2)
         last_column = min(first_column + width - 1, size(store, 2))
         columns = first_column:last_column
+        loaded = length(columns) == width ? panel32 : Matrix{ComplexF32}(undef, n, length(columns))
+        _load_panel!(loaded, store, columns)
         block = view(panel, :, 1:length(columns))
-        block .= view(store, :, columns)
+        block .= loaded
         mul!(result, block, view(x, columns, :), alpha, one(ComplexF64))
     end
     # Border columns: every row; border rows: outside the border columns; strays.
@@ -267,7 +322,7 @@ The refined dense solve of `RefinedDenseLU` over a `SplitDenseMatrix`: `ComplexF
 iterative refinement against the exact matrix, GMRES-IR when refinement stalls, and the
 `ComplexF64` LU (materialized) only as the last resort. `spill_path` names the memory-mapped file
 holding the residual copy of `hi` when `BLAB_COUPLED_DENSE_SPILL` applies; it is unlinked as soon
-as it is mapped, so its space returns when the factorization is collected.
+as it is written, so its space returns when the factorization is collected.
 """
 mutable struct SplitRefinedLU
     matrix::SplitDenseMatrix
@@ -287,18 +342,8 @@ mutable struct SplitRefinedLU
 end
 
 function _split_spill(hi::Matrix{ComplexF32}, directory::AbstractString)
-    path, io = mktemp(directory; cleanup=true)
-    try
-        write(io, hi)
-        flush(io)
-    finally
-        close(io)
-    end
-    store = open(io -> Mmap.mmap(io, Matrix{ComplexF32}, size(hi)), path, "r")
-    # Unlink at once: the mapping keeps the data, and the disk space returns when `store` is
-    # unmapped (garbage collected), so no frequency leaves a file behind.
-    rm(path; force=true)
-    return store, path
+    store = SpilledMatrix(hi, directory)
+    return store, store.path
 end
 
 function SplitRefinedLU(matrix::SplitDenseMatrix)
@@ -307,8 +352,9 @@ function SplitRefinedLU(matrix::SplitDenseMatrix)
         throw(ArgumentError("dense coupled matrix has non-finite entries"))
     n = size(matrix, 1)
     spill_directory = _dense_spill_target(n)
+    matrix_norm = _split_opnorm_inf(matrix.hi, matrix)
     store, spill_path = isnothing(spill_directory) ? (matrix.hi, nothing) : _split_spill(matrix.hi, spill_directory)
-    refined = SplitRefinedLU(matrix, store, _split_opnorm_inf(store, matrix), nothing, nothing, 0, 0, nothing, NaN, spill_path,
+    refined = SplitRefinedLU(matrix, store, matrix_norm, nothing, nothing, 0, 0, nothing, NaN, spill_path,
                              nothing, nothing)
     if matrix.overflow
         _split_fall_back!(refined, "an entry is outside the Float32 range")
@@ -331,16 +377,17 @@ end
     SplitRefinedLU(matrix, device_solve, release_device)
 
 Refinement on the host around a factorization held on a device (CUDA): `matrix.hi` is the
-host copy of the matrix that was factored there (spilled to a mapped file under
+host copy of the matrix that was factored there (spilled to a scratch file under
 `BLAB_COUPLED_DENSE_SPILL`, so the host may hold none of it). GMRES-IR needs the factors on the
 host and is skipped; a stall falls back to a host `ComplexF64` LU.
 """
 function SplitRefinedLU(matrix::SplitDenseMatrix, device_solve::Function, release_device::Function)
     all(isfinite, matrix.hi) || throw(ArgumentError("dense coupled matrix has non-finite entries"))
     spill_directory = _dense_spill_target(size(matrix, 1))
+    matrix_norm = _split_opnorm_inf(matrix.hi, matrix)
     store, spill_path = isnothing(spill_directory) ? (matrix.hi, nothing) : _split_spill(matrix.hi, spill_directory)
     isnothing(spill_path) || (matrix.hi = Matrix{ComplexF32}(undef, 0, 0))
-    return SplitRefinedLU(matrix, store, _split_opnorm_inf(store, matrix), nothing, nothing, 0, 0, nothing, NaN,
+    return SplitRefinedLU(matrix, store, matrix_norm, nothing, nothing, 0, 0, nothing, NaN,
                           spill_path, device_solve, release_device)
 end
 

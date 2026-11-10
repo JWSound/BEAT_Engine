@@ -308,7 +308,8 @@ using ..BeatEngineCoupled: SplitDenseMatrix, SplitRefinedLU, release_split_facto
     dense_solver_diagnostics(system) -> Dict{String,Any}
 
 The dense coupled factorization that ran: `dense_solver` (`lu_float32`, `lu_float64`,
-`lu_float32_refined`, or `lu_float64_fallback` after a refinement fallback),
+`lu_float32_refined`, `lu_float32_split_refined` / `lu_float32_split_gmres_ir` (split storage,
+BeatEngineSplitDense.jl), or `lu_float64_fallback` after a refinement fallback),
 `dense_refinement_iterations`, `dense_refinement_fallback_reason` and `dense_refinement_backward_error`
 (the last solve's worst column, in units of the Float64 attainable backward error).
 """

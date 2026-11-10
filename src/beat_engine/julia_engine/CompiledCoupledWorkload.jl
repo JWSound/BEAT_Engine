@@ -232,7 +232,10 @@ function check_coupled_workload(run; mumps::Bool, defaults::Symbol=:metal)
         @assert d["transducer_count"] == 1 && d["interface_count"] == 1 d
         @assert d["fem_interior_reconstruction"] == "skipped" d
         @assert isempty(d["coupled_optimization_fallback_reasons"]) d
-        @assert d["dense_solver"] in ("lu_float32_refined", "lu_float64_fallback") d
+        @assert d["dense_solver"] in ("lu_float32_refined", "lu_float32_split_refined",
+                                      "lu_float32_split_gmres_ir", "lu_float64_fallback") d
+        get(d, "dense_split_stray_entries", 0) == 0 ||
+            @warn "BEAT coupled workload: Float64 corrections outside the split border" d["dense_split_stray_entries"]
         if d["dense_solver"] == "lu_float64_fallback"
             @warn "BEAT coupled workload refinement fell back" reason=d["dense_refinement_fallback_reason"]
         end

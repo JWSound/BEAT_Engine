@@ -2759,7 +2759,7 @@ function build_coupled_system(
         rocm_dense_lu!(coupled)
     elseif linear_backend == :cuda && T == Float32 && _cuda_dense_refinement_enabled()
         # Float32 LU on the device as before, now refined on the host to the Float64 backward
-        # error against the assembled matrix (whose host copy may be spilled to a mapped file).
+        # error against the assembled matrix (whose host copy may be spilled to a scratch file).
         _cuda_refined_dense_lu!(coupled)
     else
         lu!(coupled)
