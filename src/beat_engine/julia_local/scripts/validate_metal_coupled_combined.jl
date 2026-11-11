@@ -70,9 +70,30 @@ function check_matrices(mesh, prepared, k, singular_order)
             spzeros(Float32, f, 0), zeros(ComplexF32, f, 0), zeros(ComplexF32, f, 0))
         size(empty_blocks.bem_prescribed_rhs, 2) == 0 || error("empty projection failed")
         check_compact_columns(mesh, prepared, k, host, q)
+        check_panels(mesh, prepared, k, host)
     finally
         release_operator_storage!(host_operators === nothing ? operators : host_operators)
         combined === nothing || BeatEngineCore.release_metal_coupled_burton_miller!(combined)
+    end
+end
+
+# Tiled A (BLAB_METAL_COUPLED_PANEL_COLUMNS): column panels wrapped over one host matrix must give
+# exactly the single-buffer A and C, for the narrowest panels and for two panels.
+function check_panels(mesh, prepared, k, full_host)
+    n = size(full_host.a, 1)
+    for width in ("1", string(max(1, n ÷ 2)))
+        panelled = nothing
+        try
+            panelled = withenv("BLAB_METAL_COUPLED_PANEL_COLUMNS" => width) do
+                BeatEngineCore.assemble_coupled_burton_miller_metal(mesh, prepared, k)
+            end
+            hasproperty(panelled, :a_panels) || error("panel assembly was not used for width $width")
+            host = BeatEngineCore.metal_host_coupled_burton_miller(panelled)
+            check("A (panels of >= $width columns, $(length(panelled.a_panels)) panels)", full_host.a, host.a; rtol=0, atol=0)
+            check("C (panel run)", full_host.c, host.c; rtol=0, atol=0)
+        finally
+            panelled === nothing || BeatEngineCore.release_metal_coupled_burton_miller!(panelled)
+        end
     end
 end
 

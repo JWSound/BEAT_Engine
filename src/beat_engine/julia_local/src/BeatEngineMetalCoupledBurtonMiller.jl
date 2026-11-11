@@ -61,6 +61,7 @@ function _launch_metal_coupled_pair_kernels!(
     trial_curl_sign_y,
     trial_curl_sign_z;
     element_columns=cache.element_dp0_dofs,
+    lhs_panels=nothing,
 )
     element_count = length(cache.element_indices)
     element_count == 0 && return nothing
@@ -111,6 +112,22 @@ function _launch_metal_coupled_pair_kernels!(
         stamp = _metal_gather_stage!("fused_rhs", timed, stamp)
         node_start = tables.chunk_node_offsets[chunk]
         node_count = tables.chunk_node_offsets[chunk + 1] - node_start
+        if lhs_panels !== nothing
+            # Tiled A: the same gather once per column panel, each writing only its own columns.
+            for (panel, column_first, column_last) in lhs_panels
+                _metal_launch(
+                    _metal_fused_lhs_gather_panel_kernel!,
+                    cache.p1_dof_count * node_count,
+                    panel, blocks, tables.element_positions, cache.vertex_offsets, cache.incident_elements,
+                    cache.incident_local_indices, tables.chunk_nodes, tables.inc_offsets, tables.inc_packed,
+                    Int32(node_start), Int32(node_count), Int32(element_count), pair_stride, p1_count,
+                    Int32(column_first), Int32(column_last);
+                    groupsize=groupsize,
+                )
+            end
+            stamp = _metal_gather_stage!("fused_lhs", timed, stamp)
+            continue
+        end
         _metal_launch(
             _metal_fused_lhs_gather_kernel!,
             cache.p1_dof_count * node_count,
@@ -143,6 +160,7 @@ function _launch_metal_coupled_singular_kernels!(
     k,
     transform::SymmetryTransform=SymmetryTransform(:identity, SVector{3,Int}(1, 1, 1), 1);
     compact=nothing,
+    lhs_panels=nothing,
 )
     pair_count = singular_cache.pair_count
     pair_count == 0 && return nothing
@@ -160,8 +178,8 @@ function _launch_metal_coupled_singular_kernels!(
     value_count = pair_count * part_count
     lhs_values = rhs_values = nothing
     try
-        lhs_values = Metal.zeros(eltype(lhs), value_count, 9)
-        rhs_values = Metal.zeros(eltype(lhs), value_count, 3)
+        lhs_values = Metal.zeros(eltype(rhs_operator), value_count, 9)
+        rhs_values = Metal.zeros(eltype(rhs_operator), value_count, 3)
         # The exterior fused path's packed singular blocks, grouped by rule point count.
         tables = _metal_fused_singular_tables_for(regular_cache, singular_cache)
         packed = _metal_packed_pair_tables_for(regular_cache)
@@ -186,10 +204,26 @@ function _launch_metal_coupled_singular_kernels!(
             )
             compact.singular[objectid(singular_cache)]
         end
+        if lhs_panels !== nothing
+            # Tiled A: each panel takes the entries of its own column range.
+            block_map = gather_tables.p1_p1
+            rows = Int64(regular_cache.p1_dof_count)
+            for (panel, column_first, column_last) in lhs_panels
+                _metal_launch(
+                    _metal_singular_entry_gather_panel_kernel!,
+                    block_map.entry_count,
+                    panel, lhs_values,
+                    block_map.entry_indices, block_map.contrib_offsets, block_map.contrib_values,
+                    block_map.entry_count, pair_count, part_count,
+                    (Int64(column_first) - 1) * rows + 1, Int64(column_last) * rows,
+                )
+            end
+        end
         for (destination, values, block_map) in (
             (lhs, lhs_values, gather_tables.p1_p1),
             (rhs_operator, rhs_values, rhs_map),
         )
+            destination === nothing && continue
             _metal_launch(
                 _metal_singular_entry_gather_kernel!,
                 block_map.entry_count,
@@ -205,6 +239,180 @@ function _launch_metal_coupled_singular_kernels!(
         rhs_values === nothing || Metal.unsafe_free!(rhs_values)
     end
     return nothing
+end
+
+# ---------------------------------------------------------------------------
+# Column-panel ("tiled") assembly of A.
+#
+# One Metal buffer may hold at most `maxBufferLength` bytes (20.1 GB on a 32 GB M1 Max), and the
+# stock combined path keeps A (8 N^2 bytes) in one buffer. When A is larger, A is allocated as one
+# page-aligned host matrix and split into column panels, each wrapped without a copy as its own
+# shared Metal buffer. The kernels below are the stock gather/write-back kernels with a column
+# window: each launch writes only the columns of its panel, at panel-local offsets. Pair blocks are
+# computed once per chunk and gathered into every panel, so the arithmetic, the summation order
+# and therefore every entry are the same as in the single-buffer path. C stays one buffer (it is
+# compact). Memory is the same 8 N^2 as before, plus at most one alignment group of columns.
+# ---------------------------------------------------------------------------
+
+function _metal_fused_lhs_gather_panel_kernel!(
+    lhs,
+    blocks,
+    element_positions,
+    vertex_offsets,
+    incident_elements,
+    incident_local_indices,
+    chunk_nodes,
+    inc_offsets,
+    inc_packed,
+    node_start::Int32,
+    node_count::Int32,
+    element_count::Int32,
+    pair_stride::Int32,
+    p1_count::Int32,
+    column_first::Int32,
+    column_last::Int32,
+)
+    index = Int32(thread_position_in_grid_1d())
+    index > p1_count * node_count && return nothing
+    row = (index - Int32(1)) % p1_count + Int32(1)
+    node_local = (index - Int32(1)) ÷ p1_count + Int32(1)
+    node_position = node_start + node_local - Int32(1)
+    @inbounds column = Int32(chunk_nodes[node_position])
+    (column < column_first || column > column_last) && return nothing
+    @inbounds chunk_first = Int32(inc_offsets[node_position])
+    @inbounds chunk_stop = Int32(inc_offsets[node_position + Int32(1)]) - Int32(1)
+    value_re = zero(eltype(blocks))
+    value_im = zero(eltype(blocks))
+    @inbounds incident_position = Int32(vertex_offsets[row])
+    @inbounds incident_stop = Int32(vertex_offsets[row + Int32(1)]) - Int32(1)
+    while incident_position <= incident_stop
+        @inbounds test_position = Int32(element_positions[incident_elements[incident_position]])
+        @inbounds local_row = Int32(incident_local_indices[incident_position])
+        chunk_position = chunk_first
+        while chunk_position <= chunk_stop
+            @inbounds packed = Int32(inc_packed[chunk_position])
+            trial_local = (packed >> 2) + Int32(1)
+            local_column = packed & Int32(3)
+            pair = test_position + element_count * (trial_local - Int32(1))
+            component = local_row + Int32(3) * (local_column - Int32(1))   # 1..9
+            @inbounds value_re += blocks[pair + (component - Int32(1)) * pair_stride]
+            @inbounds value_im += blocks[pair + (component + Int32(8)) * pair_stride]
+            chunk_position += Int32(1)
+        end
+        incident_position += Int32(1)
+    end
+    @inbounds lhs[Int64(row) + Int64(column - column_first) * Int64(p1_count)] += Complex(value_re, value_im)
+    return nothing
+end
+
+
+# The singular write-back of A restricted to one panel: entries are linear column-major indices
+# into the full N x N matrix; those inside `entry_first:entry_last` are written at panel offsets.
+function _metal_singular_entry_gather_panel_kernel!(
+    operator,
+    values,
+    entry_indices,
+    contrib_offsets,
+    contrib_values,
+    entry_count,
+    pair_count,
+    part_count,
+    entry_first::Int64,
+    entry_last::Int64,
+)
+    index = _metal_global_linear_index()
+    index > entry_count && return nothing
+    @inbounds begin
+        entry = Int64(entry_indices[index])
+        (entry < entry_first || entry > entry_last) && return nothing
+        position = Int(contrib_offsets[index])
+        position_stop = Int(contrib_offsets[index + 1]) - 1
+        total = zero(eltype(values))
+        while position <= position_stop
+            value_index = Int(contrib_values[position])
+            part = 1
+            while part <= part_count
+                total += values[value_index]
+                value_index += pair_count
+                part += 1
+            end
+            position += 1
+        end
+        operator[entry - entry_first + 1] += total
+    end
+    return nothing
+end
+
+# The sparse identity add restricted to one panel (same arithmetic as the stock scatter kernel).
+function _metal_sparse_scatter_panel_kernel!(destination, rows, columns, values, alpha, column_first::Int, column_last::Int)
+    index = _metal_global_linear_index()
+    if index <= length(values)
+        @inbounds column = Int(columns[index])
+        if column_first <= column <= column_last
+            @inbounds row = Int(rows[index])
+            @inbounds value = alpha * values[index]
+            @inbounds destination[row, column - column_first + 1] += value
+        end
+    end
+    return nothing
+end
+
+"""
+`BLAB_METAL_COUPLED_PANEL_COLUMNS`: `auto` (default) assembles A in column panels only when it does
+not fit one Metal buffer; an integer forces panels of about that many columns (rounded to page
+alignment; for validation against the single-buffer path); `off` never splits (A larger than
+`maxBufferLength` then fails as in the stock engine).
+"""
+function _metal_coupled_panel_plan(n::Int, ::Type{E}) where {E}
+    setting = lowercase(strip(get(ENV, "BLAB_METAL_COUPLED_PANEL_COLUMNS", "auto")))
+    setting == "off" && return nothing
+    page = Int(ccall(:getpagesize, Cint, ()))
+    column_bytes = n * sizeof(E)
+    # Panel starts and lengths must be whole pages for a no-copy wrap: columns come in groups of `step`.
+    step = page ÷ gcd(column_bytes, page)
+    limit = Int(Metal.device().maxBufferLength) - page
+    requested = if setting == "auto"
+        column_bytes * n <= limit && return nothing
+        limit ÷ column_bytes
+    else
+        value = tryparse(Int, setting)
+        value === nothing && error("BLAB_METAL_COUPLED_PANEL_COLUMNS must be auto, off, or a column count; got $(repr(setting)).")
+        min(max(value, 1), limit ÷ column_bytes)
+    end
+    step * column_bytes <= limit ||
+        error("A Metal buffer cannot hold even $(step) columns of $(n) rows; panel assembly is impossible.")
+    # A forced width below one alignment group still runs the panel path (one group per panel).
+    width = max(step, (requested ÷ step) * step)
+    width >= n && setting == "auto" && return nothing
+    firsts = collect(1:width:n)
+    panels = [(first, min(first + width - 1, n)) for first in firsts]
+    # The last panel is wrapped up to a whole page: pad the host allocation by < step columns.
+    padded_columns = panels[end][1] - 1 + cld(panels[end][2] - panels[end][1] + 1, step) * step
+    return (panels=panels, padded_columns=padded_columns, page=page, step=step)
+end
+
+# A page-aligned, zeroed host matrix of n x padded_columns, freed by the GC (posix_memalign + free).
+function _metal_aligned_host_matrix(::Type{E}, n::Int, padded_columns::Int, page::Int) where {E}
+    bytes = n * padded_columns * sizeof(E)
+    pointer_ref = Ref{Ptr{Cvoid}}(C_NULL)
+    status = ccall(:posix_memalign, Cint, (Ptr{Ptr{Cvoid}}, Csize_t, Csize_t), pointer_ref, page, bytes)
+    status == 0 || throw(OutOfMemoryError())
+    storage = unsafe_wrap(Array, Ptr{E}(pointer_ref[]), (n, padded_columns); own=true)
+    Threads.@threads for column in 1:padded_columns
+        @inbounds fill!(view(storage, :, column), zero(E))
+    end
+    return storage
+end
+
+# Wrap columns `first:last` (padded to whole pages for the last panel) of `storage` as a shared Metal buffer.
+function _metal_wrap_panel(storage::Matrix{E}, first::Int, last::Int, step::Int) where {E}
+    n = size(storage, 1)
+    columns = cld(last - first + 1, step) * step
+    first + columns - 1 <= size(storage, 2) || error("Panel wrap exceeds the padded host matrix.")
+    slice = unsafe_wrap(Array, pointer(storage, (first - 1) * n + 1), (n, columns))
+    # Shared storage is the default of a no-copy wrap; `storage` itself must keep the memory alive
+    # for as long as the panel is in use (the caller holds it in the result tuple).
+    return unsafe_wrap(MtlArray{E,2}, slice, (n, columns))
 end
 
 # Unsupported diagnostic configurations keep their original operator kernels.
@@ -339,6 +547,7 @@ function assemble_coupled_burton_miller_metal(
     owns_identity = identity_cache === nothing
     owns_identity && (identity_cache = build_metal_coupled_identity_cache(prepared, T))
     a = c = blocks = nothing
+    panels = a_storage = nothing
     succeeded = false
     try
         storage = metal_operator_storage_mode()
@@ -350,11 +559,19 @@ function assemble_coupled_burton_miller_metal(
         compact = get(identity_cache, :compact, nothing)
         element_columns = compact === nothing ? cache.element_dp0_dofs : compact.element_columns
         column_count = compact === nothing ? prepared.dp0.global_dof_count : length(compact.active)
-        a = Metal.zeros(Complex{T}, prepared.p1.global_dof_count, prepared.p1.global_dof_count; storage=storage)
-        c = Metal.zeros(Complex{T}, prepared.p1.global_dof_count, max(column_count, 1); storage=storage)
+        n = prepared.p1.global_dof_count
+        plan = storage === Metal.SharedStorage ? _metal_coupled_panel_plan(n, Complex{T}) : nothing
+        if plan === nothing
+            a = Metal.zeros(Complex{T}, n, n; storage=storage)
+        else
+            # A larger than one Metal buffer: one page-aligned host matrix, wrapped panel by panel.
+            a_storage = _metal_aligned_host_matrix(Complex{T}, n, plan.padded_columns, plan.page)
+            panels = [(_metal_wrap_panel(a_storage, first, last, plan.step), first, last) for (first, last) in plan.panels]
+        end
+        c = Metal.zeros(Complex{T}, n, max(column_count, 1); storage=storage)
         _launch_metal_coupled_pair_kernels!(
             a, c, blocks, cache, signed_k, cache.vertex_offsets, cache.incident_elements, Int32(0),
-            one(T), one(T), one(T), one(T), one(T), one(T); element_columns=element_columns,
+            one(T), one(T), one(T), one(T), one(T), one(T); element_columns=element_columns, lhs_panels=panels,
         )
         for (transform, image_cache) in zip(cache.image_transforms, cache.image_singular_caches)
             _launch_metal_coupled_pair_kernels!(
@@ -363,14 +580,16 @@ function assemble_coupled_burton_miller_metal(
                 T(transform.determinant * transform.signs[1]),
                 T(transform.determinant * transform.signs[2]),
                 T(transform.determinant * transform.signs[3]);
-                element_columns=element_columns,
+                element_columns=element_columns, lhs_panels=panels,
             )
         end
         # Singular compact blocks carry A and -C too; reuse the P1/DP0 map,
         # with one owner per cell instead of the exterior known-flux row map.
-        _launch_metal_coupled_singular_kernels!(a, c, cache, prepared.device_singular_cache, signed_k; compact=compact)
+        _launch_metal_coupled_singular_kernels!(a, c, cache, prepared.device_singular_cache, signed_k;
+                                                compact=compact, lhs_panels=panels)
         for (transform, image_cache) in zip(cache.image_transforms, cache.image_singular_caches)
-            _launch_metal_coupled_singular_kernels!(a, c, cache, image_cache, signed_k, transform; compact=compact)
+            _launch_metal_coupled_singular_kernels!(a, c, cache, image_cache, signed_k, transform;
+                                                    compact=compact, lhs_panels=panels)
         end
         # Only the integral part is row weighted. The cached mass matrices
         # already include the orbit weights. Convert the retained -C to C here.
@@ -379,18 +598,40 @@ function assemble_coupled_burton_miller_metal(
         else
             weights = MtlArray(Complex{T}.(p1_symmetry_orbit_weights(mesh, prepared.symmetry_mode)))
             try
-                a .*= reshape(weights, :, 1)
+                if panels === nothing
+                    a .*= reshape(weights, :, 1)
+                else
+                    foreach(panel -> (panel[1] .*= reshape(weights, :, 1)), panels)
+                end
                 c .= .-c .* reshape(weights, :, 1)
                 Metal.synchronize()
             finally
                 Metal.unsafe_free!(weights)
             end
         end
-        scatter_metal_sparse_to_dense!(a, identity_cache.p1_p1; alpha=Complex{T}(0.5), add=true)
+        if panels === nothing
+            scatter_metal_sparse_to_dense!(a, identity_cache.p1_p1; alpha=Complex{T}(0.5), add=true)
+        else
+            identity = identity_cache.p1_p1
+            for (panel, column_first, column_last) in panels
+                isempty(identity.values) && break
+                _metal_launch(_metal_sparse_scatter_panel_kernel!, length(identity.values),
+                              panel, identity.rows, identity.columns, identity.values,
+                              convert(Complex{T}, Complex{T}(0.5)), column_first, column_last)
+            end
+        end
         scatter_metal_sparse_to_dense!(c, identity_cache.p1_dp0;
             alpha=T(0.5) * burton_miller_coupling(k), add=true)
         Metal.synchronize()
         succeeded = true
+        if panels !== nothing
+            # The panels write straight into host memory: A is that memory, no copy.
+            a = unsafe_wrap(Array, pointer(a_storage), (n, n))
+            return (a=a, c=c, on_gpu=true, gpu_backend=:metal, assembly_mode=:metal_coupled_combined,
+                    active_columns=compact === nothing ? nothing : compact.active,
+                    dp0_count=prepared.dp0.global_dof_count,
+                    a_panels=[panel[1] for panel in panels], a_storage=a_storage)
+        end
         return (a=a, c=c, on_gpu=true, gpu_backend=:metal, assembly_mode=:metal_coupled_combined,
                 active_columns=compact === nothing ? nothing : compact.active,
                 dp0_count=prepared.dp0.global_dof_count)
@@ -401,6 +642,7 @@ function assemble_coupled_burton_miller_metal(
         if !succeeded
             a === nothing || Metal.unsafe_free!(a)
             c === nothing || Metal.unsafe_free!(c)
+            panels === nothing || foreach(panel -> Metal.unsafe_free!(panel[1]), panels)
         end
     end
 end
@@ -409,6 +651,14 @@ end
 function metal_host_coupled_burton_miller(combined)
     get(combined, :on_gpu, false) || return combined
     Metal.synchronize()
+    if hasproperty(combined, :a_storage)
+        # Tiled A already lives in host memory; the panels and the storage are its backing.
+        c = Metal.is_shared(combined.c) ? unsafe_wrap(Array, combined.c) : Array(combined.c)
+        return (a=combined.a, c=c, on_gpu=false,
+                metal_backing=(a=combined.a_panels, c=combined.c, a_storage=combined.a_storage),
+                active_columns=get(combined, :active_columns, nothing),
+                dp0_count=get(combined, :dp0_count, size(c, 2)))
+    end
     a = Metal.is_shared(combined.a) ? unsafe_wrap(Array, combined.a) : Array(combined.a)
     c = Metal.is_shared(combined.c) ? unsafe_wrap(Array, combined.c) : Array(combined.c)
     return (a=a, c=c, on_gpu=false, metal_backing=(a=combined.a, c=combined.c),
@@ -418,7 +668,13 @@ end
 
 function release_metal_coupled_burton_miller!(combined)
     backing = get(combined, :metal_backing, combined)
-    Metal.unsafe_free!(backing.a)
+    if hasproperty(combined, :a_panels) && !hasproperty(combined, :metal_backing)
+        foreach(Metal.unsafe_free!, combined.a_panels)   # tiled A on the device tuple
+    elseif backing.a isa AbstractVector
+        foreach(Metal.unsafe_free!, backing.a)           # tiled A on the host tuple
+    elseif backing.a isa MtlArray
+        Metal.unsafe_free!(backing.a)
+    end
     Metal.unsafe_free!(backing.c)
     return nothing
 end
