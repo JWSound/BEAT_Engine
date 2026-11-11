@@ -1849,6 +1849,8 @@ function build_field_evaluation_cache(mesh::BoundaryMesh{T}, rule::TriangleRule{
 end
 
 include(joinpath(@__DIR__, "BeatEngineFieldGradient.jl"))
+include(joinpath(@__DIR__, "BeatEngineDenseLu.jl"))
+export dense_lu!, dense_lu_library, dense_lu_library_diagnostic
 include(joinpath(@__DIR__, "BeatEngineDenseSolve.jl"))
 include(joinpath(@__DIR__, "BeatEngineSweepOverlap.jl"))
 include(joinpath(@__DIR__, "BeatEngineCpu.jl"))

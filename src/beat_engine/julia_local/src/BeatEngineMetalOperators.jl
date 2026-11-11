@@ -185,7 +185,7 @@ function metal_dense_lu!(matrix)
         Metal.synchronize()
         host = Array(matrix)
         Metal.unsafe_free!(matrix)
-        return lu!(host)
+        return dense_lu!(host)
     end
     return lu!(matrix)
 end

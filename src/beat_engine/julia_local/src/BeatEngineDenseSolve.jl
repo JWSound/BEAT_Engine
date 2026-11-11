@@ -1103,7 +1103,7 @@ end
 
 function _beat_dense_lu_solve(matrix, rhs_matrix, preserve_matrix::Bool)
     elapsed = @elapsed begin
-        factorization = preserve_matrix ? lu!(copy(matrix)) : lu!(matrix)
+        factorization = preserve_matrix ? dense_lu!(copy(matrix)) : dense_lu!(matrix)
         solution = factorization \ rhs_matrix
     end
     return solution, elapsed

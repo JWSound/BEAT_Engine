@@ -98,3 +98,11 @@ coexist on the device while the system is built.
 - Dense LU through Apple Accelerate (AMX/SME) instead of OpenBLAS; benchmark pending.
 - The exterior-only solvers still build dense identities; the same fix applies there.
 - The Deploy path still uses the four-operator Metal assembly.
+
+## Optional: Accelerate dense LU (`BLAB_DENSE_LU_LIBRARY`)
+
+- Host dense LU factorizations can use Apple Accelerate's ILP64 `getrf` instead of OpenBLAS:
+  `BLAB_DENSE_LU_LIBRARY=accelerate`, or `auto` (Accelerate only where the chip has SME, M4 and later).
+- Default `blas`: on an M1 Max (no SME) Accelerate's `cgetrf` was slower than OpenBLAS
+  (340-500 vs 520-570 GFLOP/s, n = 4096-24576). M4/M5 owners: run `tools/bench_dense_lu.jl` to decide.
+- Only the factorization changes library; the factors are an ordinary `LU`, solves are unchanged.

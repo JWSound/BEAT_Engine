@@ -2745,7 +2745,7 @@ function build_coupled_system(
         # Coupled pressure/flux/transducer blocks can be badly scaled. A host
         # Float32 LU loses coefficient accuracy even when the assembled entries
         # are adequate; keep the host solve in Float64 and cast only its traces.
-        lu!(ComplexF64.(coupled))
+        dense_lu!(ComplexF64.(coupled))
     elseif validation_diagnostics
         lu(coupled)
     elseif linear_backend == :rocm
@@ -2762,7 +2762,7 @@ function build_coupled_system(
         # error against the assembled matrix (whose host copy may be spilled to a scratch file).
         _cuda_refined_dense_lu!(coupled)
     else
-        lu!(coupled)
+        dense_lu!(coupled)
     end
     linear_backend == :cuda && BeatEngineCore.cuda_module().synchronize()
     linear_backend == :rocm && BeatEngineCore.amdgpu_module().synchronize()

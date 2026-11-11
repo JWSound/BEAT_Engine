@@ -147,3 +147,43 @@ end
         end
     end
 end
+
+@testset "dense LU library switch (BLAB_DENSE_LU_LIBRARY)" begin
+    core = BeatEngineCore
+    rng = MersenneTwister(7)
+    for T in (ComplexF32, ComplexF64, Float64)
+        A = randn(rng, T, 40, 40) + 8I
+        withenv("BLAB_DENSE_LU_LIBRARY" => nothing) do
+            @test core.dense_lu_library(T) == "blas"
+            F = core.dense_lu!(copy(A))
+            @test F.factors == lu(A).factors && F.ipiv == lu(A).ipiv
+        end
+        withenv("BLAB_DENSE_LU_LIBRARY" => "openblas") do
+            @test core.dense_lu_library(T) == "blas"
+        end
+        withenv("BLAB_DENSE_LU_LIBRARY" => "auto") do
+            library = core.dense_lu_library(T)
+            @test library in ("blas", "accelerate")
+            F = core.dense_lu!(copy(A))
+            @test F isa LinearAlgebra.LU
+            b = randn(rng, T, 40)
+            @test norm(A * (F \ b) - b) <= 100 * eps(real(T)) * opnorm(A, 1) * norm(F \ b) * 40
+        end
+        withenv("BLAB_DENSE_LU_LIBRARY" => "accelerate") do
+            if core._accelerate_getrf(T) == C_NULL
+                @test_throws ErrorException core.dense_lu_library(T)
+                @test startswith(core.dense_lu_library_diagnostic(T), "unavailable")
+            else
+                F = core.dense_lu!(copy(A))
+                b = randn(rng, T, 40)
+                @test norm(A * (F \ b) - b) <= 100 * eps(real(T)) * opnorm(A, 1) * norm(F \ b) * 40
+                @test_throws SingularException core.dense_lu!(zeros(T, 4, 4))
+                @test !issuccess(core.dense_lu!(zeros(T, 4, 4); check=false))
+            end
+        end
+    end
+    withenv("BLAB_DENSE_LU_LIBRARY" => "mkl") do
+        @test_throws ErrorException core.dense_lu_library(ComplexF32)
+    end
+    @test core.dense_lu!(view(randn(rng, 6, 6) + 4I, :, :)) isa LinearAlgebra.LU   # non-Matrix: lu!
+end

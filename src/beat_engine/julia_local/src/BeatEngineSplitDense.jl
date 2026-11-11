@@ -364,7 +364,7 @@ function SplitRefinedLU(matrix::SplitDenseMatrix)
     # and `hi` stays as the residual store (16 n²).
     working = isnothing(spill_path) ? copy(matrix.hi) : matrix.hi
     isnothing(spill_path) || (matrix.hi = Matrix{ComplexF32}(undef, 0, 0))
-    candidate = lu!(working; check=false)
+    candidate = dense_lu!(working; check=false)
     if issuccess(candidate) && all(isfinite, candidate.factors)
         refined.factor = candidate
     else

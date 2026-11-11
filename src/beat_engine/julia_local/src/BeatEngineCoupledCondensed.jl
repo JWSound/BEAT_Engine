@@ -224,7 +224,7 @@ function RefinedDenseLU(matrix::Matrix{ComplexF64})
     if maximum(abs, matrix; init=0.0) > floatmax(Float32)
         _dense_fall_back!(refined, "an entry is outside the Float32 range")
     else
-        candidate = lu!(ComplexF32.(matrix); check=false)
+        candidate = dense_lu!(ComplexF32.(matrix); check=false)
         if issuccess(candidate) && all(isfinite, candidate.factors)
             refined.factor = candidate
         else
@@ -328,6 +328,7 @@ function dense_solver_diagnostics(system)
             "dense_split_border_rows" => length(factorization.matrix.border_rows),
             "dense_split_stray_entries" => length(factorization.matrix.stray),
             "dense_spill" => !isnothing(factorization.spill_path),
+            "dense_lu_library" => dense_lu_library_diagnostic(ComplexF32),
         )
     end
     if factorization isa RefinedDenseLU
@@ -336,6 +337,7 @@ function dense_solver_diagnostics(system)
             "dense_refinement_iterations" => factorization.iterations,
             "dense_refinement_fallback_reason" => factorization.fallback_reason,
             "dense_refinement_backward_error" => isnan(factorization.backward_error) ? nothing : factorization.backward_error,
+            "dense_lu_library" => dense_lu_library_diagnostic(ComplexF32),
         )
     end
     kind = factorization isa LinearAlgebra.LU ? "lu_" * lowercase(string(real(eltype(factorization)))) : nothing
