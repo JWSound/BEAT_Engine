@@ -391,17 +391,35 @@ function _metal_coupled_panel_plan(n::Int, ::Type{E}) where {E}
     return (panels=panels, padded_columns=padded_columns, page=page, step=step)
 end
 
-# A page-aligned, zeroed host matrix of n x padded_columns, freed by the GC (posix_memalign + free).
+# A page-aligned, zeroed host matrix of n x padded_columns (posix_memalign). It is freed
+# explicitly by the release of the assembled operators, as the single Metal buffer of the stock
+# path is: left to the GC it would outlive the release and sit beside the dense factorization.
+mutable struct MetalAlignedHostMatrix{E}
+    data::Matrix{E}
+    freed::Bool
+end
+
+function _metal_free_aligned!(block::MetalAlignedHostMatrix{E}) where {E}
+    block.freed && return nothing
+    block.freed = true
+    address = pointer(block.data)
+    block.data = Matrix{E}(undef, 0, 0)
+    Libc.free(address)
+    return nothing
+end
+
 function _metal_aligned_host_matrix(::Type{E}, n::Int, padded_columns::Int, page::Int) where {E}
     bytes = n * padded_columns * sizeof(E)
     pointer_ref = Ref{Ptr{Cvoid}}(C_NULL)
     status = ccall(:posix_memalign, Cint, (Ptr{Ptr{Cvoid}}, Csize_t, Csize_t), pointer_ref, page, bytes)
     status == 0 || throw(OutOfMemoryError())
-    storage = unsafe_wrap(Array, Ptr{E}(pointer_ref[]), (n, padded_columns); own=true)
+    block = MetalAlignedHostMatrix{E}(unsafe_wrap(Array, Ptr{E}(pointer_ref[]), (n, padded_columns); own=false), false)
+    finalizer(_metal_free_aligned!, block)
+    storage = block.data
     Threads.@threads for column in 1:padded_columns
         @inbounds fill!(view(storage, :, column), zero(E))
     end
-    return storage
+    return block
 end
 
 # Wrap columns `first:last` (padded to whole pages for the last panel) of `storage` as a shared Metal buffer.
@@ -566,7 +584,7 @@ function assemble_coupled_burton_miller_metal(
         else
             # A larger than one Metal buffer: one page-aligned host matrix, wrapped panel by panel.
             a_storage = _metal_aligned_host_matrix(Complex{T}, n, plan.padded_columns, plan.page)
-            panels = [(_metal_wrap_panel(a_storage, first, last, plan.step), first, last) for (first, last) in plan.panels]
+            panels = [(_metal_wrap_panel(a_storage.data, first, last, plan.step), first, last) for (first, last) in plan.panels]
         end
         c = Metal.zeros(Complex{T}, n, max(column_count, 1); storage=storage)
         _launch_metal_coupled_pair_kernels!(
@@ -626,7 +644,7 @@ function assemble_coupled_burton_miller_metal(
         succeeded = true
         if panels !== nothing
             # The panels write straight into host memory: A is that memory, no copy.
-            a = unsafe_wrap(Array, pointer(a_storage), (n, n))
+            a = unsafe_wrap(Array, pointer(a_storage.data), (n, n))
             return (a=a, c=c, on_gpu=true, gpu_backend=:metal, assembly_mode=:metal_coupled_combined,
                     active_columns=compact === nothing ? nothing : compact.active,
                     dp0_count=prepared.dp0.global_dof_count,
@@ -643,6 +661,7 @@ function assemble_coupled_burton_miller_metal(
             a === nothing || Metal.unsafe_free!(a)
             c === nothing || Metal.unsafe_free!(c)
             panels === nothing || foreach(panel -> Metal.unsafe_free!(panel[1]), panels)
+            a_storage === nothing || _metal_free_aligned!(a_storage)
         end
     end
 end
@@ -670,8 +689,10 @@ function release_metal_coupled_burton_miller!(combined)
     backing = get(combined, :metal_backing, combined)
     if hasproperty(combined, :a_panels) && !hasproperty(combined, :metal_backing)
         foreach(Metal.unsafe_free!, combined.a_panels)   # tiled A on the device tuple
+        _metal_free_aligned!(combined.a_storage)
     elseif backing.a isa AbstractVector
         foreach(Metal.unsafe_free!, backing.a)           # tiled A on the host tuple
+        _metal_free_aligned!(backing.a_storage)
     elseif backing.a isa MtlArray
         Metal.unsafe_free!(backing.a)
     end
