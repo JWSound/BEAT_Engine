@@ -115,13 +115,13 @@ end
 # it. Sorting fixes the order inside each cell, which is what makes the device
 # write-back reproducible.
 function _metal_build_singular_gather_map(
-    entries::Vector{Int32},
+    entries::Vector{Int64},
     values::Vector{Int32},
     column_of_value::F,
 ) where {F}
     if isempty(entries)
         return MetalSingularGatherMap(
-            MtlArray(Int32[]),
+            MtlArray(Int64[]),
             MtlArray(Int32[1]),
             MtlArray(Int32[]),
             column_of_value === nothing ? nothing : MtlArray(Int32[]),
@@ -133,18 +133,20 @@ function _metal_build_singular_gather_map(
     # packed key, so the keys are sorted directly (radix sort for UInt64) and
     # split back apart: no permutation, no gathers through it. This is the
     # order the map has always had, so the device summation order is unchanged.
-    keys = Vector{UInt64}(undef, length(entries))
+    # Destination cells are 64-bit (an N x N operator passes 2^31 cells at N = 46,341), so the key is
+    # (entry << 32) | value in 128 bits; the order is the same (entry, value) order as before.
+    keys = Vector{UInt128}(undef, length(entries))
     @inbounds for i in eachindex(entries)
-        keys[i] = (UInt64(reinterpret(UInt32, entries[i])) << 32) | UInt64(reinterpret(UInt32, values[i]))
+        keys[i] = (UInt128(reinterpret(UInt64, entries[i])) << 32) | UInt128(reinterpret(UInt32, values[i]))
     end
     sort!(keys)
-    entry_indices = Int32[]
+    entry_indices = Int64[]
     contrib_offsets = Int32[]
     contrib_values = Vector{Int32}(undef, length(keys))
     contrib_columns = column_of_value === nothing ? nothing : Vector{Int32}(undef, length(keys))
-    previous = zero(Int32)
+    previous = zero(Int64)
     @inbounds for (position, key) in enumerate(keys)
-        entry = reinterpret(Int32, UInt32(key >> 32))
+        entry = reinterpret(Int64, UInt64(key >> 32))
         value = reinterpret(Int32, UInt32(key & 0xffffffff))
         if position == 1 || entry != previous
             push!(entry_indices, entry)
@@ -176,13 +178,8 @@ function _metal_build_singular_gather_tables(
     face_count = regular_cache.face_count
     p1_dof_count = regular_cache.p1_dof_count
     dp0_dof_count = regular_cache.dp0_dof_count
-    # Destination indices are Int32 on the device. The dense operators would not
-    # fit in memory long before this overflows, but fail loudly rather than wrap.
-    largest_entry = p1_dof_count * max(p1_dof_count, dp0_dof_count)
-    largest_entry <= typemax(Int32) || error(
-        "Singular gather map needs Int32 dense indices, but p1_dof_count=$(p1_dof_count) " *
-        "and dp0_dof_count=$(dp0_dof_count) reach $(largest_entry).",
-    )
+    # Destination indices are Int64 on the device: an N x N operator passes 2^31 cells at
+    # N = 46,341, which a large-memory Mac holds comfortably.
     value_stride = pair_count * part_count
     test_indices = Array(singular_cache.test_indices)
     trial_indices = Array(singular_cache.trial_indices)
@@ -191,11 +188,11 @@ function _metal_build_singular_gather_tables(
 
     row_count = 3 * pair_count
     block_count = 9 * pair_count
-    row_entries = Vector{Int32}(undef, row_count)
+    row_entries = Vector{Int64}(undef, row_count)
     row_values = Vector{Int32}(undef, row_count)
-    rhs_entries = Vector{Int32}(undef, row_count)
+    rhs_entries = Vector{Int64}(undef, row_count)
     rhs_columns = Vector{Int32}(undef, row_count)
-    block_entries = Vector{Int32}(undef, block_count)
+    block_entries = Vector{Int64}(undef, block_count)
     block_values = Vector{Int32}(undef, block_count)
 
     largest_value = pair_count + 8 * value_stride
@@ -255,11 +252,11 @@ function _metal_fill_singular_gather_inputs!(
             )
             at_row += 1
             # Single layer and adjoint double layer: P1 row, DP0 column.
-            row_entries[at_row] = Int32(row + (dp0_column - 1) * p1_dof_count)
+            row_entries[at_row] = Int64(row + (dp0_column - 1) * p1_dof_count)
             row_values[at_row] = Int32(pair_position + (local_row - 1) * value_stride)
             # The fused right-hand side reuses those values but lands on the row
             # alone, weighted by the trial element's Neumann datum.
-            rhs_entries[at_row] = Int32(row)
+            rhs_entries[at_row] = Int64(row)
             rhs_columns[at_row] = Int32(dp0_column)
         end
         for local_column in 1:3
@@ -274,7 +271,7 @@ function _metal_fill_singular_gather_inputs!(
                 at_block += 1
                 # Double layer, hypersingular, and the fused left-hand side:
                 # P1 row, P1 column.
-                block_entries[at_block] = Int32(row + (column - 1) * p1_dof_count)
+                block_entries[at_block] = Int64(row + (column - 1) * p1_dof_count)
                 block_values[at_block] = Int32(pair_position + component * value_stride)
             end
         end

@@ -41,7 +41,7 @@ function _metal_coupled_flux_gather_kernel!(
         incident_position += Int32(1)
     end
     coefficient = Complex(value_re, value_im)
-    @inbounds rhs_operator[row + (dp0_column - Int32(1)) * p1_count] += coefficient
+    @inbounds rhs_operator[Int64(row) + Int64(dp0_column - Int32(1)) * Int64(p1_count)] += coefficient
     return nothing
 end
 
@@ -287,7 +287,7 @@ function _metal_compact_gather_map(map::MetalSingularGatherMap, column_map::Vect
     entries = Array(map.entry_indices)
     offsets = Array(map.contrib_offsets)
     contributions = Array(map.contrib_values)
-    kept_entries = Int32[]
+    kept_entries = Int64[]
     kept_offsets = Int32[1]
     kept_values = eltype(contributions)[]
     for entry in 1:map.entry_count
@@ -295,12 +295,12 @@ function _metal_compact_gather_map(map::MetalSingularGatherMap, column_map::Vect
         row = linear % p1_count + 1
         column = Int(column_map[linear ÷ p1_count + 1])
         column == 0 && continue
-        push!(kept_entries, Int32(row + (column - 1) * p1_count))
+        push!(kept_entries, Int64(row + (column - 1) * p1_count))
         append!(kept_values, view(contributions, Int(offsets[entry]):(Int(offsets[entry + 1]) - 1)))
         push!(kept_offsets, Int32(length(kept_values) + 1))
     end
     isempty(kept_values) && push!(kept_values, zero(eltype(contributions)))   # no empty device buffers
-    return MetalSingularGatherMap(MtlArray(isempty(kept_entries) ? Int32[0] : kept_entries),
+    return MetalSingularGatherMap(MtlArray(isempty(kept_entries) ? Int64[0] : kept_entries),
                                   MtlArray(kept_offsets), MtlArray(kept_values), nothing, length(kept_entries))
 end
 

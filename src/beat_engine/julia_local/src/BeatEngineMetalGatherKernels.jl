@@ -261,7 +261,7 @@ function _metal_gather_slp_adjoint_kernel!(
         incident_position += Int32(1)
     end
     @inbounds dp0_column = Int32(element_dp0_dofs[trial_index])
-    operator_index = row + (dp0_column - Int32(1)) * p1_count
+    operator_index = Int64(row) + Int64(dp0_column - Int32(1)) * Int64(p1_count)
     @inbounds single_layer[operator_index] += Complex(s_re, s_im)
     @inbounds adjoint_double_layer[operator_index] += Complex(a_re, a_im)
     return nothing
@@ -319,7 +319,7 @@ function _metal_gather_dlp_hyp_kernel!(
         end
         incident_position += Int32(1)
     end
-    operator_index = row + (column - Int32(1)) * p1_count
+    operator_index = Int64(row) + Int64(column - Int32(1)) * Int64(p1_count)
     @inbounds double_layer[operator_index] += Complex(d_re, d_im)
     @inbounds hypersingular[operator_index] += Complex(h_re, h_im)
     return nothing

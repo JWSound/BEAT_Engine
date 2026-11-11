@@ -198,7 +198,7 @@ function _metal_fused_lhs_gather_kernel!(
         end
         incident_position += Int32(1)
     end
-    @inbounds lhs[row + (column - Int32(1)) * p1_count] += Complex(value_re, value_im)
+    @inbounds lhs[Int64(row) + Int64(column - Int32(1)) * Int64(p1_count)] += Complex(value_re, value_im)
     return nothing
 end
 
@@ -274,7 +274,7 @@ function _metal_fused_rhs_reduce_kernel!(
     total = zero(eltype(rhs))
     column = Int32(1)
     while column <= chunk_size
-        @inbounds total += rhs_partial[base + row + (column - Int32(1)) * p1_count]
+        @inbounds total += rhs_partial[Int64(base) + Int64(row) + Int64(column - Int32(1)) * Int64(p1_count)]
         column += Int32(1)
     end
     @inbounds rhs[index] = total
