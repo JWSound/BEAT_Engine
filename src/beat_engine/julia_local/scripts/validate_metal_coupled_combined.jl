@@ -80,6 +80,8 @@ end
 # Tiled A (BLAB_METAL_COUPLED_PANEL_COLUMNS): column panels wrapped over one host matrix must give
 # exactly the single-buffer A and C, for the narrowest panels and for two panels.
 function check_panels(mesh, prepared, k, full_host)
+    # Panels wrap host memory, so they exist only with shared operator storage (the default).
+    nameof(BeatEngineCore.metal_operator_storage_mode()) === :SharedStorage || return nothing
     n = size(full_host.a, 1)
     for width in ("1", string(max(1, n ÷ 2)))
         panelled = nothing
