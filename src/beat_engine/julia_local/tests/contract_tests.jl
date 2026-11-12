@@ -76,6 +76,33 @@ end
         Base.include(second_module, joinpath(fixture_root, "src", "BeatEngineProvenance.jl"))
         second = Base.invokelatest(() -> second_module.BeatEngineProvenance.engine_identity())
         @test second["source_sha256"] != first["source_sha256"]
+        # Outside any checkout the identity never asks Git.
+        @test !Base.invokelatest(() -> second_module.BeatEngineProvenance.inside_git_checkout())
+        if !Sys.iswindows()
+            fake_bin = joinpath(directory, "fake-bin")
+            marker = joinpath(directory, "git-was-called")
+            mkpath(fake_bin)
+            write(joinpath(fake_bin, "git"), "#!/bin/sh\n: > '$marker'\nexit 1\n")
+            chmod(joinpath(fake_bin, "git"), 0o755)
+            third_module = Module(:ThirdProvenanceFixture)
+            Base.include(third_module, joinpath(fixture_root, "src", "BeatEngineProvenance.jl"))
+            third = withenv("PATH" => fake_bin) do
+                Base.invokelatest(() -> third_module.BeatEngineProvenance.engine_identity())
+            end
+            @test third["repository_revision"] === nothing
+            @test !isfile(marker)
+        end
+        checkout = joinpath(directory, "checkout")
+        mkpath(checkout)
+        write(joinpath(checkout, ".git"), "gitdir: elsewhere\n")  # worktree/submodule form
+        @test Base.invokelatest(() -> second_module.BeatEngineProvenance.inside_git_checkout(checkout))
+        if !Sys.iswindows()
+            link = joinpath(mktempdir(), "engine-link")
+            symlink(checkout, link)
+            @test Base.invokelatest(() -> second_module.BeatEngineProvenance.inside_git_checkout(link))
+        end
+        mkpath(joinpath(directory, ".git"))
+        @test Base.invokelatest(() -> second_module.BeatEngineProvenance.inside_git_checkout())
     end
 end
 

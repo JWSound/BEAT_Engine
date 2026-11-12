@@ -10,7 +10,26 @@ const RUNTIME = Ref{Any}(nothing)
 
 file_hash(path) = path !== nothing && isfile(path) ? open(sha256, path) |> bytes2hex : nothing
 
+# An installed wheel lives in no checkout. Asking Git anyway costs a process
+# spawn in the first request, and on macOS without developer tools the stub
+# /usr/bin/git offers to install them.
+function inside_git_checkout(path=ENGINE_ROOT)
+    # Follow symlinks, as `git -C` does, so a linked engine still finds its checkout.
+    directory = try
+        realpath(path)
+    catch
+        abspath(path)
+    end
+    while true
+        ispath(joinpath(directory, ".git")) && return true
+        parent = dirname(directory)
+        parent == directory && return false
+        directory = parent
+    end
+end
+
 function git_value(args)
+    inside_git_checkout() || return nothing
     try
         return strip(read(pipeline(`git -C $ENGINE_ROOT $args`, stderr=devnull), String))
     catch
