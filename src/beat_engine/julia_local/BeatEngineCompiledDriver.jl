@@ -2811,6 +2811,12 @@ function solve_request_impl(request; event_mode=false)
         "transducer_reference_voltage_v must be finite and positive.",
     )
     outputs = get(request, "outputs", Any[])
+    # BLAB_COUPLED_INTERFACE_RADIATION=off drops the per-interface radiation decomposition (the GUI's
+    # "interface radiation" plot). It costs a second dense LU of the BEM matrix and keeps that factor
+    # (8 N^2 bytes) for the whole frequency; Boundary Lab treats a missing decomposition as absent.
+    if lowercase(strip(get(ENV, "BLAB_COUPLED_INTERFACE_RADIATION", "on"))) in ("off", "0", "false", "no")
+        outputs = Any[output for output in outputs if String(output["quantity"]) != "interface_radiated_pressure"]
+    end
     field_points_by_output = parse_field_output_points(outputs, FloatType)
     field_batch = exterior_field_output_batch(outputs, field_points_by_output, bem_backend)
     metal_field_batch = exterior_metal_field_output_batch(outputs, field_points_by_output, bem_backend)
