@@ -169,6 +169,8 @@ if COMPILED_WORKLOAD_PROJECT == "julia_local"
             @test result["freq_hz"] == 1000.0
             @test result["diagnostics"]["formulation"] == "fem_interface_condensed"
             @test result["diagnostics"]["interface_mass_solver"] == "cholmod"
+            # Unset BLAB_BEAT_CPU_FIELD_KERNEL selects the vectorised field kernel, as on exterior solves.
+            @test result["diagnostics"]["cpu_field_kernel"] == "simd"
             @test length(result["quantities"]) == 4
             @test result["excitation_port_ids"] == ["port:voltage"]
             for quantity in result["quantities"]
