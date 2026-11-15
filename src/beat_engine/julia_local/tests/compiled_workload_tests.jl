@@ -132,6 +132,19 @@ end
     @test bundle.BeatEngineContract.BeatEngineProvenance.RUNTIME[] === nothing
 end
 
+@testset "compiled bundle reports the running system image's hash" begin
+    provenance = CompiledWorkloadBundle.BeatEngineContract.BeatEngineProvenance
+    image = unsafe_string(Base.JLOptions().image_file)
+    build = provenance.BUILD_IMAGE
+    # Recorded while the package image was generated, on the image it loads with.
+    @test build !== nothing && build.path == image
+    try
+        @test provenance.runtime_identity()["sysimage_sha256"] == provenance.file_hash(image)
+    finally
+        provenance.RUNTIME[] = nothing
+    end
+end
+
 # The CPU compiled entry is only declared in the CPU project.
 if COMPILED_WORKLOAD_PROJECT == "julia_local"
 @testset "tiny coupled request solves through compiled CPU entry and fallback" begin
