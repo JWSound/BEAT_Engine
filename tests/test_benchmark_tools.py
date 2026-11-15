@@ -254,3 +254,23 @@ def test_cli_labels_memory_and_does_not_mix_measurements(tmp_path, monkeypatch, 
         else:
             assert "working_set; worker_process; sampled_within_sweep" in output
             assert "dedicated GPU: not_measured" in output
+
+
+def test_benchmark_records_result_arrival_and_cold_sweep(tmp_path):
+    args = argparse.Namespace(
+        label="cold",
+        backend="cpu",
+        precision="float32",
+        request=None,
+        mesh="test.msh",
+        threads="2",
+        frequencies=[100.0, 200.0],
+        warmup="none",
+    )
+    rows = [{**benchmark_result(100.0), "_arrival_s": 1.5}, {**benchmark_result(200.0), "_arrival_s": 2.0}]
+    out = tmp_path / "run.json"
+    benchmark.write_run(out, args, "test", 0.5, None, 1, 2.0, rows, None, None)
+    record = json.loads(out.read_text())
+    assert record["warmup"] == "none" and record["warmup_s"] is None
+    assert [row["arrival_s"] for row in record["frequencies"]] == [1.5, 2.0]
+    assert len(record["outputs"]) == 4
