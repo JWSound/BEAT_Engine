@@ -1621,6 +1621,18 @@ end
     reference = lu(matrix) \ rhs
     refined = BeatEngineCoupledCondensed.RefinedDenseLU(matrix)
     @test size(refined, 1) == n
+    # The one-pass scan reproduces `opnorm(_, Inf)` and the maximum bit for bit, whatever the band split.
+    for scanned in (matrix, matrix[1:37, 1:53], matrix[1:1, :], zeros(ComplexF64, 0, 0))
+        scan = BeatEngineCoupledCondensed._dense_matrix_scan(scanned)
+        @test scan.finite
+        @test scan.inf_norm === opnorm(scanned, Inf)
+        @test scan.max_abs === maximum(abs, scanned; init=0.0)
+    end
+    @test refined.matrix_norm === opnorm(matrix, Inf)
+    for bad in (NaN, Inf, complex(1.0, -Inf))
+        scanned = copy(matrix); scanned[n, n] = bad
+        @test !BeatEngineCoupledCondensed._dense_matrix_scan(scanned).finite
+    end
     single = ComplexF64.(refined.factor \ ComplexF32.(rhs))
     @test relative(reference, single) > 1e-6
     solution = refined \ rhs
