@@ -274,3 +274,25 @@ def test_benchmark_records_result_arrival_and_cold_sweep(tmp_path):
     assert record["warmup"] == "none" and record["warmup_s"] is None
     assert [row["arrival_s"] for row in record["frequencies"]] == [1.5, 2.0]
     assert len(record["outputs"]) == 4
+
+
+def test_cli_refuses_mixed_warmup_unless_allowed(tmp_path, monkeypatch, capsys):
+    base = {
+        **run([1]),
+        "wall_s": 1.0,
+        "commit": "test",
+        "backend": "cpu",
+        "memory_mb": {"before_sweep": None, "peak_sweep": None},
+        "frequencies": [],
+    }
+    (tmp_path / "warm.json").write_text(json.dumps(base))  # legacy record: warmed
+    (tmp_path / "cold.json").write_text(json.dumps({**base, "warmup": "none"}))
+    argv = ["compare", "--stage", f"warm={tmp_path / 'warm.json'}", "--stage", f"cold={tmp_path / 'cold.json'}"]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as exc:
+        compare.main()
+    assert exc.value.code == 2
+    assert "--allow-mixed-warmup" in capsys.readouterr().err
+    monkeypatch.setattr(sys, "argv", [*argv, "--allow-mixed-warmup"])
+    compare.main()
+    assert "warm -> cold" in capsys.readouterr().out

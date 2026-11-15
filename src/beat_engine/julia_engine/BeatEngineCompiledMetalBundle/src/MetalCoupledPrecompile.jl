@@ -415,16 +415,18 @@ function metal_coupled_host_signatures(types)
         (shared_matrix, shared_matrix, regular, singular, Float32, core.SymmetryTransform))
     add(core._metal_packed_pair_tables_for, (regular,))
     add(core._metal_fused_singular_tables_for, (regular, singular))
-    # Final row scaling of the combined blocks (`c .= .-c .* weights`, `a .*= weights`).
+    # Final scaling of the combined blocks: `c .*= -one(T)` without symmetry, and the
+    # symmetry row weights (`a .*= weights`, `c .= .-c .* weights`).
     weights = Metal.MtlArray{ComplexF32, 2, Metal.PrivateStorage}
     style = Metal.MtlArrayStyle{2, Metal.SharedStorage}
-    for operand in (shared_matrix, Base.Broadcast.Broadcasted{style, Nothing, typeof(-), Tuple{shared_matrix}})
-        add(Base.Broadcast.materialize!, (style, shared_matrix,
-            Base.Broadcast.Broadcasted{style, Nothing, typeof(*), Tuple{operand, weights}}))
+    product(operands...) = Base.Broadcast.Broadcasted{style, Nothing, typeof(*), Tuple{operands...}}
+    for broadcast in (product(shared_matrix, Float32), product(shared_matrix, weights),
+                      product(Base.Broadcast.Broadcasted{style, Nothing, typeof(-), Tuple{shared_matrix}}, weights))
+        add(Base.Broadcast.materialize!, (style, shared_matrix, broadcast))
     end
 
     for (f, tt, args, size) in metal_coupled_launch_types()
-        if !(f in (core._metal_regular_pair_blocks_kernel!, core._metal_fused_pair_blocks_kernel!))
+        if metal_launch_uses_helper(size)
             add(core._metal_launch, (typeof(f), Int, args...))
             add(core._metal_launch, (typeof(f), Int, args...); groupsize=Int)
         end
@@ -436,36 +438,7 @@ function metal_coupled_host_signatures(types)
     return signatures
 end
 
-function metal_coupled_launch_types()
-    core = BeatEngineCore
-    # Four-operator path, then the combined A/C path (the Metal coupled default).
-    kernels = (core._metal_regular_pair_blocks_kernel!, core._metal_gather_slp_adjoint_kernel!,
-        core._metal_gather_dlp_hyp_kernel!, core._metal_singular_fused_blocks_kernel!,
-        core._metal_singular_pair_gather_kernel!,
-        core._metal_fused_pair_blocks_kernel!, core._metal_coupled_flux_gather_kernel!,
-        core._metal_fused_lhs_gather_kernel!, core._metal_fused_singular_packed_kernel!,
-        core._metal_singular_entry_gather_kernel!)
-    shared_pair = (core._metal_gather_slp_adjoint_kernel!, core._metal_gather_dlp_hyp_kernel!,
-        core._metal_singular_pair_gather_kernel!)
-    # Combined-path gathers write the shared A or C matrix (first argument) only.
-    shared_first = (core._metal_coupled_flux_gather_kernel!, core._metal_fused_lhs_gather_kernel!,
-        core._metal_singular_entry_gather_kernel!)
-    grid_2d = (core._metal_regular_pair_blocks_kernel!, core._metal_fused_pair_blocks_kernel!)
-    launches = Tuple{Any,Type,Tuple,Type}[]
-    for (f, tt) in metal_kernel_signatures()
-        f in kernels || continue
-        # Gather destinations are shared. Geometry, indices and intermediate
-        # blocks are private. Expand fixed Varargs.
-        args = Tuple(type <: Metal.MtlDeviceArray ?
-            Metal.MtlArray{eltype(type),ndims(type),
-                (index <= 2 && f in shared_pair) || (index == 1 && f in shared_first) ?
-                    Metal.SharedStorage : Metal.PrivateStorage} : type
-            for (index, type) in enumerate(fieldtypes(tt)))
-        size = f in grid_2d ? Tuple{Int,Int} : Int
-        push!(launches, (f, tt, args, size))
-    end
-    return launches
-end
+metal_coupled_launch_types() = metal_launch_types(:coupled)
 
 # Match a compiler-generated closure by its captured fields, then bind each
 # type parameter through the field it represents. Fixed Core.Box fields are

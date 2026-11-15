@@ -75,11 +75,14 @@ system variants, with and without the replay, plus `interface_radiation_traces`;
 the shared workload's `radiation=true` request (run by both bundles, and by
 the two coverage gates) exercises the same output. The combined A/C assembly
 (the Metal coupled default) has its own pair and singular launch drivers,
-packed-table caches, final row-scaling broadcasts and kernels
+packed-table caches, final scaling broadcasts (with and without symmetry) and kernels
 (`_metal_coupled_flux_gather_kernel!`, the packed singular groups by point
 count); the kernel inventory generator solves the coupled workload request at
-orders 1/2/4 so those device signatures are cached too. Measured on an M1 Max
-with Boundary Lab's own F2B_FLH and Multi_region_SAWMOD requests, a stale
+orders 1/2/4 so those device signatures are cached too. Host launch storage
+modes and grid shapes for both inventories come from one table,
+`metal_launch_rules()` in `MetalKernelPrecompile.jl`. Measured on an M1 Max
+with the requests of Boundary Lab's example projects `F2B_FLH` and
+`Multi_region_SAWMOD`, a stale
 inventory (a keyword added to the build call, the replay variant and the
 combined kernels missing) had put about 7 s of compilation back on the first
 frequency.

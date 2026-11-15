@@ -265,3 +265,27 @@ end
     end
     bundle.reset_compiled_workload_state!()
 end
+
+@testset "tiny coupled workload with interface radiation solves (strict)" begin
+    bundle = CompiledWorkloadBundle
+    request = bundle.JSON.parse(bundle.JSON.json(bundle.coupled_workload_request(; tiny=true, radiation=true)))
+    withenv(bundle.coupled_workload_environment(; mumps=false, defaults=:cpu)...) do
+        run = bundle.solve_coupled_workload(request)
+        bundle.check_coupled_workload(run; mumps=false, defaults=:cpu, radiation=true)
+        @test all(length(result["quantities"]) == 5 for result in run.results)
+        # A request without the output must fail the radiation check, and the reverse.
+        @test_throws AssertionError bundle.check_coupled_workload(run; mumps=false, defaults=:cpu)
+    end
+    bundle.reset_compiled_workload_state!()
+end
+
+@testset "compiled worker load record has one shape" begin
+    bundle = CompiledWorkloadBundle
+    loaded = bundle.compiled_worker_load(nameof(bundle), bundle, nothing)
+    @test loaded isa Dict{String,Union{Nothing,String}}
+    @test loaded == Dict("requested_bundle" => string(nameof(bundle)), "loaded_bundle" => string(nameof(bundle)),
+                         "driver_mode" => "bundle", "fallback_reason" => nothing)
+    source = bundle.compiled_worker_load(nothing, nothing, "backend_has_no_compiled_bundle")
+    @test source isa Dict{String,Union{Nothing,String}}
+    @test source["driver_mode"] == "source" && source["requested_bundle"] === nothing
+end

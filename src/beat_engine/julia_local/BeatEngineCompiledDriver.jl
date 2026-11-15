@@ -28,6 +28,18 @@ const DEFAULT_TRANSDUCER_REFERENCE_VOLTAGE_V = 2.83
 const RUN_MESH_PROVENANCE = Ref{Any}([])
 const COMPILED_WORKER_LOAD = Ref{Any}(nothing)
 
+# What the entry point loaded, reported in the ready announcement and result diagnostics.
+# One constructor (and one concrete Dict type) for `coupled_solver.jl` and the precompile
+# workload, so the cached JSON writer is the one a worker uses.
+function compiled_worker_load(requested, loaded, fallback_reason)
+    return Dict{String,Union{Nothing,String}}(
+        "requested_bundle" => requested === nothing ? nothing : String(requested),
+        "loaded_bundle" => loaded === nothing ? nothing : String(nameof(loaded)),
+        "driver_mode" => loaded === nothing ? "source" : "bundle",
+        "fallback_reason" => fallback_reason,
+    )
+end
+
 function record_result_provenance!(result, request)
     diagnostics = result["diagnostics"]
     diagnostics["phasor_convention"] = phasor_convention()

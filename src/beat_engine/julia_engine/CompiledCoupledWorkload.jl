@@ -222,7 +222,7 @@ function solve_coupled_workload(request)
     end
 end
 
-function check_coupled_workload(run; mumps::Bool, defaults::Symbol=:metal)
+function check_coupled_workload(run; mumps::Bool, defaults::Symbol=:metal, radiation::Bool=false)
     @assert !run.outcome.cancelled
     @assert run.outcome.solved_count == 2 && length(run.results) == 2
     for result in run.results
@@ -238,6 +238,17 @@ function check_coupled_workload(run; mumps::Bool, defaults::Symbol=:metal)
         @assert d["fem_interior_reconstruction"] == "skipped" d
         @assert isempty(d["coupled_optimization_fallback_reasons"]) d
         @assert d["dense_solver"] in ("lu_float32_refined", "lu_float64_fallback") d
+        # The radiation request must reach the retained replay and its output, or the
+        # package image silently loses that call graph.
+        radiated = [q for q in result["quantities"] if q["quantity"] == "interface_radiated_pressure"]
+        @assert length(radiated) == (radiation ? 1 : 0) result["quantities"]
+        if radiation
+            @assert d["interface_radiation_backend"] == "cpu" d
+            errors = d["interface_radiation_boundary_reconstruction_relative_error"]
+            @assert errors isa AbstractVector && length(errors) == 1 && all(isfinite, errors) d
+        else
+            @assert d["interface_radiation_backend"] === nothing d
+        end
         if d["dense_solver"] == "lu_float64_fallback"
             @warn "BEAT coupled workload refinement fell back" reason=d["dense_refinement_fallback_reason"]
         end
@@ -272,7 +283,7 @@ function precompile_coupled_workload(; tiny::Bool, mumps::Bool, defaults::Symbol
     try
         request = JSON.parse(JSON.json(coupled_workload_request(; tiny, radiation)))
         withenv(coupled_workload_environment(; mumps, defaults)...) do
-            check_coupled_workload(solve_coupled_workload(request); mumps, defaults)
+            check_coupled_workload(solve_coupled_workload(request); mumps, defaults, radiation)
         end
     catch exception
         @warn "BEAT compiled coupled workload failed" tiny mumps defaults radiation exception=(exception, catch_backtrace())
@@ -292,9 +303,8 @@ end
 function precompile_worker_startup()
     load = COMPILED_WORKER_LOAD[]
     try
-        # The entry point (`coupled_solver.jl`) records this, in the same shape, at load.
-        COMPILED_WORKER_LOAD[] = Dict("requested_bundle" => string(nameof(@__MODULE__)),
-            "loaded_bundle" => string(nameof(@__MODULE__)), "driver_mode" => "bundle", "fallback_reason" => nothing)
+        # What the entry point (`coupled_solver.jl`) records when this bundle loads.
+        COMPILED_WORKER_LOAD[] = compiled_worker_load(nameof(@__MODULE__), @__MODULE__, nothing)
         JSON.json(worker_ready_announcement())
     catch exception
         @warn "BEAT compiled worker start-up workload failed" exception=(exception, catch_backtrace())

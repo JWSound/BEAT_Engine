@@ -38,7 +38,9 @@ checkout's meshes, so it is not committed here.
 - `--warmup none` drops the two-frequency warm-up request, so sweep 1 is a
   fresh worker's first request including its run-time compilation (the cold
   first frequency). Use it, with `startup_s` and each row's `arrival_s`, for
-  changes to precompile workloads or worker start-up.
+  changes to precompile workloads or worker start-up. `compare_benchmarks.py`
+  refuses to compare runs with different `--warmup` settings unless given
+  `--allow-mixed-warmup`.
 - Skip a configuration when the diff does not touch the logic on its code path
   and a measurement has confirmed it unchanged. Plumbing for another backend
   passing through the same files does not count as a change.
