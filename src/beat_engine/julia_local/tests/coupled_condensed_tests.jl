@@ -1629,8 +1629,9 @@ end
         @test scan.max_abs === maximum(abs, scanned; init=0.0)
     end
     @test refined.matrix_norm === opnorm(matrix, Inf)
-    for bad in (NaN, Inf, complex(1.0, -Inf))
-        scanned = copy(matrix); scanned[n, n] = bad
+    # In the first and the last row band, so every band's flag reaches the result.
+    for bad in (NaN, Inf, complex(1.0, -Inf)), position in ((1, 2), (n, n))
+        scanned = copy(matrix); scanned[position...] = bad
         @test !BeatEngineCoupledCondensed._dense_matrix_scan(scanned).finite
     end
     single = ComplexF64.(refined.factor \ ComplexF32.(rhs))
