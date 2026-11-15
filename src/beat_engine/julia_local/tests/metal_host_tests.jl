@@ -26,20 +26,28 @@ include(joinpath(@__DIR__, "compiled_metal_worker_tests.jl"))
     core = bundle.BeatEngineCore
     launches = bundle.metal_coupled_launch_types()
     runtime = bundle.metal_coupled_runtime_signatures()
+    # Four-operator path, then the combined A/C path (the Metal coupled default).
     @test Set(f for (f, _, _, _) in launches) == Set((
         core._metal_regular_pair_blocks_kernel!, core._metal_gather_slp_adjoint_kernel!,
         core._metal_gather_dlp_hyp_kernel!, core._metal_singular_fused_blocks_kernel!,
-        core._metal_singular_pair_gather_kernel!))
+        core._metal_singular_pair_gather_kernel!,
+        core._metal_fused_pair_blocks_kernel!, core._metal_coupled_flux_gather_kernel!,
+        core._metal_fused_lhs_gather_kernel!, core._metal_fused_singular_packed_kernel!,
+        core._metal_singular_entry_gather_kernel!))
     pair_orders = Set{Int}()
     for (f, tt, args, size) in launches
         @test length(args) == fieldcount(tt)
         @test all(isconcretetype, args)
         gathered = f in (core._metal_gather_slp_adjoint_kernel!,
                         core._metal_gather_dlp_hyp_kernel!, core._metal_singular_pair_gather_kernel!)
+        # Combined-path gathers write only the shared A or C matrix (their first argument).
+        combined_gather = f in (core._metal_coupled_flux_gather_kernel!,
+                                core._metal_fused_lhs_gather_kernel!, core._metal_singular_entry_gather_kernel!)
         for (index, device_type) in enumerate(fieldtypes(tt))
             host_type = args[index]
             if device_type <: Metal.MtlDeviceArray
-                storage = gathered && index <= 2 ? Metal.SharedStorage : Metal.PrivateStorage
+                shared = (gathered && index <= 2) || (combined_gather && index == 1)
+                storage = shared ? Metal.SharedStorage : Metal.PrivateStorage
                 @test host_type === Metal.MtlArray{eltype(device_type),ndims(device_type),storage}
             else
                 @test host_type === device_type
@@ -48,6 +56,8 @@ include(joinpath(@__DIR__, "compiled_metal_worker_tests.jl"))
         if f === core._metal_regular_pair_blocks_kernel!
             @test size === Tuple{Int,Int}
             push!(pair_orders, args[17].parameters[1])
+        elseif f === core._metal_fused_pair_blocks_kernel!
+            @test size === Tuple{Int,Int}
         else
             @test size === Int
         end

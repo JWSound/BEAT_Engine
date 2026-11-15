@@ -101,10 +101,10 @@ function metal_host_signatures()
     # Reuse the recorded device signatures for host launches of the fused and
     # field kernels. Device arrays erase storage mode; restore the exact mode
     # used at each call site. This evaluates types only, without fake buffers.
-    shared_destination = Set((core._metal_fused_lhs_gather_kernel!,
+    shared_destination = Set((core._metal_fused_lhs_gather_kernel!, core._metal_coupled_flux_gather_kernel!,
         core._metal_fused_rhs_reduce_kernel!, core._metal_singular_entry_gather_kernel!,
         core._metal_singular_rhs_gather_kernel!, core._metal_sparse_scatter_kernel!))
-    launches = Set((core._metal_fused_pair_blocks_kernel!,
+    launches = Set((core._metal_fused_pair_blocks_kernel!, core._metal_coupled_flux_gather_kernel!,
         core._metal_fused_lhs_gather_kernel!, core._metal_fused_rhs_gather_kernel!,
         core._metal_fused_rhs_reduce_kernel!, core._metal_fused_singular_packed_kernel!,
         core._metal_singular_entry_gather_kernel!, core._metal_singular_rhs_gather_kernel!,
