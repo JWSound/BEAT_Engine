@@ -30,6 +30,10 @@ except for lower memory use.
 | Fork | ~200 s | 21.6 GB |
 | Fork, interface radiation off | ~118 s | 16.2 GB |
 
+Adopting A instead of copying it (patch 13), same model, dense spill forced to emulate the
+large-model regime: footprint 17.3 → 11.9 GB, results bit-identical; with defaults (no spill)
+15.2 GB.
+
 Single runs on one machine, not yet medians of interleaved runs as `docs/Benchmarking.md`
 asks; treat them as indicative. All other result quantities stay bit-identical. A 54.6k-node model at 20 kHz now
 assembles on Metal; it failed upstream.
