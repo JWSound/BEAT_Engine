@@ -1,5 +1,7 @@
 # BEAT Engine
 
+> **Memory fork:** this is an unofficial fork with memory and speed work for coupled FEM–BEM solves. See [FORK.md](FORK.md).
+
 Numerical BEM, FEM, and lumped electroacoustic solving, extracted from Boundary Lab.
 The `beat-engine` Python distribution supplies a standard-library worker client,
 versioned wire contracts, Julia CPU/CUDA/ROCm/Metal environments, and numerical
