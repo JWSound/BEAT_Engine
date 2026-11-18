@@ -2639,7 +2639,8 @@ function solve_condensed_coupled_excitations(system, excitations; reconstruct_in
                     tag,
                     system.density,
                     system.omega,
-                    amplitude * weight,
+                    amplitude * weight;
+                    motion_axis=get(excitation, :motion_axis, nothing),
                 )
             end
             bem_source_index = hasproperty(excitation, :bem_source_index) ?

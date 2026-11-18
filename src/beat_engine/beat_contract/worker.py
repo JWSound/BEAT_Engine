@@ -56,7 +56,7 @@ def validate_worker_ready(info: dict) -> None:
             isinstance(kinds, list) and all(isinstance(kind, str) and bool(kind.strip()) for kind in kinds),
             "invalid exterior_component_kinds capabilities; expected a list of non-empty strings.",
         )
-    for name in ("exterior_source_profiles", "coupled_exterior_source_profiles"):
+    for name in ("exterior_source_profiles", "coupled_exterior_source_profiles", "coupled_source_profiles"):
         if name in info:
             profiles = info[name]
             _require(
@@ -153,16 +153,17 @@ def negotiate_submission(info: dict, request: dict, operation: str) -> dict:
                 system = request["compiled_system"]
                 exterior_ids = {region["id"] for region in system["regions"] if region["kind"] == "unbounded_air"}
                 boundaries = {boundary["id"]: boundary for boundary in system["boundaries"]}
+                exterior_only = bool(component["boundary_ids"]) and all(
+                    boundaries[boundary_id]["region_id"] in exterior_ids for boundary_id in component["boundary_ids"]
+                )
                 _require(
-                    bool(component["boundary_ids"])
-                    and all(
-                        boundaries[boundary_id]["region_id"] in exterior_ids
-                        for boundary_id in component["boundary_ids"]
-                    ),
-                    "rigid-translation ideal sources require exterior-only boundary assignments.",
+                    kind != "interior_fem",
+                    "rigid-translation ideal sources require exterior or coupled boundary assignments.",
                 )
                 capability = (
-                    "coupled_exterior_source_profiles" if kind == "coupled_fem_bem_lem" else "exterior_source_profiles"
+                    ("coupled_exterior_source_profiles" if exterior_only else "coupled_source_profiles")
+                    if kind == "coupled_fem_bem_lem"
+                    else "exterior_source_profiles"
                 )
                 _require(
                     profile in info.get(capability, ["uniform_normal"]),
