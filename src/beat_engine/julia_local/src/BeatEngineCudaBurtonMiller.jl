@@ -161,6 +161,17 @@ function _cuda_bm_correction_scatter_kernel!(
     return nothing
 end
 
+# Regular pair kernel for the direct Burton-Miller system: `fused` (default)
+# combines the operators per quadrature point pair; `generic` is the
+# four-operator `_cuda_regular_kernel!` in direct mode, kept for comparisons.
+function _cuda_bm_regular_kernel_mode()
+    mode = lowercase(strip(get(ENV, "BEAT_CUDA_BM_REGULAR_KERNEL", "fused")))
+    mode in ("fused", "generic") || error(
+        "Unknown BEAT_CUDA_BM_REGULAR_KERNEL=$(mode); expected fused or generic.",
+    )
+    return Symbol(mode)
+end
+
 function _launch_cuda_bm_regular_transform!(
     matrix_re,
     matrix_im,
@@ -177,10 +188,43 @@ function _launch_cuda_bm_regular_transform!(
     total_pairs = length(cache.test_indices) * length(trial_indices)
     threads = 128
     blocks = min(cld(total_pairs, threads), 65_535)
+    signs = T.(transform.signs)
+    curl_signs = T.(transform.determinant .* transform.signs)
+    if _cuda_bm_regular_kernel_mode() == :fused
+        CUDA.@cuda threads=threads blocks=blocks _cuda_bm_fused_regular_kernel!(
+            matrix_re,
+            matrix_im,
+            rhs_re,
+            rhs_im,
+            q_neumann,
+            cache.face_vertices,
+            cache.normals,
+            cache.areas,
+            cache.faces,
+            cache.curls,
+            cache.test_indices,
+            cache.trial_indices,
+            cache.rule_points,
+            cache.rule_weights,
+            k,
+            size(matrix_re, 1),
+            cache.face_count,
+            total_pairs,
+            skip_adjacent,
+            signs[1],
+            signs[2],
+            signs[3],
+            curl_signs[1],
+            curl_signs[2],
+            curl_signs[3],
+            Val(cache.rule_count),
+            Val(!rhs_only),
+        )
+        CUDA.synchronize()
+        return total_pairs
+    end
     placeholder = CUDA.zeros(T, 1)
     try
-        signs = T.(transform.signs)
-        curl_signs = T.(transform.determinant .* transform.signs)
         CUDA.@cuda threads=threads blocks=blocks _cuda_regular_kernel!(
             placeholder,
             placeholder,
