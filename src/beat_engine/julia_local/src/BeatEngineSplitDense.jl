@@ -151,6 +151,61 @@ function SplitDenseMatrix(n::Integer, border_rows, border_columns)
     )
 end
 
+"""
+    SplitDenseMatrix(hi, border_rows, border_columns)
+
+Split storage around an existing `ComplexF32` square `hi` (adopted, not copied).
+"""
+function SplitDenseMatrix(hi::Matrix{ComplexF32}, border_rows, border_columns)
+    n = size(hi, 1)
+    size(hi, 2) == n || throw(ArgumentError("adopted dense storage must be square"))
+    matrix = SplitDenseMatrix(0, Int[], Int[])
+    columns = sort!(unique!(collect(Int, border_columns)))
+    rows = sort!(unique!(collect(Int, border_rows)))
+    all(c -> 1 <= c <= n, columns) && all(r -> 1 <= r <= n, rows) || throw(ArgumentError("border index out of range"))
+    col_slot = zeros(Int32, n)
+    row_slot = zeros(Int32, n)
+    for (slot, column) in enumerate(columns)
+        col_slot[column] = slot
+    end
+    for (slot, row) in enumerate(rows)
+        row_slot[row] = slot
+    end
+    return SplitDenseMatrix(
+        hi, col_slot, row_slot, columns, rows,
+        zeros(ComplexF64, n, length(columns)), zeros(ComplexF64, length(rows), n),
+        Dict{Tuple{Int,Int},ComplexF64}(), false,
+    )
+end
+
+"""
+    adopt_square_storage(address, n, order) -> Matrix{ComplexF32}
+
+Turn malloc'd memory holding an n x n `ComplexF32` matrix (leading dimension n) with room for
+`order^2` elements into an `order x order` matrix whose top-left n x n block is that matrix and
+whose remaining rows and columns are zero. In place: the columns move back to front (memmove),
+so no second n x n copy ever exists. The returned array owns the memory (`free` at GC).
+"""
+function adopt_square_storage(address::Ptr, n::Int, order::Int)
+    order >= n || throw(ArgumentError("adopted order $order is smaller than the matrix ($n)"))
+    pointer = Ptr{ComplexF32}(address)
+    bytes = sizeof(ComplexF32)
+    if order > n
+        for column in n:-1:2
+            ccall(:memmove, Ptr{Cvoid}, (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t),
+                  pointer + (column - 1) * order * bytes, pointer + (column - 1) * n * bytes, n * bytes)
+        end
+    end
+    matrix = unsafe_wrap(Array, pointer, (order, order); own=true)
+    if order > n
+        Threads.@threads for column in 1:order
+            first = column <= n ? n + 1 : 1
+            @inbounds fill!(view(matrix, first:order, column), zero(ComplexF32))
+        end
+    end
+    return matrix
+end
+
 Base.size(matrix::SplitDenseMatrix) = size(matrix.hi)
 Base.IndexStyle(::Type{SplitDenseMatrix}) = IndexCartesian()
 

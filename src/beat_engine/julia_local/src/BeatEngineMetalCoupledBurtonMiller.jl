@@ -363,7 +363,7 @@ not fit one Metal buffer; an integer forces panels of about that many columns (r
 alignment; for validation against the single-buffer path); `off` never splits (A larger than
 `maxBufferLength` then fails as in the stock engine).
 """
-function _metal_coupled_panel_plan(n::Int, ::Type{E}) where {E}
+function _metal_coupled_panel_plan(n::Int, ::Type{E}; host_backed::Bool=false) where {E}
     setting = lowercase(strip(get(ENV, "BLAB_METAL_COUPLED_PANEL_COLUMNS", "auto")))
     setting == "off" && return nothing
     page = Int(ccall(:getpagesize, Cint, ()))
@@ -372,7 +372,13 @@ function _metal_coupled_panel_plan(n::Int, ::Type{E}) where {E}
     step = page ÷ gcd(column_bytes, page)
     limit = Int(Metal.device().maxBufferLength) - page
     requested = if setting == "auto"
-        column_bytes * n <= limit && return nothing
+        if column_bytes * n <= limit
+            host_backed || return nothing
+            # A fits one buffer but must live in host memory the caller can adopt: one panel.
+            padded = cld(n, step) * step
+            padded * column_bytes <= limit || return nothing
+            return (panels=[(1, n)], padded_columns=padded, page=page, step=step)
+        end
         limit ÷ column_bytes
     else
         value = tryparse(Int, setting)
@@ -408,8 +414,10 @@ function _metal_free_aligned!(block::MetalAlignedHostMatrix{E}) where {E}
     return nothing
 end
 
-function _metal_aligned_host_matrix(::Type{E}, n::Int, padded_columns::Int, page::Int) where {E}
-    bytes = n * padded_columns * sizeof(E)
+function _metal_aligned_host_matrix(::Type{E}, n::Int, padded_columns::Int, page::Int; capacity::Int=0) where {E}
+    # `capacity` (elements) reserves room beyond n x padded_columns, so the caller can later restride
+    # A in place to a larger leading dimension (`metal_detach_coupled_lhs!`).
+    bytes = max(n * padded_columns, capacity) * sizeof(E)
     pointer_ref = Ref{Ptr{Cvoid}}(C_NULL)
     status = ccall(:posix_memalign, Cint, (Ptr{Ptr{Cvoid}}, Csize_t, Csize_t), pointer_ref, page, bytes)
     status == 0 || throw(OutOfMemoryError())
@@ -553,7 +561,7 @@ symmetry weights follow the existing exterior path. Images use separate launches
 Returned device storage belongs to the caller, including on private storage.
 """
 function assemble_coupled_burton_miller_metal(
-    mesh::BoundaryMesh{T}, prepared, k::T; identity_cache=nothing,
+    mesh::BoundaryMesh{T}, prepared, k::T; identity_cache=nothing, adopt_order::Int=0,
 ) where {T<:AbstractFloat}
     _require_metal!()
     reason = metal_coupled_combined_support_reason(prepared, T)
@@ -578,12 +586,17 @@ function assemble_coupled_burton_miller_metal(
         element_columns = compact === nothing ? cache.element_dp0_dofs : compact.element_columns
         column_count = compact === nothing ? prepared.dp0.global_dof_count : length(compact.active)
         n = prepared.p1.global_dof_count
-        plan = storage === Metal.SharedStorage ? _metal_coupled_panel_plan(n, Complex{T}) : nothing
+        adoptable = adopt_order >= n && storage === Metal.SharedStorage
+        plan = storage === Metal.SharedStorage ?
+               _metal_coupled_panel_plan(n, Complex{T}; host_backed=adoptable) : nothing
+        adoptable &= plan !== nothing
         if plan === nothing
             a = Metal.zeros(Complex{T}, n, n; storage=storage)
         else
-            # A larger than one Metal buffer: one page-aligned host matrix, wrapped panel by panel.
-            a_storage = _metal_aligned_host_matrix(Complex{T}, n, plan.padded_columns, plan.page)
+            # A larger than one Metal buffer, or A to be adopted by the dense system: one page-aligned
+            # host matrix, wrapped panel by panel.
+            a_storage = _metal_aligned_host_matrix(Complex{T}, n, plan.padded_columns, plan.page;
+                                                   capacity=adoptable ? adopt_order * adopt_order : 0)
             panels = [(_metal_wrap_panel(a_storage.data, first, last, plan.step), first, last) for (first, last) in plan.panels]
         end
         c = Metal.zeros(Complex{T}, n, max(column_count, 1); storage=storage)
@@ -648,7 +661,8 @@ function assemble_coupled_burton_miller_metal(
             return (a=a, c=c, on_gpu=true, gpu_backend=:metal, assembly_mode=:metal_coupled_combined,
                     active_columns=compact === nothing ? nothing : compact.active,
                     dp0_count=prepared.dp0.global_dof_count,
-                    a_panels=[panel[1] for panel in panels], a_storage=a_storage)
+                    a_panels=[panel[1] for panel in panels], a_storage=a_storage,
+                    adopt_order=adoptable ? adopt_order : 0)
         end
         return (a=a, c=c, on_gpu=true, gpu_backend=:metal, assembly_mode=:metal_coupled_combined,
                 active_columns=compact === nothing ? nothing : compact.active,
@@ -675,6 +689,7 @@ function metal_host_coupled_burton_miller(combined)
         c = Metal.is_shared(combined.c) ? unsafe_wrap(Array, combined.c) : Array(combined.c)
         return (a=combined.a, c=c, on_gpu=false,
                 metal_backing=(a=combined.a_panels, c=combined.c, a_storage=combined.a_storage),
+                adopt_order=get(combined, :adopt_order, 0),
                 active_columns=get(combined, :active_columns, nothing),
                 dp0_count=get(combined, :dp0_count, size(c, 2)))
     end
@@ -698,4 +713,29 @@ function release_metal_coupled_burton_miller!(combined)
     end
     Metal.unsafe_free!(backing.c)
     return nothing
+end
+
+"""
+    metal_detach_coupled_lhs!(host, order) -> (pointer, n) or nothing
+
+Hand the host memory of a host-backed A (assembled with `adopt_order >= order`) over to the
+caller: its panel wraps are freed, and the later release no longer frees the memory. The caller
+owns `pointer` (posix_memalign, room for `order^2` elements; A is its first n x n, leading
+dimension n) and frees it with `Libc.free`. `nothing` when A cannot be adopted (stock path).
+"""
+function metal_detach_coupled_lhs!(host, order::Int)
+    hasproperty(host, :metal_backing) || return nothing
+    backing = host.metal_backing
+    (hasproperty(backing, :a_storage) && backing.a isa AbstractVector) || return nothing
+    get(host, :adopt_order, 0) >= order || return nothing
+    storage = backing.a_storage
+    storage.freed && return nothing
+    Metal.synchronize()
+    foreach(Metal.unsafe_free!, backing.a)
+    empty!(backing.a)
+    address = pointer(storage.data)
+    n = size(storage.data, 1)
+    storage.data = Matrix{eltype(storage.data)}(undef, 0, 0)
+    storage.freed = true   # ownership moves to the caller; the finalizer and the release skip it
+    return (address, n)
 end

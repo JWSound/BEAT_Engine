@@ -300,7 +300,7 @@ end
 
 # Split-precision dense storage and refinement (BeatEngineSplitDense.jl) live in BeatEngineCoupled,
 # shared with the CUDA coupled path.
-using ..BeatEngineCoupled: SplitDenseMatrix, SplitRefinedLU, SplitGMRES, _dense_solver_mode, release_split_factor!, _dense_split_enabled,
+using ..BeatEngineCoupled: SplitDenseMatrix, adopt_square_storage, SplitRefinedLU, SplitGMRES, _dense_solver_mode, release_split_factor!, _dense_split_enabled,
     _dense_spill_target, _dense_gmres_ir_enabled, _split_mul!, _split_opnorm_inf, _split_materialize,
     _split_precondition_double
 
@@ -314,6 +314,12 @@ BeatEngineSplitDense.jl), or `lu_float64_fallback` after a refinement fallback),
 (the last solve's worst column, in units of the Float64 attainable backward error).
 """
 function dense_solver_diagnostics(system)
+    diagnostics = _dense_solver_diagnostics(system)
+    hasproperty(system, :dense_lhs_adopted) && (diagnostics["dense_lhs_adopted"] = system.dense_lhs_adopted)
+    return diagnostics
+end
+
+function _dense_solver_diagnostics(system)
     factorization = hasproperty(system, :factorization) ? system.factorization : nothing
     if factorization isa SplitGMRES
         return Dict{String,Any}(
@@ -1899,9 +1905,10 @@ Metal assembles them on the GPU; the CPU uses this solver's own fork of the regu
 With a `combined_identity` (`_condensed_bem_assembly_plan`), Metal instead assembles the
 Burton-Miller A and C directly, returned as `(combined=...,)` device storage.
 """
-function _assemble_condensed_bem_operators(bem_mesh, prepared, wavenumber, singular_order::Int; combined_identity=nothing)
+function _assemble_condensed_bem_operators(bem_mesh, prepared, wavenumber, singular_order::Int; combined_identity=nothing,
+                                           adopt_order::Int=0)
     isnothing(combined_identity) || return (combined=BeatEngineCore.assemble_coupled_burton_miller_metal(
-        bem_mesh, prepared, wavenumber; identity_cache=combined_identity,
+        bem_mesh, prepared, wavenumber; identity_cache=combined_identity, adopt_order=adopt_order,
     ),)
     return if prepared.bem_backend == :metal
         # Metal assembles the four operators on the GPU; the condensed algebra
@@ -1947,6 +1954,15 @@ end
 The Burton-Miller combination of one frequency's four operators and the interface coupling block
 `-C Q`, as fresh host arrays. Frees the operators' Metal buffers: nothing reads them afterwards.
 """
+# `BLAB_METAL_COUPLED_ADOPT_A`: `on` (default) lets the split dense system take over the host memory
+# Metal assembled A into (restrided in place), so A and the dense system never coexist; `off` copies
+# A into a separately allocated dense system, as before.
+function _metal_adopt_enabled()
+    setting = lowercase(strip(get(ENV, "BLAB_METAL_COUPLED_ADOPT_A", "on")))
+    setting in ("on", "off") || error("BLAB_METAL_COUPLED_ADOPT_A must be on or off; got $(repr(setting)).")
+    return setting == "on"
+end
+
 # The host flux operator of a combined assembly: the full C, or C on its active columns.
 function _combined_flux_operator(host, matrix)
     active = get(host, :active_columns, nothing)
@@ -1976,7 +1992,9 @@ function _combine_condensed_bem_operators!(operators, prepared, wavenumber; keep
                     BeatEngineCore.release_metal_coupled_burton_miller!(host)
                     return nothing
                 end
-                return host.a, rhs_operator, interface_block, release
+                held = host
+                adopt = order -> BeatEngineCore.metal_detach_coupled_lhs!(held, order)
+                return host.a, rhs_operator, interface_block, release, adopt
             catch
                 isnothing(host) ? BeatEngineCore.release_metal_coupled_burton_miller!(operators.combined) :
                                   BeatEngineCore.release_metal_coupled_burton_miller!(host)
@@ -1994,7 +2012,8 @@ function _combine_condensed_bem_operators!(operators, prepared, wavenumber; keep
             BeatEngineCore.release_metal_coupled_burton_miller!(operators.combined)
         end
     end
-    keep_device && return (_combine_condensed_bem_operators!(operators, prepared, wavenumber)..., () -> nothing)
+    keep_device && return (_combine_condensed_bem_operators!(operators, prepared, wavenumber)..., () -> nothing,
+                           order -> nothing)
     bem_lhs, bem_rhs_operator = burton_miller_neumann_matrices(
         operators,
         prepared.identity_p1_p1,
@@ -2337,12 +2356,18 @@ function build_condensed_coupled_system(
     keep_device = T === Float32 && _dense_double_assembly(bem_backend) && _dense_refinement_enabled(bem_backend) &&
                   _dense_split_enabled()
     bem_release = () -> nothing
+    bem_adopt = order -> nothing
+    # Flux elimination puts the BEM block first ([p_B, y]); the dense system is A bordered by the
+    # transducer rows and columns, so it can grow out of A's own host memory.
+    adopt_order = (keep_device && interface_elimination == :flux && _metal_adopt_enabled()) ?
+                  length(bem_mesh.vertices) + 2 * transducer_count : 0
     try
         bem_operator_started = time_ns()
         prefetched = nothing
         operators = if isnothing(bem_operators)
             _assemble_condensed_bem_operators(
                 bem_mesh, prepared, wavenumber, singular_order; combined_identity=combined_identity,
+                adopt_order=adopt_order,
             )
         else
             # Assembled and combined ahead by the sweep pipeline (`assemble_condensed_bem_operators`);
@@ -2357,11 +2382,13 @@ function build_condensed_coupled_system(
         bem_operator_s = (time_ns() - bem_operator_started) / 1.0e9
 
         bem_matrix_started = time_ns()
-        bem_lhs, bem_rhs_operator, bem_interface_block, bem_release = if isnothing(prefetched)
+        bem_lhs, bem_rhs_operator, bem_interface_block, bem_release, bem_adopt = if isnothing(prefetched)
             keep_device ? _combine_condensed_bem_operators!(operators, prepared, wavenumber; keep_device=true) :
-                          (_combine_condensed_bem_operators!(operators, prepared, wavenumber)..., () -> nothing)
+                          (_combine_condensed_bem_operators!(operators, prepared, wavenumber)..., () -> nothing,
+                           order -> nothing)
         else
-            (prefetched.bem_lhs, prefetched.bem_rhs_operator, prefetched.bem_interface_block, () -> nothing)
+            (prefetched.bem_lhs, prefetched.bem_rhs_operator, prefetched.bem_interface_block, () -> nothing,
+             order -> nothing)
         end
         # The part of `bem_matrix_s` the sweep pipeline moves onto its producer.
         bem_combine_s = isnothing(prefetched) ? (time_ns() - bem_matrix_started) / 1.0e9 : 0.0
@@ -2453,10 +2480,22 @@ function build_condensed_coupled_system(
     # outside the Γ-mapped columns holds only `bem_lhs` (Complex{T} == ComplexF32) and needs none.
     split_dense = dense_type === Float64 && T === Float32 && _dense_refinement_enabled(bem_backend) &&
                   _dense_split_enabled()
+    lhs_adopted = false
     coupled = if split_dense
         non_bem = setdiff(1:system_count, bem_range)
         gamma_bem_columns = isnothing(elimination_map) ? Int[] : collect(bem_range)[elimination_map.bem_of_gamma]
-        SplitDenseMatrix(system_count, non_bem, vcat(non_bem, gamma_bem_columns))
+        detached = (interface_elimination == :flux && bem_range == 1:bem_count) ? bem_adopt(system_count) : nothing
+        if detached === nothing
+            SplitDenseMatrix(system_count, non_bem, vcat(non_bem, gamma_bem_columns))
+        else
+            # A's host memory becomes the dense system: restrided in place, never copied.
+            address, assembled = detached
+            assembled == bem_count || error("Adopted Metal A has $assembled rows where $bem_count were expected.")
+            lhs_adopted = true
+            bem_lhs = nothing   # its old layout is gone
+            SplitDenseMatrix(adopt_square_storage(address, bem_count, system_count), non_bem,
+                             vcat(non_bem, gamma_bem_columns))
+        end
     else
         zeros(Complex{dense_type}, system_count, system_count)
     end
@@ -2537,7 +2576,7 @@ function build_condensed_coupled_system(
             (local_gamma_mech, local_mech_gamma, collect(bem_range)[elimination_map.bem_of_gamma])
         end
         _split_timed!(elimination_split, :bem_block_copy) do
-            coupled[bem_range, bem_range] = bem_lhs
+            lhs_adopted || (coupled[bem_range, bem_range] = bem_lhs)
         end
         if interface_elimination == :pressure
             coupled[gamma_row_range, flux_range] =
@@ -2660,6 +2699,7 @@ function build_condensed_coupled_system(
         field_cache=prepared.field_cache,
         coupled=nothing,
         factorization=factorization,
+        dense_lhs_adopted=lhs_adopted,
         formulation=:fem_interface_condensed,
         # The order the assembly actually used, so diagnostics report what ran, not what was asked.
         regular_quadrature_order=selected_quadrature_order,

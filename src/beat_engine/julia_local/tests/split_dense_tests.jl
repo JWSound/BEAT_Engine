@@ -215,3 +215,32 @@ end
         @test SD.dense_solver_diagnostics((factorization=solver,))["dense_solver"] == "gmres_fallback_lu"
     end
 end
+
+@testset "Adopted A (BLAB_METAL_COUPLED_ADOPT_A): restrided in place, same system as a copy" begin
+    rng = MersenneTwister(31)
+    for (n, border) in ((160, 12), (97, 0), (64, 1))
+        f = split_fixture(rng, n, border)
+        m = f.m
+        # Host memory laid out like the Metal assembly leaves it: A (m x m, leading dimension m)
+        # first, then junk up to the n^2 capacity that must not leak into the system.
+        address = Libc.malloc(n * n * sizeof(ComplexF32))
+        raw = unsafe_wrap(Array, Ptr{ComplexF32}(address), n * n; own=false)
+        fill!(raw, ComplexF32(NaN, NaN))
+        copyto!(raw, 1, vec(f.bem), 1, m * m)
+        hi = SD.adopt_square_storage(address, m, n)
+        @test size(hi) == (n, n) && pointer(hi) == Ptr{ComplexF32}(address)
+        adopted = SD.SplitDenseMatrix(hi, (m + 1):n, vcat((m + 1):n, f.gamma_columns))
+        # Everything the build writes after the BEM block copy, which the adopted path skips.
+        for (local_column, column) in enumerate(f.gamma_columns)
+            @views adopted[1:m, column] .+= f.schur[:, local_column]
+        end
+        border > 0 && (adopted[1:n, (m + 1):n] = f.border_cols)
+        border > 0 && (adopted[(m + 1):n, 1:m] = f.border_rows)
+        border > 0 && (@views adopted[(m + 1):n, f.gamma_columns[1]] .+= 1e-7)
+        @test Matrix(adopted) == dense_build(f)
+        @test adopted.hi == split_build(f).hi
+        rhs = randn(rng, ComplexF64, n, 2)
+        @test SD.SplitRefinedLU(adopted) \ rhs ≈ dense_build(f) \ rhs rtol = 1e-10
+    end
+    @test_throws ArgumentError SD.adopt_square_storage(Ptr{Cvoid}(1), 5, 4)
+end
