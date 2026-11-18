@@ -300,7 +300,7 @@ end
 
 # Split-precision dense storage and refinement (BeatEngineSplitDense.jl) live in BeatEngineCoupled,
 # shared with the CUDA coupled path.
-using ..BeatEngineCoupled: SplitDenseMatrix, SplitRefinedLU, release_split_factor!, _dense_split_enabled,
+using ..BeatEngineCoupled: SplitDenseMatrix, SplitRefinedLU, SplitGMRES, _dense_solver_mode, release_split_factor!, _dense_split_enabled,
     _dense_spill_target, _dense_gmres_ir_enabled, _split_mul!, _split_opnorm_inf, _split_materialize,
     _split_precondition_double
 
@@ -315,6 +315,20 @@ BeatEngineSplitDense.jl), or `lu_float64_fallback` after a refinement fallback),
 """
 function dense_solver_diagnostics(system)
     factorization = hasproperty(system, :factorization) ? system.factorization : nothing
+    if factorization isa SplitGMRES
+        return Dict{String,Any}(
+            "dense_solver" => isnothing(factorization.fallback) ? "gmres_float32_ir" : "gmres_fallback_lu",
+            "dense_gmres_inner_iterations" => factorization.inner_iterations,
+            "dense_gmres_outer_iterations" => factorization.outer_iterations,
+            "dense_gmres_relative_residual" => isnan(factorization.relative_residual) ? nothing : factorization.relative_residual,
+            "dense_gmres_tolerance" => factorization.tolerance,
+            "dense_gmres_restart" => factorization.restart,
+            "dense_gmres_preconditioner" => all(isone, factorization.preconditioner) ? "none" : "jacobi",
+            "dense_gmres_solve_s" => factorization.solve_seconds,
+            "dense_gmres_matvec_s" => factorization.matvec_seconds,
+            "dense_refinement_fallback_reason" => factorization.fallback_reason,
+        )
+    end
     if factorization isa SplitRefinedLU
         return Dict{String,Any}(
             "dense_solver" => isnothing(factorization.fallback) ?
@@ -2621,7 +2635,7 @@ function build_condensed_coupled_system(
         GC.gc()
     end
     factorization = if coupled isa SplitDenseMatrix
-        SplitRefinedLU(coupled)
+        _dense_solver_mode() == "gmres" ? SplitGMRES(coupled) : SplitRefinedLU(coupled)
     elseif dense_type === Float64 && T !== Float64 && _dense_refinement_enabled(bem_backend)
         RefinedDenseLU(coupled)
     else

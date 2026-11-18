@@ -187,3 +187,31 @@ end
     end
     @test core.dense_lu!(view(randn(rng, 6, 6) + 4I, :, :)) isa LinearAlgebra.LU   # non-Matrix: lu!
 end
+
+@testset "SplitGMRES (BLAB_COUPLED_DENSE_SOLVER=gmres): no factorization, falls back to LU" begin
+    rng = MersenneTwister(21)
+    f = split_fixture(rng, 200, 10)
+    dense = dense_build(f)
+    rhs = randn(rng, ComplexF64, f.n, 5)
+    reference = dense \ rhs
+    for precond in ("jacobi", "none")
+        withenv("BLAB_COUPLED_DENSE_GMRES_PRECOND" => precond, "BLAB_COUPLED_DENSE_GMRES_TOL" => "1e-9") do
+            solver = SD.SplitGMRES(split_build(f))
+            solution = solver \ rhs
+            @test isnothing(solver.fallback)
+            @test solver.relative_residual <= 1e-9
+            @test norm(solution - reference) / norm(reference) < 1e-6
+            @test solver.inner_iterations > 0 && solver.outer_iterations >= 1
+            d = SD.dense_solver_diagnostics((factorization=solver,))
+            @test d["dense_solver"] == "gmres_float32_ir" && d["dense_gmres_preconditioner"] == precond
+            @test vec(solver \ rhs[:, 2]) ≈ solution[:, 2] rtol = 1e-6
+        end
+    end
+    withenv("BLAB_COUPLED_DENSE_GMRES_MAXITER" => "3") do              # budget too small: LU fallback
+        solver = SD.SplitGMRES(split_build(f))
+        solution = (@test_logs (:warn,) match_mode=:any solver \ rhs)
+        @test solver.fallback isa SD.SplitRefinedLU
+        @test norm(solution - reference) / norm(reference) < 1e-12
+        @test SD.dense_solver_diagnostics((factorization=solver,))["dense_solver"] == "gmres_fallback_lu"
+    end
+end

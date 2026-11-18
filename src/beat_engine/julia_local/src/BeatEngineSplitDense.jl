@@ -572,3 +572,191 @@ function _split_gmres_ir!(factorization::SplitRefinedLU, target, solution, resid
     return false, "not converged after $(DENSE_GMRES_IR_MAX_CYCLES) restarts of $(DENSE_GMRES_IR_RESTART) " *
                   "(worst $(maximum(ratios))x the Float64 backward error)"
 end
+
+# ---------------------------------------------------------------------------------------------
+# Experimental: iterative solve of the condensed dense system without any LU factorization.
+#
+# `BLAB_COUPLED_DENSE_SOLVER=gmres` (default `lu`). Mixed-precision iterative refinement whose
+# inner solver is restarted GMRES in ComplexF32 on the stored `hi` part (one ComplexF32 matrix
+# product per Arnoldi step serves every right-hand side), outer residuals in ComplexF64 against the
+# exact split matrix. No factor is ever allocated: the dense system needs 8 n^2 bytes instead of
+# 16 n^2, and the work per right-hand side is O(n^2) per iteration instead of O(n^3) once.
+# If the iteration does not reach the tolerance within its budget, the solve falls back to the
+# usual SplitRefinedLU, so results never silently degrade.
+#
+#   BLAB_COUPLED_DENSE_GMRES_TOL      relative residual target per column (default 1e-10)
+#   BLAB_COUPLED_DENSE_GMRES_RESTART  Arnoldi steps per restart (default 100)
+#   BLAB_COUPLED_DENSE_GMRES_MAXITER  total inner steps per solve before falling back (default 2000)
+#   BLAB_COUPLED_DENSE_GMRES_PRECOND  jacobi (default) | none
+# ---------------------------------------------------------------------------------------------
+
+_dense_solver_mode() = lowercase(strip(get(ENV, "BLAB_COUPLED_DENSE_SOLVER", "lu")))
+_dense_gmres_setting(name, default) = something(tryparse(typeof(default), get(ENV, name, string(default))), default)
+
+mutable struct SplitGMRES
+    matrix::SplitDenseMatrix
+    store::Matrix{ComplexF32}
+    preconditioner::Vector{ComplexF32}       # right Jacobi scaling (ones for :none)
+    tolerance::Float64
+    restart::Int
+    max_inner::Int
+    inner_iterations::Int                    # total Arnoldi steps over all solves
+    outer_iterations::Int
+    relative_residual::Float64               # worst column of the last solve (ComplexF64 residual)
+    solve_seconds::Float64
+    matvec_seconds::Float64
+    fallback::Union{Nothing,SplitRefinedLU}
+    fallback_reason::Union{Nothing,String}
+end
+
+function SplitGMRES(matrix::SplitDenseMatrix)
+    all(isfinite, matrix.hi) || throw(ArgumentError("dense coupled matrix has non-finite entries"))
+    n = size(matrix, 1)
+    mode = lowercase(strip(get(ENV, "BLAB_COUPLED_DENSE_GMRES_PRECOND", "jacobi")))
+    preconditioner = ones(ComplexF32, n)
+    if mode == "jacobi"
+        @inbounds for i in 1:n
+            d = matrix.hi[i, i]
+            preconditioner[i] = iszero(d) ? one(ComplexF32) : inv(d)
+        end
+    elseif mode != "none"
+        error("BLAB_COUPLED_DENSE_GMRES_PRECOND must be jacobi or none; got $(repr(mode)).")
+    end
+    return SplitGMRES(matrix, matrix.hi, preconditioner,
+                      _dense_gmres_setting("BLAB_COUPLED_DENSE_GMRES_TOL", 1e-10),
+                      _dense_gmres_setting("BLAB_COUPLED_DENSE_GMRES_RESTART", 100),
+                      _dense_gmres_setting("BLAB_COUPLED_DENSE_GMRES_MAXITER", 2000),
+                      0, 0, NaN, 0.0, 0.0, nothing, nothing)
+end
+
+Base.size(solver::SplitGMRES, dims...) = size(solver.store, dims...)
+release_split_factor!(solver::SplitGMRES) = (solver.fallback === nothing || release_split_factor!(solver.fallback); nothing)
+
+function Base.:\(solver::SplitGMRES, rhs::AbstractVecOrMat)
+    all(isfinite, rhs) || throw(ArgumentError("dense coupled right-hand side has non-finite entries"))
+    solver.fallback === nothing || return solver.fallback \ rhs
+    started = time_ns()
+    target = rhs isa AbstractVector ? reshape(ComplexF64.(rhs), :, 1) : ComplexF64.(rhs)
+    solution, ok, reason = _gmres_ir_solve(solver, target)
+    solver.solve_seconds += (time_ns() - started) / 1.0e9
+    if !ok
+        solver.fallback_reason = "GMRES fell back to the Float32 LU with refinement: " * reason
+        @warn solver.fallback_reason
+        solver.fallback = SplitRefinedLU(solver.matrix)
+        solution = solver.fallback \ target
+    end
+    return rhs isa AbstractVector ? vec(solution) : solution
+end
+
+function _gmres_ir_solve(solver::SplitGMRES, target::Matrix{ComplexF64})
+    n, columns = size(target)
+    solution = zeros(ComplexF64, n, columns)
+    residual = similar(target)
+    norms = [max(norm(view(target, :, j)), floatmin(Float64)) for j in 1:columns]
+    budget = solver.max_inner
+    previous = Inf
+    for outer in 0:20
+        copyto!(residual, target)
+        _split_mul!(residual, solver.store, solver.matrix, solution, -one(ComplexF64), one(ComplexF64))
+        relative = [norm(view(residual, :, j)) / norms[j] for j in 1:columns]
+        worst = maximum(relative; init=0.0)
+        solver.relative_residual = worst
+        isfinite(worst) || return solution, false, "non-finite residual"
+        worst <= solver.tolerance && return solution, true, ""
+        outer > 0 && worst > previous / 2 && return solution, false, "outer refinement stalled at $(worst)"
+        previous = worst
+        active = findall(>(solver.tolerance), relative)
+        # inner tolerance: the remaining reduction, but no tighter than Float32 can deliver
+        inner_tolerance = max(solver.tolerance / worst, 1e-4)
+        correction, steps = _gmres_f32(solver, ComplexF32.(residual[:, active]), inner_tolerance, budget)
+        budget -= steps
+        solution[:, active] .+= correction
+        solver.outer_iterations += 1
+        budget <= 0 && return solution, false, "no convergence within $(solver.max_inner) inner steps (residual $(worst))"
+    end
+    return solution, false, "outer refinement limit reached"
+end
+
+"""
+Restarted, right-preconditioned GMRES in ComplexF32 for all columns in lockstep, Givens-rotated
+least squares per column. Returns the ComplexF64 correction and the number of Arnoldi steps.
+"""
+function _gmres_f32(solver::SplitGMRES, rhs::Matrix{ComplexF32}, tolerance::Float64, budget::Int)
+    n, k = size(rhs)
+    m = solver.restart
+    P = solver.preconditioner
+    x = zeros(ComplexF32, n, k)
+    r = copy(rhs)
+    bnorm = [max(norm(view(rhs, :, j)), floatmin(Float32)) for j in 1:k]
+    V = Array{ComplexF32}(undef, n, m + 1, k)
+    H = zeros(ComplexF32, m + 1, m, k)
+    cs = zeros(ComplexF32, m, k); sn = zeros(ComplexF32, m, k)
+    g = zeros(ComplexF32, m + 1, k)
+    Z = Matrix{ComplexF32}(undef, n, k)
+    W = Matrix{ComplexF32}(undef, n, k)
+    steps = 0
+    previous = Inf
+    while steps < budget
+        beta = [norm(view(r, :, j)) for j in 1:k]
+        current = maximum(beta[j] / bnorm[j] for j in 1:k)
+        current <= tolerance && break
+        # A restart that did not halve the residual means Float32 has reached its floor
+        # (about cond * eps(Float32)); the ComplexF64 outer refinement continues from here.
+        current > previous / 2 && break
+        previous = current
+        fill!(H, 0); fill!(g, 0)
+        for j in 1:k
+            @views V[:, 1, j] .= r[:, j] ./ max(beta[j], floatmin(Float32))
+            g[1, j] = beta[j]
+        end
+        done = falses(k)
+        used = 0
+        column_steps = zeros(Int, k)
+        for i in 1:m
+            @views Z .= V[:, i, :] .* P                      # right preconditioning
+            t = time_ns()
+            mul!(W, solver.store, Z)
+            solver.matvec_seconds += (time_ns() - t) / 1.0e9
+            steps += 1; used = i
+            for j in 1:k
+                done[j] && continue
+                w = view(W, :, j)
+                for l in 1:i                                  # modified Gram-Schmidt
+                    v = view(V, :, l, j)
+                    h = dot(v, w)
+                    H[l, i, j] = h
+                    BLAS.axpy!(-h, v, w)
+                end
+                hn = norm(w)
+                H[i + 1, i, j] = hn
+                @views V[:, i + 1, j] .= iszero(hn) ? zero(ComplexF32) : w ./ hn
+                for l in 1:(i - 1)                            # apply previous rotations
+                    a = H[l, i, j]; b = H[l + 1, i, j]
+                    H[l, i, j] = conj(cs[l, j]) * a + conj(sn[l, j]) * b
+                    H[l + 1, i, j] = -sn[l, j] * a + cs[l, j] * b
+                end
+                a = H[i, i, j]; b = H[i + 1, i, j]
+                denom = sqrt(abs2(a) + abs2(b))
+                c, s = iszero(denom) ? (one(ComplexF32), zero(ComplexF32)) : (a / denom, b / denom)
+                cs[i, j] = c; sn[i, j] = s
+                H[i, i, j] = conj(c) * a + conj(s) * b
+                H[i + 1, i, j] = 0
+                g[i + 1, j] = -s * g[i, j]
+                g[i, j] = conj(c) * g[i, j]
+                column_steps[j] = i
+                abs(g[i + 1, j]) / bnorm[j] <= tolerance && (done[j] = true)
+            end
+            (all(done) || steps >= budget) && break
+        end
+        for j in 1:k                                          # update x_j with its least squares
+            steps_j = column_steps[j]
+            steps_j == 0 && continue
+            y = UpperTriangular(view(H, 1:steps_j, 1:steps_j, j)) \ view(g, 1:steps_j, j)
+            @views x[:, j] .+= (V[:, 1:steps_j, j] * y) .* P
+        end
+        mul!(r, solver.store, x)                             # true ComplexF32 residual for the restart
+        r .= rhs .- r
+    end
+    solver.inner_iterations += steps
+    return ComplexF64.(x), steps
+end
