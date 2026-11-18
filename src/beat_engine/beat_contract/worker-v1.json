@@ -45,6 +45,7 @@
     "uniform_normal",
     "rigid_translation"
   ],
+  "coupled_source_profiles": ["uniform_normal", "rigid_translation"],
   "coupled_exterior_source_profiles": [
     "uniform_normal",
     "rigid_translation"

@@ -129,6 +129,10 @@ end
     stiffness, mass = assemble_p2_fem_matrices(mesh)
     boundary_mass = assemble_boundary_mass_matrix(mesh, [1], collect(1:10))
     load = assemble_prescribed_velocity_load(mesh, 2, 1.2, 100.0, 1.0 + 0.0im)
+    axial_load = assemble_prescribed_velocity_load(mesh, 2, 1.2, 100.0, 1.0 + 0.0im;
+        motion_axis=SVector(0.0, 0.0, 1.0))
+    @test isapprox(axial_load, -load)
+
 
     @test size(stiffness) == (10, 10)
     @test Matrix(stiffness) ≈ transpose(Matrix(stiffness)) atol=1e-12
@@ -478,6 +482,14 @@ end
     @test solution.bem_neumann == ComplexF64[6im]
     @test solution.pressure_continuity_error == 0
     @test solution.flux_conservation_error == 0
+    # FEM outward normal is -Z despite the supplied +Z triangle winding.
+    for axis in (SVector(0.0, 0.0, 1.0), SVector(0.0, 0.0, -1.0), SVector(1.0, 0.0, 0.0))
+        axial = merge(excitation, (motion_axis=axis,))
+        result = only(solve_coupled_excitations(system, [axial]))
+        @test isapprox(result.fem_pressure, -axis[3] .* solution.fem_pressure)
+        @test result.bem_pressure == solution.bem_pressure # Already projected during BEM assembly.
+        @test result.bem_neumann == solution.bem_neumann
+    end
 end
 
 @testset "rigid-piston electrodynamic surface operators" begin

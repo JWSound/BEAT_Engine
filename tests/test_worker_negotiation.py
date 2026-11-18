@@ -169,7 +169,7 @@ def test_missing_profiles_preserves_old_worker_normal_fallback(ready, payload):
 
 
 @pytest.mark.parametrize("kind", ["interior_fem", "coupled_fem_bem_lem"])
-def test_rigid_ideal_source_rejects_interior_boundaries_before_submission(ready, payload, kind):
+def test_rigid_ideal_source_negotiates_fem_boundary_support(ready, payload, kind):
     system = payload["compiled_system"]
     system["contract_version"] = 2
     system["components"][0]["parameters"] = {"motion_profile": "rigid_translation", "motion_axis": [1, 2, 3]}
@@ -180,14 +180,21 @@ def test_rigid_ideal_source_rejects_interior_boundaries_before_submission(ready,
         interior.update(id="region:interior", kind="bounded_air")
         system["regions"].append(interior)
         system["boundaries"][0]["region_id"] = interior["id"]
-    with pytest.raises(WorkerCompatibilityError, match="exterior-only boundary assignments"):
-        negotiate_submission(ready, payload, "solve")
+    if kind == "interior_fem":
+        with pytest.raises(WorkerCompatibilityError, match="exterior or coupled"):
+            negotiate_submission(ready, payload, "solve")
+    else:
+        assert negotiate_submission(ready, payload, "solve")["result_schema_version"] == 2
+        ready.pop("coupled_source_profiles")
+        with pytest.raises(WorkerCompatibilityError, match="restart the worker"):
+            negotiate_submission(ready, payload, "solve")
 
 
 @pytest.mark.parametrize("profiles", [None, {}, "rigid_translation", [1], [""]])
-def test_rejects_malformed_coupled_source_profiles(ready, profiles):
-    ready["coupled_exterior_source_profiles"] = profiles
-    with pytest.raises(WorkerCompatibilityError, match="coupled_exterior_source_profiles"):
+@pytest.mark.parametrize("capability", ["coupled_exterior_source_profiles", "coupled_source_profiles"])
+def test_rejects_malformed_coupled_source_profiles(ready, profiles, capability):
+    ready[capability] = profiles
+    with pytest.raises(WorkerCompatibilityError, match=capability):
         validate_worker_ready(ready)
 
 

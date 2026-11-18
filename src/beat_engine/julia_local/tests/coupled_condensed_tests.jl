@@ -359,6 +359,20 @@ if get(ENV, "BLAB_RUN_COUPLED_REFERENCE", "0") == "1"
                 @test eltype(condensed.condensation.schur) == ComplexF64
                 @test condensed.condensation.retained_count == length(interface_map.fem_vertex_indices)
 
+                # Compare the complete complex solution for weighted axial FEM forcing.
+                axis = normalize(SVector(0.3, 0.2, 1.0))
+                axial = (kind=:normal_velocity, fem_boundary_tags=[radiator_tag],
+                    fem_boundary_weights=[0.7], bem_source_index=0, transducer_index=0,
+                    amplitude=ComplexF64(1, 0.2), motion_axis=axis)
+                axial_cases = [axial, merge(axial, (motion_axis=-axis,))]
+                axial_references = solve_coupled_excitations(monolithic, axial_cases)
+                axial_candidates = solve_condensed_coupled_excitations(condensed, axial_cases)
+                for field in (:fem_pressure, :bem_pressure, :interface_flux, :bem_neumann)
+                    @test relative_error(getproperty(axial_references[1], field),
+                        getproperty(axial_candidates[1], field)) < 1e-9
+                    @test isapprox(getproperty(axial_references[2], field), -getproperty(axial_references[1], field))
+                    @test isapprox(getproperty(axial_candidates[2], field), -getproperty(axial_candidates[1], field))
+                end
                 reference = only(solve_coupled_systems(monolithic, [radiator_tag]))
                 candidates = solve_condensed_coupled_systems(
                     condensed,

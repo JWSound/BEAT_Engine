@@ -717,10 +717,12 @@ function assemble_prescribed_velocity_load(
     boundary_tag::Int,
     density::T,
     omega::T,
-    velocity::Complex{T},
+    velocity::Complex{T};
+    motion_axis=nothing,
 ) where {T<:AbstractFloat}
     load = zeros(Complex{T}, length(mesh.vertices))
-    normal_derivative = neumann_scale(density, omega) * velocity
+    base_derivative = neumann_scale(density, omega) * velocity
+    normals = motion_axis === nothing ? nothing : _outward_boundary_normals(mesh)
     quadratic_reference_load = is_quadratic(mesh) ? _p2_triangle_reference_load(T) : nothing
     for face_index in eachindex(mesh.boundary_faces)
         mesh.boundary_physical_tags[face_index] == boundary_tag || continue
@@ -728,6 +730,10 @@ function assemble_prescribed_velocity_load(
                mesh.quadratic_boundary_faces[face_index] :
                mesh.boundary_faces[face_index]
         area = _triangle_area(mesh.vertices, face)
+        projection = motion_axis === nothing ? one(T) : T(dot(normals[face_index], motion_axis))
+        normal_derivative = base_derivative * projection
+        projection = motion_axis === nothing ? one(T) : T(dot(normals[face_index], motion_axis))
+        normal_derivative = base_derivative * projection
         if is_quadratic(mesh)
             nodal_load = normal_derivative .* (T(2) * area) .* quadratic_reference_load
             for (local_index, vertex) in enumerate(face)
@@ -2995,7 +3001,8 @@ function solve_coupled_excitations(system, excitations)
                     tag,
                     system.density,
                     system.omega,
-                    amplitude * weight,
+                    amplitude * weight;
+                    motion_axis=get(excitation, :motion_axis, nothing),
                 )
             end
             bem_source_index = hasproperty(excitation, :bem_source_index) ?
