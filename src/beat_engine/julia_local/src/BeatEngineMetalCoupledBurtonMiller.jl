@@ -444,9 +444,10 @@ function _metal_wrap_panel(storage::Matrix{E}, first::Int, last::Int, step::Int)
     return unsafe_wrap(MtlArray{E,2}, slice, (n, columns))
 end
 
-# Column panels of a host matrix, wrapped as Metal buffers one at a time while their kernels run,
-# so the GPU never holds more than one panel of A (plus C and the tables) resident. A single panel
-# stays wrapped for the whole assembly.
+# Column panels of a host matrix, each wrapped once as a Metal buffer. With more than one panel the
+# kernels of one panel finish (synchronize) before the next panel's are queued, so a command buffer
+# in flight never needs more than one panel of A resident (plus C and the tables). Re-wrapping
+# panels per use is not an option: no-copy buffers are released lazily and creation starts failing.
 struct MetalLazyPanels{E}
     storage::Matrix{E}
     ranges::Vector{Tuple{Int,Int}}
@@ -456,26 +457,17 @@ end
 
 function MetalLazyPanels(storage::Matrix{E}, ranges, step::Int) where {E}
     ranges = collect(Tuple{Int,Int}, ranges)
-    held = length(ranges) == 1 ? [_metal_wrap_panel(storage, ranges[1][1], ranges[1][2], step)] : MtlArray{E,2}[]
+    held = MtlArray{E,2}[_metal_wrap_panel(storage, first, last, step) for (first, last) in ranges]
     return MetalLazyPanels{E}(storage, ranges, step, held)
 end
 
 _metal_held_panels(panels::MetalLazyPanels) = panels.held
 
 function _metal_foreach_panel(f, panels::MetalLazyPanels)
-    if !isempty(panels.held)
-        first, last = panels.ranges[1]
-        f(panels.held[1], first, last)
-        return nothing
-    end
-    for (first, last) in panels.ranges
-        panel = _metal_wrap_panel(panels.storage, first, last, panels.step)
-        try
-            f(panel, first, last)
-        finally
-            Metal.synchronize()
-            Metal.unsafe_free!(panel)
-        end
+    serial = length(panels.held) > 1
+    for (panel, (first, last)) in zip(panels.held, panels.ranges)
+        f(panel, first, last)
+        serial && Metal.synchronize()
     end
     return nothing
 end
