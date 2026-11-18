@@ -91,7 +91,7 @@ function check_panels(mesh, prepared, k, full_host)
             end
             hasproperty(panelled, :a_panels) || error("panel assembly was not used for width $width")
             host = BeatEngineCore.metal_host_coupled_burton_miller(panelled)
-            check("A (panels of >= $width columns, $(length(panelled.a_panels)) panels)", full_host.a, host.a; rtol=0, atol=0)
+            check("A (panels of >= $width columns, $(get(panelled, :a_panel_count, length(panelled.a_panels))) panels)", full_host.a, host.a; rtol=0, atol=0)
             check("C (panel run)", full_host.c, host.c; rtol=0, atol=0)
         finally
             panelled === nothing || BeatEngineCore.release_metal_coupled_burton_miller!(panelled)

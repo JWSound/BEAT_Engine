@@ -114,7 +114,7 @@ function _launch_metal_coupled_pair_kernels!(
         node_count = tables.chunk_node_offsets[chunk + 1] - node_start
         if lhs_panels !== nothing
             # Tiled A: the same gather once per column panel, each writing only its own columns.
-            for (panel, column_first, column_last) in lhs_panels
+            _metal_foreach_panel(lhs_panels) do panel, column_first, column_last
                 _metal_launch(
                     _metal_fused_lhs_gather_panel_kernel!,
                     cache.p1_dof_count * node_count,
@@ -208,7 +208,7 @@ function _launch_metal_coupled_singular_kernels!(
             # Tiled A: each panel takes the entries of its own column range.
             block_map = gather_tables.p1_p1
             rows = Int64(regular_cache.p1_dof_count)
-            for (panel, column_first, column_last) in lhs_panels
+            _metal_foreach_panel(lhs_panels) do panel, column_first, column_last
                 _metal_launch(
                     _metal_singular_entry_gather_panel_kernel!,
                     block_map.entry_count,
@@ -370,7 +370,10 @@ function _metal_coupled_panel_plan(n::Int, ::Type{E}; host_backed::Bool=false) w
     column_bytes = n * sizeof(E)
     # Panel starts and lengths must be whole pages for a no-copy wrap: columns come in groups of `step`.
     step = page ÷ gcd(column_bytes, page)
-    limit = Int(Metal.device().maxBufferLength) - page
+    # A panel is also bounded by a quarter of the GPU's recommended working set: every buffer a
+    # command buffer touches must be resident, and A plus the assembly's own tables must fit.
+    device = Metal.device()
+    limit = min(Int(device.maxBufferLength), Int(device.recommendedMaxWorkingSetSize) ÷ 4) - page
     requested = if setting == "auto"
         if column_bytes * n <= limit
             host_backed || return nothing
@@ -439,6 +442,42 @@ function _metal_wrap_panel(storage::Matrix{E}, first::Int, last::Int, step::Int)
     # Shared storage is the default of a no-copy wrap; `storage` itself must keep the memory alive
     # for as long as the panel is in use (the caller holds it in the result tuple).
     return unsafe_wrap(MtlArray{E,2}, slice, (n, columns))
+end
+
+# Column panels of a host matrix, wrapped as Metal buffers one at a time while their kernels run,
+# so the GPU never holds more than one panel of A (plus C and the tables) resident. A single panel
+# stays wrapped for the whole assembly.
+struct MetalLazyPanels{E}
+    storage::Matrix{E}
+    ranges::Vector{Tuple{Int,Int}}
+    step::Int
+    held::Vector{MtlArray{E,2}}
+end
+
+function MetalLazyPanels(storage::Matrix{E}, ranges, step::Int) where {E}
+    ranges = collect(Tuple{Int,Int}, ranges)
+    held = length(ranges) == 1 ? [_metal_wrap_panel(storage, ranges[1][1], ranges[1][2], step)] : MtlArray{E,2}[]
+    return MetalLazyPanels{E}(storage, ranges, step, held)
+end
+
+_metal_held_panels(panels::MetalLazyPanels) = panels.held
+
+function _metal_foreach_panel(f, panels::MetalLazyPanels)
+    if !isempty(panels.held)
+        first, last = panels.ranges[1]
+        f(panels.held[1], first, last)
+        return nothing
+    end
+    for (first, last) in panels.ranges
+        panel = _metal_wrap_panel(panels.storage, first, last, panels.step)
+        try
+            f(panel, first, last)
+        finally
+            Metal.synchronize()
+            Metal.unsafe_free!(panel)
+        end
+    end
+    return nothing
 end
 
 # Unsupported diagnostic configurations keep their original operator kernels.
@@ -597,7 +636,7 @@ function assemble_coupled_burton_miller_metal(
             # host matrix, wrapped panel by panel.
             a_storage = _metal_aligned_host_matrix(Complex{T}, n, plan.padded_columns, plan.page;
                                                    capacity=adoptable ? adopt_order * adopt_order : 0)
-            panels = [(_metal_wrap_panel(a_storage.data, first, last, plan.step), first, last) for (first, last) in plan.panels]
+            panels = MetalLazyPanels(a_storage.data, plan.panels, plan.step)
         end
         c = Metal.zeros(Complex{T}, n, max(column_count, 1); storage=storage)
         _launch_metal_coupled_pair_kernels!(
@@ -632,7 +671,9 @@ function assemble_coupled_burton_miller_metal(
                 if panels === nothing
                     a .*= reshape(weights, :, 1)
                 else
-                    foreach(panel -> (panel[1] .*= reshape(weights, :, 1)), panels)
+                    _metal_foreach_panel(panels) do panel, _, _
+                        panel .*= reshape(weights, :, 1)
+                    end
                 end
                 c .= .-c .* reshape(weights, :, 1)
                 Metal.synchronize()
@@ -644,8 +685,7 @@ function assemble_coupled_burton_miller_metal(
             scatter_metal_sparse_to_dense!(a, identity_cache.p1_p1; alpha=Complex{T}(0.5), add=true)
         else
             identity = identity_cache.p1_p1
-            for (panel, column_first, column_last) in panels
-                isempty(identity.values) && break
+            isempty(identity.values) || _metal_foreach_panel(panels) do panel, column_first, column_last
                 _metal_launch(_metal_sparse_scatter_panel_kernel!, length(identity.values),
                               panel, identity.rows, identity.columns, identity.values,
                               convert(Complex{T}, Complex{T}(0.5)), column_first, column_last)
@@ -661,7 +701,7 @@ function assemble_coupled_burton_miller_metal(
             return (a=a, c=c, on_gpu=true, gpu_backend=:metal, assembly_mode=:metal_coupled_combined,
                     active_columns=compact === nothing ? nothing : compact.active,
                     dp0_count=prepared.dp0.global_dof_count,
-                    a_panels=[panel[1] for panel in panels], a_storage=a_storage,
+                    a_panels=_metal_held_panels(panels), a_panel_count=length(panels.ranges), a_storage=a_storage,
                     adopt_order=adoptable ? adopt_order : 0)
         end
         return (a=a, c=c, on_gpu=true, gpu_backend=:metal, assembly_mode=:metal_coupled_combined,
@@ -674,7 +714,7 @@ function assemble_coupled_burton_miller_metal(
         if !succeeded
             a === nothing || Metal.unsafe_free!(a)
             c === nothing || Metal.unsafe_free!(c)
-            panels === nothing || foreach(panel -> Metal.unsafe_free!(panel[1]), panels)
+            panels === nothing || foreach(Metal.unsafe_free!, _metal_held_panels(panels))
             a_storage === nothing || _metal_free_aligned!(a_storage)
         end
     end
