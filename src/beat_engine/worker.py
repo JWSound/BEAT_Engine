@@ -159,6 +159,7 @@ class WorkerProcess(IdleCleanupMixin):
         self.julia_sysimage = julia_sysimage
         self.environment = dict(os.environ if environment is None else environment)
         self.environment["JULIA_NUM_THREADS"] = resolve_julia_threads(julia_threads)
+        apply_cpu_quota_to_blas(self.environment)
         self.backend_label = backend_label
         if startup_timeout_s <= 0:
             raise ValueError("startup_timeout_s must be positive.")
@@ -612,18 +613,59 @@ def format_julia_error(
     )
 
 
+def _cgroup_cpu_quota() -> float | None:
+    """CPUs granted by a cgroup CPU quota (containers: Docker, RunPod, Kubernetes), or None."""
+    try:  # cgroup v2: "<quota> <period>" or "max <period>"
+        quota, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()[:2]
+        return None if quota == "max" else int(quota) / int(period)
+    except (OSError, ValueError):
+        pass
+    for base in ("/sys/fs/cgroup/cpu", "/sys/fs/cgroup/cpu,cpuacct"):  # cgroup v1
+        try:
+            quota = int(Path(base, "cpu.cfs_quota_us").read_text())
+            period = int(Path(base, "cpu.cfs_period_us").read_text())
+        except (OSError, ValueError):
+            continue
+        return None if quota <= 0 or period <= 0 else quota / period
+    return None
+
+
+def available_cpu_count() -> int:
+    """CPUs this process may actually use: the machine's count, narrowed by the CPU affinity mask
+    and by a cgroup quota. In a container the machine's count can be several times the quota
+    (128 visible vs 13.6 granted on a rented GPU pod), and threads beyond the quota only contend."""
+    count = os.cpu_count() or 1
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            count = min(count, len(os.sched_getaffinity(0)))
+        except OSError:
+            pass
+    quota = _cgroup_cpu_quota()
+    if quota is not None:
+        count = min(count, max(1, int(quota)))
+    return max(1, count)
+
+
+def apply_cpu_quota_to_blas(environment: dict[str, str]) -> None:
+    """Under a CPU quota smaller than the visible CPUs, cap OpenBLAS threads at the quota unless the
+    caller chose a count (Julia otherwise starts one BLAS thread per visible CPU)."""
+    available = available_cpu_count()
+    if available < (os.cpu_count() or 1):
+        environment.setdefault("OPENBLAS_NUM_THREADS", str(available))
+
+
 def resolve_julia_threads(julia_threads: str | int = "auto") -> str:
     if isinstance(julia_threads, int):
         return str(max(1, julia_threads))
 
     text = str(julia_threads or "auto").strip().lower()
     if text == "auto":
-        return str(os.cpu_count() or 1)
+        return str(available_cpu_count())
 
     try:
         return str(max(1, int(text)))
     except ValueError:
-        return str(os.cpu_count() or 1)
+        return str(available_cpu_count())
 
 
 def julia_command(
@@ -685,6 +727,7 @@ class WorkerPool:
         threads = resolve_julia_threads(julia_threads)
         env = dict(os.environ if environment is None else environment)
         env["JULIA_NUM_THREADS"] = threads
+        apply_cpu_quota_to_blas(env)
         key = (
             julia_executable,
             str(solver_script.resolve()),

@@ -423,3 +423,24 @@ assert module.WorkerPool
         [sys.executable, "-I", "-c", code, str(script)], capture_output=True, text=True, timeout=30
     )
     assert process.returncode == 0, process.stderr
+
+
+def test_auto_threads_respect_cgroup_quota(monkeypatch):
+    from beat_engine import worker
+
+    monkeypatch.setattr(worker.os, "cpu_count", lambda: 128)
+    monkeypatch.setattr(worker.os, "sched_getaffinity", lambda pid: set(range(128)), raising=False)
+    monkeypatch.setattr(worker, "_cgroup_cpu_quota", lambda: 13.6)
+    assert worker.resolve_julia_threads("auto") == "13"
+    assert worker.resolve_julia_threads(4) == "4"
+    env = {}
+    worker.apply_cpu_quota_to_blas(env)
+    assert env == {"OPENBLAS_NUM_THREADS": "13"}
+    env = {"OPENBLAS_NUM_THREADS": "2"}
+    worker.apply_cpu_quota_to_blas(env)
+    assert env["OPENBLAS_NUM_THREADS"] == "2"
+    monkeypatch.setattr(worker, "_cgroup_cpu_quota", lambda: None)
+    assert worker.resolve_julia_threads("auto") == "128"
+    env = {}
+    worker.apply_cpu_quota_to_blas(env)
+    assert env == {}
