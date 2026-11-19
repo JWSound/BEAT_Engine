@@ -16,9 +16,10 @@ except for lower memory use.
 | Coupled dense memory (Metal + CUDA) | Compact C columns, no host copies of A/C, sparse identities | always on |
 | Dense solve | Float32 split storage + Float64 iterative refinement, GMRES-IR fallback, disk spill | always on |
 | Metal index limit | 64-bit dense indices; lifts the ~32k-node cap ("Int32 dense indices") | always on |
-| Metal buffer limit | Column-panel assembly when A exceeds one Metal buffer (e.g. 20.1 GB on a 32 GB Mac) | `BLAB_METAL_COUPLED_PANEL_COLUMNS=auto\|<n>\|off` |
+| Metal buffer limit | Column-panel assembly when A exceeds one Metal buffer or a quarter of the GPU working set; one panel in flight at a time | `BLAB_METAL_COUPLED_PANEL_COLUMNS=auto\|<n>\|off` |
 | LU library | Choose OpenBLAS or Apple Accelerate for the dense LU | `BLAB_DENSE_LU_LIBRARY=blas\|accelerate\|auto` |
 | Dense build (Metal) | The dense system takes over A's host memory (restrided in place) instead of copying it: A and the dense system never coexist. Saves 8 n² bytes at the build peak when the dense spill is active (large models) | `BLAB_METAL_COUPLED_ADOPT_A=on\|off` |
+| Threads in containers | "auto" Julia threads and OpenBLAS threads follow the cgroup CPU quota (rented GPU pods) | `OPENBLAS_NUM_THREADS` overrides |
 | Interface radiation | Skip the interface-radiation replay (a second LU per frequency) when the decomposition is not needed | `BLAB_COUPLED_INTERFACE_RADIATION=off` |
 | Experimental | Dense GMRES (Float32 inner, Float64 outer) with automatic LU fallback | `BLAB_COUPLED_DENSE_SOLVER=gmres` |
 
@@ -46,7 +47,11 @@ not converge. See `docs/Memory Fork Summary.md` for details and future direction
 ## Status
 
 - Metal: validated on M1 Max (tests and A/B runs against upstream).
-- CUDA: implemented, not yet validated on hardware. Reports welcome.
+- CUDA: validated on an A100 SXM 80 GB pod: the HF piece matches the Metal result within 0.05 dB
+  in the main lobe (the CUDA path keeps upstream's `interface_elimination = none`); full quarter
+  model at 20 kHz (n = 59-63k): ~3.5 min per frequency, 50-57 GB GPU memory.
+- Metal: a 54.6k-node quarter model at 20 kHz now assembles and factors on a 32 GB M1 Max (it
+  failed upstream), but swaps: more than 2.5 h per frequency.
 - Testing on M4/M5 (Accelerate with SME) is especially welcome.
 
 ## License
