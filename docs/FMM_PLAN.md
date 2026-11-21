@@ -411,3 +411,16 @@ Engine Float64 A rows = conj(oracle) to 2.3e-15. tol 1e-3: worst BEM p 9.9e-4, q
 tol 1e-4: 5.7e-5, 2.5e-4, 3.2e-6, 3.3e-9. GMRES 46-48 its (20 kHz: 59-62). H(A) 0.230/0.279, H(C) 0.206/0.244 of dense.
 Archived A100 Float32 sweep (reference/20261120-conv_piece_h343) at 10 kHz vs Float64 field: within 6 dB of each
 driver's max <= 0.016 dB, within 20 dB <= 0.082 dB, deepest points up to 1.5 dB.
+
+## CUDA (RunPod A100 SXM 80GB, 2026-11-21, 18:25-19:33 UTC, 3.11 USD)
+| test | build | other |
+|---|---|---|
+| A piece_h343 20 kHz f32 | 30 s (ACA 12.6 s, device 1.6 s) | GMRES 34 its 7 s, FP16 4.7e-4 |
+| A piece_h245 f32 | 51 s | GMRES 76 its 22 s |
+| A piece_h17 f32 | 101 s (ACA 66 s, device 8 s; recompress 19 s) | GMRES 86 its 53 s (host hmul; slower CPU than M1 Max) |
+| A piece_h17 f64 | 107 s | identical results: Float64 kernels cost ~nothing on A100 |
+| C piece_h343 / h17 f32 | 27 s / 85 s | driver RHS 2.6e-4 / 4.8e-4; C 2.25 GB vs 28.5 GB dense |
+| real model (Float64 dump) cuda64 tol 1e-3 | A 29 s, C 11 s | worst BEM p 1.3e-3, q 1.9e-3, mech 4.1e-5, elec 5.4e-8; 59-62 its, ~21 s/exc |
+| real model cuda64 tol 1e-4 | A 35 s, C 14 s | worst BEM p 1.6e-4, q 3.1e-4, mech 3.8e-6, elec 5.0e-9 |
+Engine Float64 A rows vs CUDA oracle: 2.3e-15. Same numbers as the Metal runs. Bottleneck on CUDA: host side (ACA
+bookkeeping, recompression, H*x on the CPU). Next: H*x and recompression on the device.
