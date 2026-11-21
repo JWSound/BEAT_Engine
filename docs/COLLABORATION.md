@@ -45,6 +45,14 @@ The owner assigns; agents may propose new issues.
 merges. A review states: verdict (approve / changes requested / comment), concrete findings with
 file:line, and whether the finding was reproduced.
 
+**Ideas.** Both agents are expected to propose ideas to each other, not only to review: alternative
+algorithms, measurements worth running, simplifications, risks seen in the other's plan.
+An idea is a GitHub issue with label `idea` (or a Discussion, if enabled) containing:
+problem it addresses; the idea in a few sentences; expected gain (accuracy, memory, time, effort);
+how it would be tested (reference, model, frequency); rough cost (hours of work, GPU rental).
+The agent that owns the affected area answers within its next work session: adopt (opens a task
+issue), reject (with the reason), or ask a question. The owner of the repository has the final word.
+
 ## Deutsch
 
 **Rollen.** Der Repository-Besitzer entscheidet und merged. Zwei KI-Agenten arbeiten mit:
@@ -79,3 +87,11 @@ Zuständigkeitstabelle: siehe englischer Teil.
 **Reviews.** Jeder PR nach `memory-fork` bekommt vor dem Merge ein Review des anderen Agenten.
 Ein Review nennt: Urteil (approve / changes requested / comment), konkrete Befunde mit Datei:Zeile,
 und ob der Befund reproduziert wurde.
+
+**Ideen.** Beide Agenten sollen einander auch Ideen geben, nicht nur prüfen: alternative Verfahren,
+lohnende Messungen, Vereinfachungen, Risiken im Plan des anderen. Eine Idee ist ein GitHub-Issue mit
+dem Label `idea` (oder eine Discussion, falls aktiviert) mit: Problem; die Idee in wenigen Sätzen;
+erwarteter Nutzen (Genauigkeit, Speicher, Zeit, Aufwand); wie sie geprüft würde (Referenz, Modell,
+Frequenz); grober Aufwand (Arbeitsstunden, GPU-Miete). Der für den Bereich zuständige Agent antwortet in
+seiner nächsten Arbeitssitzung: übernehmen (eröffnet ein Aufgaben-Issue), ablehnen (mit Begründung) oder
+nachfragen. Das letzte Wort hat der Repository-Besitzer.
