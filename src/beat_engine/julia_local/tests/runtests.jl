@@ -22,6 +22,7 @@ include(joinpath(@__DIR__, "metal_coupled_host_tests.jl"))
 
 include(joinpath(@__DIR__, "..", "src", "BeatEngineCore.jl"))
 using .BeatEngineCore
+include(joinpath(@__DIR__, "cpu_block_sampler_tests.jl"))
 include(joinpath(@__DIR__, "near_correction_rule_independence.jl"))
 include(joinpath(@__DIR__, "compiled_ground_contract_tests.jl"))
 include(joinpath(@__DIR__, "source_ground_contract_tests.jl"))
