@@ -5,8 +5,8 @@ include(joinpath(pwd(), "src", "BeatEngineCoupled.jl"))
 include(joinpath(pwd(), "src", "BeatEngineFmm.jl")); using .BeatEngineFmm
 using Krylov, LinearMaps, Random, SparseArrays, Printf, StaticArrays, LinearAlgebra, Serialization
 const BC = BeatEngineCore
-include(joinpath(@__DIR__, "..", "hmat_core.jl")); include(joinpath(@__DIR__, "..", "hmat_fast.jl"))
-include(joinpath(@__DIR__, "..", "hmat_ka.jl")); include(joinpath(@__DIR__, "..", "hmat_c.jl"))
+include(joinpath(@__DIR__, "hmat_core.jl")); include(joinpath(@__DIR__, "hmat_fast.jl"))
+include(joinpath(@__DIR__, "hmat_ka.jl")); include(joinpath(@__DIR__, "hmat_c.jl"))
 function hmat_load(dir)
     vals = Pair{Symbol,Any}[]
     rd(name, T, dims) = (a = Array{T}(undef, dims...); read!(joinpath(dir, name * ".bin"), a); a)
@@ -123,4 +123,27 @@ for c in axes(d.rhs, 2)
     @printf("; rel L2 all %.1e", norm(x - xs) / norm(xs))
     # scaled residuals of both solutions against the H operator: tells conditioning apart from a model mismatch
     @printf("; scaled residual vs H: H sol %.1e, dense sol %.1e\n", norm(D * (b - hmul_coupled(x))) / norm(D * b), norm(D * (b - hmul_coupled(xs))) / norm(D * b))
+end
+
+# ---- a-posteriori error estimate prototype (env HMAT_TRUTH_DIR = Float64 dump of the same frequency) ----
+# estimate: residual of the dumped solution against the independent H operator, one correction solve
+# M_H d = r (loose tolerance / few iterations), d ~ x_true - x_dumped. Compared with the real error vs Float64.
+if haskey(ENV, "HMAT_TRUTH_DIR")
+    tr = hmat_load(ENV["HMAT_TRUTH_DIR"]).dense_solution
+    ec < ep && (tr = conj.(tr))   # same convention as d (conjugated above when ec < ep)
+    nexc = min(size(d.rhs, 2), parse(Int, get(ENV, "HMAT_EST_NEXC", "6")))
+    println("\n== a-posteriori estimate vs true error (truth: Float64 dump)")
+    for its in (3, 15), c in 1:nexc
+        b = d.rhs[:, c]; xs = d.dense_solution[:, c]; xt = tr[:, c]
+        r = b - hmul_coupled(xs)
+        t = @elapsed dl, st = gmres(Am, D * r; N=Pm, ldiv=false, rtol=1e-3, atol=0.0, memory=300, itmax=its)
+        @printf("   its<=%3d exc %2d (%3d its %.1fs):", its, c, st.niter, t)
+        for (name, rr) in (("p", B), ("q", Q), ("mech", Mr), ("elec", Er))
+            isempty(rr) && continue
+            e_true = maximum(abs.(xt[rr] - xs[rr])) / maximum(abs.(xt[rr])); e_est = maximum(abs.(dl[rr])) / maximum(abs.(xs[rr]))
+            mis = norm(dl[rr] - (xt[rr] - xs[rr])) / max(norm(xt[rr] - xs[rr]), eps())
+            @printf(" %s true %.1e est %.1e (shape miss %.2f)", name, e_true, e_est, mis)
+        end
+        println()
+    end
 end
