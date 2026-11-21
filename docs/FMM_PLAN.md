@@ -424,3 +424,30 @@ driver's max <= 0.016 dB, within 20 dB <= 0.082 dB, deepest points up to 1.5 dB.
 | real model cuda64 tol 1e-4 | A 35 s, C 14 s | worst BEM p 1.6e-4, q 3.1e-4, mech 3.8e-6, elec 5.0e-9 |
 Engine Float64 A rows vs CUDA oracle: 2.3e-15. Same numbers as the Metal runs. Bottleneck on CUDA: host side (ACA
 bookkeeping, recompression, H*x on the CPU). Next: H*x and recompression on the device.
+
+## Float32 vs Float64 across frequency (Mac, 2026-11-21 evening; HF piece h343, 20 excitations, 2 polars x 73 points)
+
+Reference: CPU beat_cpu with `solver_options.precision=float64`. Float32: Metal beat_metal with the fork defaults
+(`lu_float32_split_refined`, 1 refinement step against the Float64 residual, `interface_elimination=flux`).
+
+| f (kHz) | polar max abs dB within 6 / 20 dB of max / all | polar max complex rel | diaphragm velocity | coil current |
+|---|---|---|---|---|
+| 10 | 0.000 / 0.000 / 0.00 | 3.4e-5 | 1.9e-6 | 7.9e-8 |
+| 11 | 0.000 / 0.000 / 0.00 | 1.4e-5 | 1.8e-6 | 7.8e-8 |
+| 13 | 0.000 / 0.000 / 0.01 | 3.7e-5 | 1.7e-6 | 7.8e-8 |
+| 15 | 0.000 / 0.000 / 0.03 | 2.3e-5 | 1.0e-6 | 7.7e-8 |
+| 17 | 0.000 / 0.000 / 0.08 | 4.3e-5 | 1.0e-6 | 7.5e-8 |
+| 19 | 0.000 / 0.000 / 0.05 | 5.5e-5 | 1.3e-6 | 7.9e-8 |
+| 20 | 0.000 / 0.000 / 0.02 | 6.7e-5 | 1.3e-6 | 7.8e-8 |
+| 10, archived A100 run without split refinement | 0.016 / 0.082 / 1.54 | 1.4e-3 | 2.5e-4 | 2.5e-7 |
+| 20, dump run (`interface_elimination=none`, no refinement step) | 0.039 / 0.161 / 7.74 | 3.2e-3 | 3.3e-4 | 3.9e-7 |
+
+Correction of the earlier note: the 1-2 % / 12-16 % boundary errors and the multi-dB null errors belong to the
+unrefined Float32 path used for the H-matrix dumps, not to the normal fork run. With the default split refinement the
+Float32 result matches Float64 to about 1e-4 relative (deep nulls <= 0.08 dB) over 10-20 kHz on this model. The
+reported `dense_refinement_backward_error` was 5.9e-4 (10 kHz) and 1.8e-4 (20 kHz).
+
+Consequence for the error indicator: the refinement step already has the ingredients of an a-posteriori estimate
+(Float64 residual + one correction). The size of that correction, mapped through the output operators, bounds the
+error of the unrefined iterate; for the refined result it is a conservative upper bound. Next: log the correction
+norm per output, and compare it with the true error on the dumps (unrefined x32 vs f64).
