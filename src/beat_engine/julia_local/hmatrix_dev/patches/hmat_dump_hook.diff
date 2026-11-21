@@ -1,0 +1,88 @@
+diff --git a/src/beat_engine/julia_local/src/BeatEngineCoupledCondensed.jl b/src/beat_engine/julia_local/src/BeatEngineCoupledCondensed.jl
+index 34ab05e..ceaa0dc 100644
+--- a/src/beat_engine/julia_local/src/BeatEngineCoupledCondensed.jl
++++ b/src/beat_engine/julia_local/src/BeatEngineCoupledCondensed.jl
+@@ -31,6 +31,37 @@ which makes that margin nearly free.
+ module BeatEngineCoupledCondensed
+ 
+ using LinearAlgebra, SparseArrays, StaticArrays, Statistics
++const _HMAT_DUMP = Ref{Any}(nothing)   # BLAB_HMAT_DUMP development hook (no extra package dependencies)
++# Raw dump: one .bin per array, manifest.txt lines "name kind eltype dims..." (kind: array, sparse, scalar, text).
++function _hmat_save(dir::AbstractString, data::NamedTuple)
++    mkpath(dir)
++    open(joinpath(dir, "manifest.txt"), "w") do man
++        rawarr(name, a) = (write(joinpath(dir, name * ".bin"), a); println(man, name, " array ", eltype(a), " ", join(size(a), " ")))
++        for (key, value) in pairs(data)
++            name = String(key)
++            if value isa SparseMatrixCSC
++                I, J, V = findnz(value)
++                rawarr(name * "__I", I); rawarr(name * "__J", J); rawarr(name * "__V", ComplexF64.(V))
++                println(man, name, " sparse ", size(value, 1), " ", size(value, 2))
++            elseif value isa AbstractRange
++                println(man, name, " range ", first(value), " ", last(value))
++            elseif value isa AbstractArray{<:Number}
++                rawarr(name, collect(value))
++            elseif value isa BoundaryMesh
++                rawarr(name * "__vertices", reduce(hcat, [Float64.(collect(v)) for v in value.vertices]))
++                rawarr(name * "__faces", reduce(hcat, [collect(f) for f in value.faces]))
++                rawarr(name * "__tags", collect(value.physical_tags))
++                println(man, name, " mesh")
++            elseif value === nothing
++                println(man, name, " nothing")
++            elseif value isa Number
++                println(man, name, " scalar ", typeof(value), " ", value)
++            else
++                println(man, name, " text ", string(value))
++            end
++        end
++    end
++end
+ using ..BeatEngineCore
+ using ..BeatEngineCoupled
+ 
+@@ -2663,6 +2694,32 @@ function build_condensed_coupled_system(
+     end
+     block_assembly_s = (time_ns() - block_assembly_started) / 1.0e9
+ 
++    # BLAB_HMAT_DUMP=<dir>: keep what an independent H-matrix solve of this frequency needs (development check;
++    # dense layout :none only). The non-BEM-operator part of the coupled matrix is stored sparse.
++    if !isempty(get(ENV, "BLAB_HMAT_DUMP", "")) && interface_elimination == :none && coupled isa Matrix
++        Bset = falses(size(coupled, 1)); Bset[bem_range] .= true
++        Oset = falses(size(coupled, 2)); Oset[bem_range] .= true; Oset[flux_range] .= true; Oset[mechanical_range] .= true
++        I_ = Int[]; J_ = Int[]; V_ = ComplexF64[]
++        for j in axes(coupled, 2), i in axes(coupled, 1)
++            v = coupled[i, j]
++            (iszero(v) || (Bset[i] && Oset[j])) && continue
++            push!(I_, i); push!(J_, j); push!(V_, ComplexF64(v))
++        end
++        nr = min(64, length(bem_range))
++        _HMAT_DUMP[] = (
++            rest=sparse(I_, J_, V_, size(coupled)...), bem_range=bem_range, flux_range=flux_range,
++            mechanical_range=mechanical_range, electrical_range=electrical_range, gamma_range=gamma_range,
++            bem_flux=SparseMatrixCSC{ComplexF64,Int}(interface_operators.bem_flux),
++            bem_motion_flux=transducer_count == 0 ? nothing : SparseMatrixCSC{ComplexF64,Int}(sparse(ComplexF64.(bem_motion_flux))),
++            frequency_hz=Float64(frequency_hz), wavenumber=Float64(wavenumber), symmetry_mode=symmetry_mode,
++            regular_quadrature_order=something(regular_quadrature_order, quadrature_order), singular_order=singular_order,
++            bem_mesh=bem_mesh,
++            identity_p1_p1=SparseMatrixCSC{ComplexF64,Int}(condensed_cache.base.identity_p1_p1),
++            identity_p1_dp0=SparseMatrixCSC{ComplexF64,Int}(condensed_cache.base.identity_p1_dp0),
++            bem_lhs_rows=ComplexF64.(coupled[bem_range[1:nr], bem_range]),
++            bem_iface_rows=ComplexF64.(coupled[bem_range[1:nr], flux_range]),
++        )
++    end
+     coupled_factorization_started = time_ns()
+     if coupled isa SplitDenseMatrix
+         # A, -C and any prefetched copies are consumed: free them before the factor is allocated.
+@@ -2936,6 +2993,12 @@ function solve_condensed_coupled_excitations(system, excitations; reconstruct_in
+             Complex{system.dense_scalar_type}.(transpose(system.condensation.force_solution) * interior_rhs)
+     end
+     dense_solution = _split_timed!(() -> system.factorization \ rhs, solve_split, :dense_solve)
++    if !isempty(get(ENV, "BLAB_HMAT_DUMP", "")) && _HMAT_DUMP[] !== nothing
++        dir = joinpath(ENV["BLAB_HMAT_DUMP"], "f$(round(Int, _HMAT_DUMP[].frequency_hz))Hz")
++        _hmat_save(dir, merge(_HMAT_DUMP[], (rhs=ComplexF64.(rhs), dense_solution=ComplexF64.(dense_solution))))
++        println(stderr, "BLAB_HMAT_DUMP: wrote $dir")
++        _HMAT_DUMP[] = nothing
++    end
+     solution = Complex{T}.(dense_solution)
+     flux_reconstruction_started = time_ns()
+     retained_pressure, interface_flux = if elimination_mode == :none
