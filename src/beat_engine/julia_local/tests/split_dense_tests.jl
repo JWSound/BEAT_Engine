@@ -121,6 +121,30 @@ end
     @test_throws ArgumentError SD.SplitRefinedLU(split_build(merge(f, (; bem=fill(NaN32 + 0im, f.m, f.m)))))
 end
 
+@testset "GMRES-IR rejects non-finite residuals after a finite RHS overflows Float32" begin
+    # The original system is finite and exactly solvable. Converting the RHS for
+    # the initial Float32 solve overflows; NaN residual ratios must not make the
+    # GMRES-IR active set look converged. Include an already-solved finite column.
+    for spill in ("off", "on")
+        withenv("BLAB_COUPLED_DENSE_SPILL" => spill, "BLAB_COUPLED_DENSE_GMRES_IR" => "1") do
+            for rhs in (ComplexF64[1e39, 2e39], ComplexF64[1 1e39; 2 2e39])
+                split = SD.SplitDenseMatrix(2, Int[], Int[])
+                split[1, 1] = 1
+                split[2, 2] = 1
+                factorization = SD.SplitRefinedLU(split)
+                solution = (@test_logs (:warn,) match_mode=:any factorization \ rhs)
+                @test size(solution) == size(rhs)
+                @test all(isfinite, solution)
+                @test solution == rhs
+                @test !isnothing(factorization.fallback)
+                @test occursin("non-finite residual", something(factorization.fallback_reason, ""))
+                @test isfinite(factorization.backward_error) && factorization.backward_error <= 1
+                @test factorization.gmres_iterations == 0
+            end
+        end
+    end
+end
+
 @testset "SplitRefinedLU around a device-held factor (CUDA path, simulated on the host)" begin
     rng = MersenneTwister(15)
     n = 180
@@ -213,6 +237,43 @@ end
         @test solver.fallback isa SD.SplitRefinedLU
         @test norm(solution - reference) / norm(reference) < 1e-12
         @test SD.dense_solver_diagnostics((factorization=solver,))["dense_solver"] == "gmres_fallback_lu"
+    end
+end
+
+@testset "SplitGMRES falls back when its Float32 correction is singular" begin
+    for spill in ("off", "on")
+        withenv("BLAB_COUPLED_DENSE_SPILL" => spill) do
+            # The FP64 border correction makes the exact system nonsingular,
+            # but its Float32 surrogate annihilates this right-hand side.
+            split = SD.SplitDenseMatrix(2, Int[], [2])
+            split[1, 1] = split[1, 2] = split[2, 1] = 1
+            split[2, 2] = 1 + 1e-10
+            rhs = ComplexF64[1, -1]
+            reference = Matrix(split) \ rhs
+            solver = SD.SplitGMRES(split)
+            solution = (@test_logs (:warn,) (:warn,) match_mode=:any solver \ rhs)
+            @test all(isfinite, solution)
+            @test solution ≈ reference rtol = 1e-12
+            @test solver.fallback isa SD.SplitRefinedLU
+            @test !isnothing(solver.fallback.fallback)
+            @test occursin("singular projected system", something(solver.fallback_reason, ""))
+        end
+    end
+end
+
+@testset "SplitGMRES checks convergence after its final allowed correction" begin
+    withenv("BLAB_COUPLED_DENSE_SPILL" => "off", "BLAB_COUPLED_DENSE_GMRES_MAXITER" => "1") do
+        for rhs in (ComplexF64[1], ComplexF64[1 2])
+            split = SD.SplitDenseMatrix(1, Int[], Int[])
+            split[1, 1] = 1
+            solver = SD.SplitGMRES(split)
+            solution = (@test_logs solver \ rhs)
+            @test solution == rhs
+            @test isnothing(solver.fallback)
+            @test solver.relative_residual == 0
+            @test solver.inner_iterations == 1
+            @test solver.outer_iterations == 1
+        end
     end
 end
 

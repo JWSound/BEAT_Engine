@@ -582,9 +582,11 @@ function _split_gmres_ir!(factorization::SplitRefinedLU, target, solution, resid
     for cycle in 1:DENSE_GMRES_IR_MAX_CYCLES
         _split_residual!(residual, factorization, target, solution)
         ratios = _split_backward_error_ratios(factorization, residual, solution)
+        # NaN does not compare greater than one: check before an empty active set
+        # can be mistaken for convergence after a non-finite Float32 solve.
+        all(isfinite, ratios) || return false, "non-finite residual"
         active = findall(>(1), ratios)
         isempty(active) && (factorization.backward_error = maximum(ratios; init=0.0); return true, "")
-        all(isfinite, ratios) || return false, "non-finite residual"
         k = length(active)
         basis = Array{ComplexF64}(undef, n, m + 1, k)
         hessenberg = zeros(ComplexF64, m + 1, m, k)
@@ -718,16 +720,21 @@ function _gmres_ir_solve(solver::SplitGMRES, target::Matrix{ComplexF64})
         solver.relative_residual = worst
         isfinite(worst) || return solution, false, "non-finite residual"
         worst <= solver.tolerance && return solution, true, ""
+        budget <= 0 && return solution, false, "no convergence within $(solver.max_inner) inner steps (residual $(worst))"
         outer > 0 && worst > previous / 2 && return solution, false, "outer refinement stalled at $(worst)"
         previous = worst
         active = findall(>(solver.tolerance), relative)
         # inner tolerance: the remaining reduction, but no tighter than Float32 can deliver
         inner_tolerance = max(solver.tolerance / worst, 1e-4)
-        correction, steps = _gmres_f32(solver, ComplexF32.(residual[:, active]), inner_tolerance, budget)
+        correction, steps = try
+            _gmres_f32(solver, ComplexF32.(residual[:, active]), inner_tolerance, budget)
+        catch err
+            err isa SingularException || rethrow()
+            return solution, false, "Float32 GMRES correction has a singular projected system: $(sprint(showerror, err))"
+        end
         budget -= steps
         solution[:, active] .+= correction
         solver.outer_iterations += 1
-        budget <= 0 && return solution, false, "no convergence within $(solver.max_inner) inner steps (residual $(worst))"
     end
     return solution, false, "outer refinement limit reached"
 end
