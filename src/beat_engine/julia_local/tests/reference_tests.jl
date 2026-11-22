@@ -31,3 +31,4 @@ include(joinpath(@__DIR__, "deploy_mixed_rom_tests.jl"))
 
 include(joinpath(@__DIR__, "thermoviscous_tests.jl"))
 include(joinpath(@__DIR__, "thermoviscous_driver_tests.jl"))
+include(joinpath(@__DIR__, "continuous_speaker_export_tests.jl"))
