@@ -36,7 +36,9 @@ class ContinuousSpeaker:
                 return json.loads(data)
 
             manifest = read_json("manifest.json")
-            description = manifest["files"].get("experimental_continuous_interior") or manifest["files"]["coupled_model"]
+            description = (
+                manifest["files"].get("experimental_continuous_interior") or manifest["files"]["coupled_model"]
+            )
             model = read_json(description["path"])
         if model["metadata"]["format"] not in {"experimental-continuous-speaker-v1", "continuous-speaker-v1"}:
             raise ValueError("Unsupported continuous interior format")
