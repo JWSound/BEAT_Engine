@@ -64,6 +64,7 @@
     "exp(-i omega t)",
     "exp(+i omega t)"
   ],
+  "continuous_speaker_rom_versions": [1],
   "optional_output_quantities": [
     "interface_average_normal_velocity",
     "interface_radiated_pressure",

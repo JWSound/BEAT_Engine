@@ -24,6 +24,8 @@ include(joinpath(@__DIR__, "src", "BeatEngineInterfaceRadiation.jl"))
 using .BeatEngineInterfaceRadiation
 include(joinpath(@__DIR__, "exterior_rhs_policy.jl"))
 
+include(joinpath(@__DIR__, "continuous_speaker_rom.jl"))
+
 const DEFAULT_TRANSDUCER_REFERENCE_VOLTAGE_V = 2.83
 const RUN_MESH_PROVENANCE = Ref{Any}([])
 const COMPILED_WORKER_LOAD = Ref{Any}(nothing)
@@ -3185,6 +3187,10 @@ function solve_request_impl(request; event_mode=false)
         if metal_field_batch !== nothing
             metal_field_points = BeatEngineCore.prepare_metal_field_output_points(metal_field_batch.point_sets)
         end
+        continuous_model = if haskey(solver_options, "continuous_speaker_rom")
+            println(stderr, "Training continuous Level 3 speaker ROM")
+            train_continuous_speaker(request, cancel_requested)
+        end
         for (frequency_index, frequency_value) in enumerate(request["frequencies_hz"])
             if cancel_requested()
                 cancelled = true
@@ -3896,6 +3902,10 @@ function solve_request_impl(request; event_mode=false)
                     sweep_pipeline_plan === nothing ? nothing : String(sweep_pipeline_plan.reason)
                 diagnostics["coupled_sweep_pipeline_saving_model_s"] =
                     sweep_pipeline_plan === nothing ? nothing : sweep_pipeline_plan.saving_model_s
+            end
+            if frequency_index == 1 && continuous_model !== nothing
+                diagnostics["continuous_speaker_rom"] = continuous_model
+                continuous_model = nothing
             end
             isnothing(rank_experiment) ||
                 (diagnostics["speaker_rom_rank_experiment"] = rank_experiment)
