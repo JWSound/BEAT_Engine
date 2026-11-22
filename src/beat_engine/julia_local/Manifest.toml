@@ -19,7 +19,7 @@ uuid = "5c7d6f0a-3b6e-4d0a-9a53-0d9b1f2a7c11"
 version = "0.1.0"
 
 [[deps.BeatEngineCpuBundle]]
-deps = ["JSON", "LinearAlgebra", "PrecompileTools", "Printf", "SHA", "Serialization", "SparseArrays", "StaticArrays", "Statistics"]
+deps = ["Base64", "JSON", "LinearAlgebra", "PrecompileTools", "Printf", "SHA", "Serialization", "SparseArrays", "StaticArrays", "Statistics", "p7zip_jll"]
 path = "../julia_engine/BeatEngineCpuBundle"
 uuid = "dbb44b52-9b63-42c8-872c-0d4697051c06"
 version = "0.1.0"
@@ -173,3 +173,8 @@ version = "1.11.0"
 deps = ["Artifacts", "Libdl"]
 uuid = "8e850b90-86db-534c-a0d3-1478176c7d93"
 version = "5.15.0+0"
+
+[[deps.p7zip_jll]]
+deps = ["Artifacts", "CompilerSupportLibraries_jll", "Libdl"]
+uuid = "3f19e933-33d8-53b3-aaab-bd5110c3b7a0"
+version = "17.7.0+0"

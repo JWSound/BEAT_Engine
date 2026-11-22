@@ -84,4 +84,5 @@ end
         @test_throws ErrorException load_deploy_speaker_rom(Dict("rom" => invalid), Float64, 7, 8)
     end
 end
+include(joinpath(@__DIR__, "deploy_continuous_tests.jl"))
 end
