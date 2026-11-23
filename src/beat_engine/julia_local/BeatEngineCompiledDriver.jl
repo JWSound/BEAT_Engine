@@ -3189,7 +3189,7 @@ function solve_request_impl(request; event_mode=false)
         end
         continuous_model = if haskey(solver_options, "continuous_speaker_rom")
             println(stderr, "Training continuous Level 3 speaker ROM")
-            train_continuous_speaker(request, cancel_requested)
+            train_continuous_speaker(request, cancel_requested, bem_backend)
         end
         for (frequency_index, frequency_value) in enumerate(request["frequencies_hz"])
             if cancel_requested()
