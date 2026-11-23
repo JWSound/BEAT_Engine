@@ -1,3 +1,4 @@
+include(joinpath(@__DIR__, "deploy_continuous.jl"))
 include(joinpath(@__DIR__, "deploy_cpu.jl"))
 include(joinpath(@__DIR__, "deploy_rocm.jl"))
 include(joinpath(@__DIR__, "deploy_rhs_policy.jl"))
@@ -241,7 +242,7 @@ function load_deploy_speaker_rom(request, ::Type{T}, node_count::Int, face_count
     if raw_models isa AbstractDict
         isempty(raw_models) && error("Deploy ROM model collection must not be empty.")
         models = Dict(String(id) => load_deploy_speaker_rom(
-            Dict("rom" => value), T, node_count, face_count,
+            Dict("rom" => value, "frequency_hz" => get(request, "frequency_hz", nothing)), T, node_count, face_count,
         ) for (id, value) in raw_models)
         instances = get_value(raw, "instances", Any[])
         locations = Dict(instance.id => (String(id), index)
@@ -262,31 +263,29 @@ function load_deploy_speaker_rom(request, ::Type{T}, node_count::Int, face_count
         end
         return (
             models=models, order=order, face_count=face_count, node_count=node_count,
+            representation=allequal(m.representation for m in values(models)) ?
+                first(values(models)).representation : "mixed_rom",
             rank=maximum(model.rank for model in values(models)),
             sector_count=maximum(model.sector_count for model in values(models)), symmetry=:mixed,
             tolerance=T(get_value(raw, "gmres_tolerance", 1e-4)),
             max_iterations=Int(get_value(raw, "gmres_max_iterations", 30)),
         )
     end
-    String(get_value(raw, "representation", "")) == "parity_petrov_galerkin_rom" || error(
-        "Deploy Level 3 request uses an unsupported reduced representation.",
-    )
-    descriptors = get_value(raw, "binary_arrays", nothing)
-    descriptors isa AbstractDict || error("Deploy speaker ROM is missing binary array descriptors.")
-    arrays = Dict(
-        name => deploy_rom_binary_array(descriptors[name], T)
-        for name in (
-            "k",
-            "c",
-            "d",
-            "b",
-            "e",
-            "velocity",
-            "current",
-            "velocity_drive",
-            "current_drive",
-        )
-    )
+    native = get(raw, "representation", "") == "continuous_speaker_rom"
+    prepared = if native
+        deploy_continuous_frequency(raw["compact_model"], request["frequency_hz"], T)
+    else
+        nothing
+    end
+    arrays = if native
+        prepared.arrays
+    else
+        get(raw, "representation", "") == "parity_petrov_galerkin_rom" ||
+            error("Unsupported Deploy Level 3 representation.")
+        descriptors = raw["binary_arrays"]
+        Dict(name => deploy_rom_binary_array(descriptors[name], T) for name in
+             ("k", "c", "d", "b", "e", "velocity", "current", "velocity_drive", "current_drive"))
+    end
     rank = Int(get_value(raw, "rank_per_sector", 0))
     rank > 0 || error("Deploy speaker ROM rank must be positive.")
     symmetry = Symbol(lowercase(String(get_value(raw, "symmetry_mode", "xy"))))
@@ -305,8 +304,8 @@ function load_deploy_speaker_rom(request, ::Type{T}, node_count::Int, face_count
     input_count = size(arrays["b"], 3)
     size(arrays["b"]) == (sector_count, rank, input_count) || error("Deploy speaker ROM B shape is invalid.")
 
-    raw_node_orbits = get_value(raw, "node_orbits", Any[])
-    raw_face_orbits = get_value(raw, "face_orbits", Any[])
+    raw_node_orbits = native ? prepared.nodes : get_value(raw, "node_orbits", Any[])
+    raw_face_orbits = native ? prepared.faces : get_value(raw, "face_orbits", Any[])
     all(length(orbit) == image_count for orbit in raw_node_orbits) || error(
         "Deploy speaker ROM node orbit width does not match its symmetry mode.",
     )
@@ -365,9 +364,10 @@ function load_deploy_speaker_rom(request, ::Type{T}, node_count::Int, face_count
         ))
     end
     isempty(instances) && error("Deploy speaker ROM requires at least one speaker instance.")
-    factors = [lu!(Matrix(view(arrays["k"], sector, :, :))) for sector in 1:sector_count]
+    factors = native ? prepared.factors : [lu!(Matrix(view(arrays["k"], sector, :, :))) for sector in 1:sector_count]
     return (
         rank=rank,
+        representation=String(raw["representation"]),
         symmetry=symmetry,
         image_count=image_count,
         sector_count=sector_count,
@@ -1487,6 +1487,11 @@ function solve_deploy_request_impl(
                 result["diagnostics"]["field_backend"] = "metal"
             end
             if rom_request
+                if speaker_rom.representation != "parity_petrov_galerkin_rom"
+                    result["diagnostics"]["fidelity"] = "level3_" * speaker_rom.representation
+                    result["diagnostics"]["continuous_rom_host_cache_bytes"] =
+                        sum(last, values(DEPLOY_CONTINUOUS_RECENT); init=0)
+                end
                 result["diagnostics"]["rom_feedback_mode"] = projected_rhs !== nothing ? "projected" : compressed_rhs !== nothing ? "compressed" : rom_rhs_operator_used ? "cached_operator" : "matrix_free"
                 result["diagnostics"]["rhs_compression"] = compression_report
                 result["diagnostics"]["rom_feedback_requested_mode"] = rom_rhs_mode
@@ -1497,7 +1502,7 @@ function solve_deploy_request_impl(
                 if hasproperty(speaker_rom, :models)
                     result["diagnostics"]["rom_models"] = Dict(id => Dict(
                         "rank_per_sector" => model.rank, "sector_count" => model.sector_count,
-                        "symmetry" => String(model.symmetry),
+                        "symmetry" => String(model.symmetry), "representation" => model.representation,
                     ) for (id, model) in speaker_rom.models)
                 end
                 result["diagnostics"]["schur_gmres_iterations"] = rom_iterations

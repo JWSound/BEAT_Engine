@@ -32,6 +32,7 @@ function emit_event(event_type::String; kwargs...)
     payload["phasor_convention"] = phasor_convention()
     if event_type == "ready"
         payload["phasor_conventions"] = [NEGATIVE_TIME_PHASOR, POSITIVE_TIME_PHASOR]
+        payload["deploy_continuous_rom_versions"] = [1]
         payload["deploy_solver_backends"] = ["cpu", "cuda", "metal", "rocm"]
         # Supported solve paths are not a claim about this worker/device. Probe
         # at startup, outside precompilation, and report actual availability.
@@ -815,6 +816,9 @@ end
 function solve_request_with_convention(request)
     try
         schema = String(get_value(request, "schema", ""))
+        if schema != "boundary_lab_deploy_field"
+            prune_deploy_continuous_models!(get(request, "rom", get(request, "rom_sweep", nothing)))
+        end
         if schema in ("boundary_lab_deploy_solve", "boundary_lab_deploy_rom")
             solve_deploy_request_impl(request)
         elseif schema == "boundary_lab_deploy_microphone_sweep"
