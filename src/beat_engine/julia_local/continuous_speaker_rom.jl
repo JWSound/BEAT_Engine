@@ -1,3 +1,5 @@
+include("continuous_cuda_interior.jl")
+
 # Continuous full-domain acoustic interior for Level 3 speaker export.
 function continuous_prepare_interior(request)
     system = request["compiled_system"]
@@ -54,7 +56,7 @@ function continuous_dynamic_matrix(m, f)
     return A
 end
 
-function continuous_response(m, f, p, u)
+function continuous_response(m, f, p, u, workspace=nothing)
     g = axes(m.gram, 1)
     inside = last(g)+1:size(m.K, 1)
     gamma = m.trace*p
@@ -65,9 +67,10 @@ function continuous_response(m, f, p, u)
     bl = Diagonal([d.bl_n_per_a for d in m.drivers])
     # Prescribed interface pressures. Eliminate interior acoustic pressure, then
     # solve the remaining mechanical and electrical equations for all load cases.
-    factor = lu(A[inside,inside])
-    free = factor \ (-A[inside,g]*gamma)
-    forced = factor \ Matrix(scale*m.surface[inside,:])
+    interior = A[inside,inside]
+    factor = isnothing(workspace) || isempty(inside) ? lu(interior) : continuous_interior_factor!(workspace, interior, f)
+    free = continuous_interior_solve(factor, -A[inside,g]*gamma)
+    forced = continuous_interior_solve(factor, Matrix(scale*m.surface[inside,:]))
     force = transpose(m.force[inside,:])
     rhs = vcat(force*free + transpose(m.force[g,:])*gamma - transpose(m.bem_force)*p, m.drive*u)
     state = [zm-force*forced -bl; bl ze] \ rhs
@@ -166,17 +169,17 @@ function continuous_incident_fields(mesh, k)
     return p,q
 end
 
-function continuous_loaded_response(m, V, f, A, B, rhs, active, inputs)
-    transfer = continuous_response(m, f, inputs, zeros(length(m.ports),length(active)))
+function continuous_loaded_response(m, V, f, A, B, rhs, active, inputs, workspace=nothing)
+    transfer = continuous_response(m, f, inputs, zeros(length(m.ports),length(active)),workspace)
     coupled = copy(A)
     coupled[:,active] -= B*transfer.q
     p = coupled \ rhs
-    response = continuous_response(m, f, p, zeros(length(m.ports),size(p,2)))
+    response = continuous_response(m, f, p, zeros(length(m.ports),size(p,2)),workspace)
     state = vcat(m.trace*p,response.internal)
     return (isnothing(V) ? state : V*state),response.q,response.v
 end
 
-function continuous_coupled_check(full, m, V, mesh, chambers, f)
+function continuous_coupled_check(full, m, V, mesh, chambers, f, workspace)
     k = 2pi*f/full.c
     p1,dp,rule = build_p1_space(mesh),build_dp0_space(mesh),triangle_rule(Float64,2)
     ipp = assemble_l2_identity_matrix(mesh,p1,dp,rule,:p1,:p1)
@@ -190,12 +193,21 @@ function continuous_coupled_check(full, m, V, mesh, chambers, f)
     for (j,node) in enumerate(active)
         inputs[node,j] = 1
     end
-    reference = continuous_loaded_response(full,nothing,f,A,B,rhs,active,inputs)
+    reference = continuous_loaded_response(full,nothing,f,A,B,rhs,active,inputs,workspace)
     candidate = continuous_loaded_response(m,V,f,A,B,rhs,active,inputs)
     return continuous_errors(candidate...,reference...,chambers,f)
 end
 
-function train_continuous_speaker(request, cancelled)
+function train_continuous_speaker(request, cancelled, bem_backend)
+    workspace = bem_backend == :cuda ? ContinuousCudaInterior() : nothing
+    try
+        return train_continuous_speaker_model(request, cancelled, workspace)
+    finally
+        isnothing(workspace) || release_continuous_interior!(workspace)
+    end
+end
+
+function train_continuous_speaker_model(request, cancelled, workspace)
     phasor_convention()==POSITIVE_TIME_PHASOR || error("Continuous speaker export requires exp(+i omega t)")
     options = request["solver_options"]["continuous_speaker_rom"]
     full,mesh,domains = continuous_prepare_interior(request)
@@ -219,7 +231,7 @@ function train_continuous_speaker(request, cancelled)
             cancelled() && return nothing
             get!(snapshots,f) do
                 p,u = continuous_probes(full,mesh.vertices,f,8,0)
-                delta = continuous_response(full,f,p,u).internal-lift*(full.trace*p)
+                delta = continuous_response(full,f,p,u,workspace).internal-lift*(full.trace*p)
                 delta ./= max.(sqrt.(sum(abs2,delta;dims=1)),eps())
                 hcat(real(delta),imag(delta))
             end
@@ -237,7 +249,7 @@ function train_continuous_speaker(request, cancelled)
                 cancelled() && return nothing
                 reference = get!(references,f) do
                     p,u = continuous_probes(full,mesh.vertices,f,6,101)
-                    a = continuous_response(full,f,p,u)
+                    a = continuous_response(full,f,p,u,workspace)
                     (p,u,vcat(full.trace*p,a.internal),a.q,a.v)
                 end
                 push!(rows,continuous_check(m,V,reference,chambers,f))
@@ -256,7 +268,7 @@ function train_continuous_speaker(request, cancelled)
                 external = NamedTuple[]
                 for f in audit
                     cancelled() && return nothing
-                    push!(external,continuous_coupled_check(full,m,V,mesh,chambers,f))
+                    push!(external,continuous_coupled_check(full,m,V,mesh,chambers,f,workspace))
                 end
                 external_errors = [max(a.field_error,a.flux_error,a.velocity_error) for a in external]
                 all(isfinite,external_errors) || error("Nonfinite coupled external-source validation error")
@@ -265,6 +277,7 @@ function train_continuous_speaker(request, cancelled)
                     continue
                 end
                 metadata = (;format="continuous-speaker-v1",phasor=phasor_convention(),rank,training,
+                    interior_factorization=isnothing(workspace) ? "cpu_fp64" : "cuda_cudss_fp64",
                     meshes=[(;id=t["id"],sha256=t["sha256"]) for t in RUN_MESH_PROVENANCE[]],validation=(;kind="prescribed_and_external_loading",
                     relative_tolerance=target, checks=rows, external_source_checks=external))
                 return continuous_model_payload(metadata,m,mesh)

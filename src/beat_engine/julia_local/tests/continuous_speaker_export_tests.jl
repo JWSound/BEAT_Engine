@@ -22,6 +22,7 @@ include(joinpath(ENGINE_DIR, "..", "julia_engine", "CompiledCoupledWorkload.jl")
     model = JSON.parse(results[1]["diagnostics"]["continuous_speaker_rom"])
     @test model["band"] == [20,250]
     info = model["metadata"]
+    @test info["interior_factorization"] == "cpu_fp64"
     @test extrema(info["training"]) == (20.0,250.0)
     @test model["ports"] == request["excitation_port_ids"]
     @test model["matrices"]["K"]["shape"] == model["matrices"]["M"]["shape"]

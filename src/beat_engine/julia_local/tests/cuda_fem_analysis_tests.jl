@@ -118,3 +118,29 @@
         BeatEngineCoupled._release_cuda_fem_analysis!(cache)
     end
 end
+
+isdefined(@__MODULE__, :ContinuousCudaInterior) ||
+    include(joinpath(@__DIR__, "..", "continuous_cuda_interior.jl"))
+
+@testset "Continuous export FP64 interior factors and batched loads" begin
+    work = ContinuousCudaInterior()
+    matrix = sparse(ComplexF64[4+im 1 0; 1 5-im 2; 0 2 6+im])
+    loads = reshape(complex.(1:105, 105:-1:1), 3, 35)
+    try
+        continuous_interior_factor!(work, matrix, 160.0)
+        solver = work.solver
+        @test isapprox(continuous_interior_solve(work, loads), matrix \ loads; rtol=1e-12)
+        @test continuous_interior_factor!(work, matrix, 160.0).solver === solver
+        shifted = matrix + 0.25im * I
+        continuous_interior_factor!(work, shifted, 161.0)
+        @test work.solver === solver
+        @test isapprox(continuous_interior_solve(work, loads), shifted \ loads; rtol=1e-12)
+        shifted[1, 3] = 0.5
+        continuous_interior_factor!(work, shifted, 162.0)
+        @test work.solver !== solver
+        @test isapprox(continuous_interior_solve(work, loads), shifted \ loads; rtol=1e-12)
+    finally
+        release_continuous_interior!(work)
+    end
+    @test isnothing(work.solver) && isnothing(work.matrix)
+end
