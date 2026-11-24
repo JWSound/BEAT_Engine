@@ -58,10 +58,35 @@ function read_deploy_continuous_model(ref)
     walls = [(project(unpack_deploy_matrix(w["matrix"])), w["thickness_m"], w["flow_resistivity_pa_s_per_m2"])
              for w in data["walls"]]
     driver_pressure = transpose(m.bem_force[nodes,:]) - transpose(m.force[1:ng,:])*trace
-    return (; stiffness, inertia, walls, driver_pressure, m.gram, m.surface, m.force, m.drive,
+    return (; stiffness, inertia, walls, driver_pressure, m.gram, gram_factors=Dict{DataType,LU}(), m.surface, m.force, m.drive,
         flux=m.flux[faces,:], bem_velocity=m.bem_velocity[faces,:],
         nodes=[[i-1] for i in nodes], faces=[[i-1] for i in faces], drivers=data["drivers"],
         c=data["c"], rho=data["rho"], band=data["band"])
+end
+
+struct DeployContinuousBlockLU{G,U,F}
+    gram::G
+    coupling::U
+    trailing::F
+end
+
+function Base.:\(f::DeployContinuousBlockLU, rhs::AbstractVecOrMat)
+    ng = size(f.coupling, 1)
+    tail = f.trailing \ selectdim(rhs, 1, ng+1:size(rhs,1))
+    head = f.gram \ (selectdim(rhs, 1, 1:ng) - f.coupling * tail)
+    return vcat(head, tail)
+end
+
+function factor_deploy_continuous(model, system::Matrix{T}) where T
+    ng = size(model.gram, 1)
+    ng == 0 && return lu(system)
+    # The assembled system is [Gram coupling; 0 trailing]. Gram is shared
+    # across frequencies and owned by this model for its cache lifetime.
+    gram = get!(model.gram_factors, T) do
+        lu!(Matrix{T}(model.gram))
+    end
+    trailing = ng+1:size(system, 1)
+    return DeployContinuousBlockLU(gram, view(system, 1:ng, trailing), lu!(system[trailing,trailing]))
 end
 
 function assemble_deploy_continuous(m, hz, ::Type{T}) where T
@@ -121,7 +146,7 @@ function assemble_deploy_continuous(m, hz, ::Type{T}) where T
     matrices = (; k=system, c=pressure, b=drive, d=flux, e=zeros(Complex{T},length(m.faces),np),
         velocity, current, velocity_drive=zeros(Complex{T},nd,np), current_drive=zeros(Complex{T},nd,np))
     arrays = Dict(string(k) => reshape(v,1,size(v)...) for (k,v) in pairs(matrices))
-    return (; arrays, factors=[lu(system)], m.nodes, m.faces)
+    return (; arrays, factors=[factor_deploy_continuous(m, system)], m.nodes, m.faces)
 end
 
 function deploy_continuous_frequency(ref, hz, ::Type{T}; budget=DEPLOY_CONTINUOUS_CACHE_BYTES) where T

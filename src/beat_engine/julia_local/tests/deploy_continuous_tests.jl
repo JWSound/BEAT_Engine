@@ -1,4 +1,21 @@
 # Included inside the standalone Deploy ROM algebra test module.
+@testset "continuous ROM block factors with independent loads" begin
+    model = (gram=[0.5 1.0; 1.0 3.0], gram_factors=Dict{DataType,LU}())
+    for T in (ComplexF32, ComplexF64)
+        rhs = T[1+im 2; 3 0; -2im 1; 4 -im]
+        for z in (1+im, 3-2im)
+            system = T[0.5 1 z 4; 1 3 2 im; 0 0 z 1; 0 0 -im 5]
+            block = factor_deploy_continuous(model, system)
+            @test block.gram === model.gram_factors[T]
+            @test block \ rhs ≈ system \ rhs
+            @test block \ rhs[:,1] ≈ system \ rhs[:,1]
+        end
+    end
+    @test length(model.gram_factors) == 2
+    empty_interface = (gram=zeros(0,0), gram_factors=Dict{DataType,LU}())
+    @test factor_deploy_continuous(empty_interface, ComplexF32[1 2; 2 1]) isa LU
+end
+
 @testset "native continuous speaker archive, pressure feedback and host cache" begin
     with_phasor_convention(POSITIVE_TIME_PHASOR) do
         mktempdir() do directory
@@ -29,7 +46,8 @@
             @test isapprox(only(a["d"][1,:,:]*state), 2p-1.21*s*v)
             @test_throws ErrorException deploy_continuous_frequency(ref, 501, Float64)
             size_limit = Base.summarysize(prepared)
-            deploy_continuous_frequency(ref, 161, Float64; budget=size_limit)
+            next_frequency = deploy_continuous_frequency(ref, 161, Float64; budget=size_limit)
+            @test only(next_frequency.factors).gram === only(prepared.factors).gram
             @test length(DEPLOY_CONTINUOUS_RECENT) == 1
             @test !haskey(DEPLOY_CONTINUOUS_RECENT,(id,160.0,Float64))
             deploy_continuous_frequency(ref, 162, Float64; budget=1)
